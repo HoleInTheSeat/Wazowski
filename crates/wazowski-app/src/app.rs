@@ -111,6 +111,7 @@ enum Dialog {
     AskUsername(UsernamePrompt),
     AddSource { name: String, path: String },
     MissingShare { id: String },
+    DropMenu { payload: DragPayload, to: StoreId, folder: String },
 }
 
 /// Prompt for a username at connect time when the session has none.
@@ -304,6 +305,13 @@ enum StoreId {
     Local,
     /// A shared source, by its id.
     Shared(String),
+}
+
+/// What is being dragged in the session tree.
+#[derive(Clone)]
+enum DragPayload {
+    Session { store: StoreId, id: String },
+    Folder { store: StoreId, path: String },
 }
 
 impl App {
@@ -771,8 +779,15 @@ impl App {
         // Local sessions.
         render_store(ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action);
 
-        // Fill a bit of blank space with a right-click menu for the local store.
+        // Fill a bit of blank space: right-click menu + a drop zone for the local root.
         let bg = ui.allocate_response(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
+        if let Some(payload) = bg.dnd_release_payload::<DragPayload>() {
+            action = Some(TreeAction::Dropped {
+                payload: (*payload).clone(),
+                to: StoreId::Local,
+                folder: String::new(),
+            });
+        }
         bg.context_menu(|ui| {
             if ui.button("New session").clicked() {
                 action = Some(TreeAction::NewSessionIn(StoreId::Local, String::new()));
@@ -798,6 +813,16 @@ impl App {
                 }
                 render_store(ui, &store, source.store(), editable, &destinations, &mut action);
             });
+            // Dropping onto the source header targets that store's root.
+            if editable
+                && let Some(payload) = resp.header_response.dnd_release_payload::<DragPayload>()
+            {
+                action = Some(TreeAction::Dropped {
+                    payload: (*payload).clone(),
+                    to: store.clone(),
+                    folder: String::new(),
+                });
+            }
             resp.header_response.context_menu(|ui| {
                 if ui.button("Sync now").clicked() {
                     action = Some(TreeAction::SyncSource(source.id().to_owned()));
@@ -905,6 +930,15 @@ impl App {
                 Ok(())
             }
             TreeAction::RemoveSource(id) => self.remove_source(&id),
+            TreeAction::Dropped { payload, to, folder } => {
+                // Ignore no-op or invalid drops; otherwise ask Move or Copy.
+                if is_noop_drop(&payload, &to, &folder) {
+                    Ok(())
+                } else {
+                    self.dialog = Dialog::DropMenu { payload, to, folder };
+                    Ok(())
+                }
+            }
         };
         if let Err(e) = result {
             self.error = Some(format!("{e:#}"));
@@ -1166,6 +1200,51 @@ impl App {
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
             Dialog::AddSource { .. } => self.show_add_source(ctx),
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
+            Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
+        }
+    }
+
+    /// Asks whether a drag-and-drop should move or copy, then performs it.
+    fn show_drop_menu(&mut self, ctx: &egui::Context) {
+        let Dialog::DropMenu { payload, to, folder } = &self.dialog else { return };
+        let (to, folder) = (to.clone(), folder.clone());
+        let dest_label = if folder.is_empty() { "root".to_owned() } else { folder.clone() };
+        let (what, move_action, copy_action) = match payload {
+            DragPayload::Session { store, id } => (
+                "session".to_owned(),
+                TreeAction::MoveTo { from: store.clone(), id: id.clone(), to: to.clone(), folder: folder.clone() },
+                TreeAction::CopyTo { from: store.clone(), id: id.clone(), to: to.clone(), folder: folder.clone() },
+            ),
+            DragPayload::Folder { store, path } => (
+                "folder".to_owned(),
+                TreeAction::MoveFolder { from: store.clone(), folder: path.clone(), to: to.clone(), parent: folder.clone() },
+                TreeAction::CopyFolder { from: store.clone(), folder: path.clone(), to: to.clone(), parent: folder.clone() },
+            ),
+        };
+        let mut chosen: Option<TreeAction> = None;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("drop-menu")).show(ctx, |ui| {
+            ui.set_width(300.0);
+            ui.heading(format!("Drop {what}"));
+            ui.label(RichText::new(format!("Into: {dest_label}")).weak());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Move here").clicked() {
+                    chosen = Some(move_action.clone());
+                }
+                if ui.button("Copy here").clicked() {
+                    chosen = Some(copy_action.clone());
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if let Some(act) = chosen {
+            self.dialog = Dialog::None;
+            self.apply_tree_action(Some(act), ctx);
+        } else if cancel {
+            self.dialog = Dialog::None;
         }
     }
 
@@ -2656,6 +2735,7 @@ fn initial_vault_state(path: &std::path::Path) -> VaultState {
 }
 
 /// An action chosen from the session tree, applied after rendering.
+#[derive(Clone)]
 enum TreeAction {
     Connect(StoreId, String),
     Edit(StoreId, String),
@@ -2671,6 +2751,8 @@ enum TreeAction {
     DeleteFolder(StoreId, String),
     SyncSource(String),
     RemoveSource(String),
+    /// A drag-and-drop release onto a folder (or root) of a destination store.
+    Dropped { payload: DragPayload, to: StoreId, folder: String },
 }
 
 /// Renders one store's folders and sessions, emitting a [`TreeAction`] on
@@ -2745,20 +2827,43 @@ fn render_folder(
     editable: bool,
     action: &mut Option<TreeAction>,
 ) {
-    let header = egui::CollapsingHeader::new(format!("📁 {segment}"))
-        .id_salt((store_salt(store), full))
-        .default_open(true);
-    let resp = header.show(ui, |ui| {
-        for (id, name) in &node.sessions {
-            session_row(ui, store, id, name, destinations, editable, action);
-        }
-        for (child_segment, child) in &node.children {
-            let child_full = format!("{full}/{child_segment}");
-            render_folder(ui, store, child_segment, &child_full, child, destinations, editable, action);
-        }
-    });
+    use egui::containers::collapsing_header::CollapsingState;
+
+    let id = egui::Id::new((store_salt(store), "folder", full));
+    let state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    // Header: a draggable folder label next to the collapse triangle.
+    let (_toggle, header_inner, _body) = state
+        .show_header(ui, |ui| {
+            ui.dnd_drag_source(
+                id.with("drag"),
+                DragPayload::Folder { store: store.clone(), path: full.to_owned() },
+                |ui| ui.label(format!("📁 {segment}")),
+            )
+            .response
+        })
+        .body(|ui| {
+            for (id, name) in &node.sessions {
+                session_row(ui, store, id, name, destinations, editable, action);
+            }
+            for (child_segment, child) in &node.children {
+                let child_full = format!("{full}/{child_segment}");
+                render_folder(ui, store, child_segment, &child_full, child, destinations, editable, action);
+            }
+        });
+
+    // The header row is a drop target for sessions/folders dragged onto it.
+    let header_row = header_inner.response;
+    if editable
+        && let Some(payload) = header_row.dnd_release_payload::<DragPayload>()
+    {
+        *action = Some(TreeAction::Dropped {
+            payload: (*payload).clone(),
+            to: store.clone(),
+            folder: full.to_owned(),
+        });
+    }
     if editable {
-        resp.header_response.context_menu(|ui| {
+        header_row.context_menu(|ui| {
             if ui.button("New session here").clicked() {
                 *action = Some(TreeAction::NewSessionIn(store.clone(), full.to_owned()));
                 ui.close();
@@ -2797,6 +2902,23 @@ fn render_folder(
     }
 }
 
+/// Whether a drop is a no-op or invalid (dropping a folder into itself/subtree).
+fn is_noop_drop(payload: &DragPayload, to: &StoreId, folder: &str) -> bool {
+    match payload {
+        // A session drop always offers a choice (copy is useful even in place).
+        DragPayload::Session { .. } => false,
+        DragPayload::Folder { store, path } => {
+            if store != to {
+                return false;
+            }
+            let base = path.rsplit('/').next().unwrap_or(path);
+            let new = if folder.is_empty() { base.to_owned() } else { format!("{folder}/{base}") };
+            // Same spot, into itself, or into its own subtree.
+            new == *path || folder == path || folder.starts_with(&format!("{path}/"))
+        }
+    }
+}
+
 /// A stable salt per store so folder headers in different stores don't collide.
 fn store_salt(store: &StoreId) -> String {
     match store {
@@ -2815,7 +2937,15 @@ fn session_row(
     editable: bool,
     action: &mut Option<TreeAction>,
 ) {
-    let resp = ui.selectable_label(false, format!("🖥 {name}"));
+    // The row is a drag source; its inner response still handles click/menu.
+    let drag_id = egui::Id::new((store_salt(store), "session", id));
+    let resp = ui
+        .dnd_drag_source(
+            drag_id,
+            DragPayload::Session { store: store.clone(), id: id.to_owned() },
+            |ui| ui.selectable_label(false, format!("🖥 {name}")),
+        )
+        .inner;
     if resp.double_clicked() {
         *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
     }
