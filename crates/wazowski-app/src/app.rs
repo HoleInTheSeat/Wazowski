@@ -95,8 +95,8 @@ impl VaultState {
 /// A modal dialog, at most one at a time.
 enum Dialog {
     None,
-    UnlockVault { password: String, error: Option<String> },
-    CreateVault { password: String, confirm: String, error: Option<String> },
+    UnlockVault { password: String, remember: bool, error: Option<String> },
+    CreateVault { password: String, confirm: String, remember: bool, error: Option<String> },
     EditSession(SessionForm),
     HostKey { info: UnknownHostKey, changed: bool, tab_id: u64 },
     QuickConnect(ConnectAuthForm),
@@ -104,6 +104,16 @@ enum Dialog {
     CreateCredential(CredentialPrompt),
     NewFolder { name: String },
     RenameFolder { old: String, name: String },
+    ConfirmDeleteVault,
+    AskUsername(UsernamePrompt),
+}
+
+/// Prompt for a username at connect time when the session has none.
+struct UsernamePrompt {
+    title: String,
+    session: Session,
+    material: AuthMaterial,
+    username: String,
 }
 
 /// How a quick connection should authenticate.
@@ -361,7 +371,8 @@ impl App {
     }
 
     /// Spawns a connection to `session` with already-resolved credentials,
-    /// letting the vault entry's username override the session's.
+    /// letting the vault entry's username override the session's. If no username
+    /// is available anywhere, prompts for one (without persisting it).
     fn connect_with(
         &mut self,
         title: &str,
@@ -370,17 +381,33 @@ impl App {
         ctx: &egui::Context,
     ) {
         let username = resolved.username.unwrap_or_else(|| session.username.clone());
-        let params = ConnectParams {
+        if username.trim().is_empty() {
+            self.dialog = Dialog::AskUsername(UsernamePrompt {
+                title: title.to_owned(),
+                session: session.clone(),
+                material: resolved.material,
+                username: String::new(),
+            });
+            return;
+        }
+        let mut session = session.clone();
+        session.username = username;
+        let params = self.params_for(&session, resolved.material);
+        self.open_connecting_tab(title.to_owned(), params, ctx);
+    }
+
+    /// Builds connect parameters for a session with resolved auth material.
+    fn params_for(&self, session: &Session, material: AuthMaterial) -> ConnectParams {
+        ConnectParams {
             host: session.host.clone(),
             port: session.port,
-            username,
-            auth: resolved.material,
+            username: session.username.clone(),
+            auth: material,
             policy: HostKeyPolicy::Strict,
             size: TermSize::default(),
             known_hosts: None,
             legacy_algorithms: session.legacy,
-        };
-        self.open_connecting_tab(title.to_owned(), params, ctx);
+        }
     }
 
     /// Opens a tab that shows connection progress and the handshake log.
@@ -565,41 +592,75 @@ impl App {
                     self.dialog = Dialog::EditSession(SessionForm::new());
                 }
             });
-            ui.menu_button("Vault", |ui| match &self.vault {
-                VaultState::Absent => {
-                    if ui.button("Create vault…").clicked() {
-                        self.dialog = Dialog::CreateVault {
-                            password: String::new(),
-                            confirm: String::new(),
-                            error: None,
-                        };
+            ui.menu_button("Vault", |ui| {
+                let exists = !matches!(self.vault, VaultState::Absent);
+                match &self.vault {
+                    VaultState::Absent => {
+                        if ui.button("Create vault…").clicked() {
+                            self.dialog = Dialog::CreateVault {
+                                password: String::new(),
+                                confirm: String::new(),
+                                remember: false,
+                                error: None,
+                            };
+                        }
+                    }
+                    VaultState::Locked => {
+                        if ui.button("Unlock vault…").clicked() {
+                            self.dialog = Dialog::UnlockVault {
+                                password: String::new(),
+                                remember: false,
+                                error: None,
+                            };
+                        }
+                    }
+                    VaultState::Unlocked(_) => {
+                        if ui.button("Manage secrets…").clicked() {
+                            self.dialog = Dialog::VaultManager(VaultManagerState::default());
+                        }
                     }
                 }
-                VaultState::Locked => {
-                    if ui.button("Unlock vault…").clicked() {
-                        self.dialog =
-                            Dialog::UnlockVault { password: String::new(), error: None };
-                    }
-                }
-                VaultState::Unlocked(_) => {
-                    if ui.button("Manage secrets…").clicked() {
-                        self.dialog = Dialog::VaultManager(VaultManagerState::default());
-                    }
+                if exists {
                     ui.separator();
-                    if ui.button("Remember on this device").clicked()
-                        && let Some(vault) = self.vault.unlocked()
-                        && let Err(e) = vault.enable_keyring_unlock()
-                    {
-                        self.error = Some(format!("{e:#}"));
+                    if ui.button("Back up vault…").clicked() {
+                        self.backup_vault();
                     }
-                    if ui.button("Forget on this device").clicked()
-                        && let Err(e) = Vault::disable_keyring_unlock()
-                    {
-                        self.error = Some(format!("{e:#}"));
+                    if ui.button("Delete vault…").clicked() {
+                        self.dialog = Dialog::ConfirmDeleteVault;
                     }
                 }
             });
         });
+    }
+
+    /// Copies the vault file to a user-chosen location.
+    fn backup_vault(&mut self) {
+        if !Vault::exists(&self.vault_path) {
+            self.error = Some("There is no vault to back up.".into());
+            return;
+        }
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name("vault.enc.backup")
+            .save_file()
+        else {
+            return;
+        };
+        if let Err(e) = std::fs::copy(&self.vault_path, &dest) {
+            self.error = Some(format!("Backup failed: {e}"));
+        }
+    }
+
+    /// Deletes the vault file and any saved key, after confirmation.
+    fn delete_vault(&mut self) {
+        let _ = Vault::disable_keyring_unlock();
+        if let Err(e) = std::fs::remove_file(&self.vault_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            self.error = Some(format!("Could not delete the vault: {e}"));
+            return;
+        }
+        self.vault = VaultState::Absent;
+        self.dialog = Dialog::None;
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -614,7 +675,7 @@ impl App {
         match &self.vault {
             VaultState::Locked => {
                 if ui.button("🔒 Unlock vault").clicked() {
-                    self.dialog = Dialog::UnlockVault { password: String::new(), error: None };
+                    self.dialog = Dialog::UnlockVault { password: String::new(), remember: false, error: None };
                 }
             }
             VaultState::Absent => {
@@ -835,6 +896,82 @@ impl App {
             Dialog::CreateCredential(_) => self.show_create_credential(ctx),
             Dialog::NewFolder { .. } => self.show_new_folder(ctx),
             Dialog::RenameFolder { .. } => self.show_rename_folder(ctx),
+            Dialog::ConfirmDeleteVault => self.show_confirm_delete_vault(ctx),
+            Dialog::AskUsername(_) => self.show_ask_username(ctx),
+        }
+    }
+
+    fn show_confirm_delete_vault(&mut self, ctx: &egui::Context) {
+        let mut delete = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("delete-vault")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading(RichText::new("⚠ Delete vault").color(Color32::LIGHT_RED));
+            ui.label(
+                "This permanently deletes the encrypted vault file and all stored \
+                 passwords and keys. Sessions that reference them will prompt for new \
+                 credentials. Back up first if unsure.",
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Delete vault").clicked() {
+                    delete = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if delete {
+            self.delete_vault();
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn show_ask_username(&mut self, ctx: &egui::Context) {
+        let mut submit = false;
+        let mut cancel = false;
+        if let Dialog::AskUsername(prompt) = &mut self.dialog {
+            egui::Modal::new(egui::Id::new("ask-username")).show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.heading("Username");
+                ui.label(
+                    RichText::new(format!("Enter the username for {}.", prompt.session.host))
+                        .weak(),
+                );
+                ui.add_space(6.0);
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.username).hint_text("Username"),
+                );
+                autofocus(ui, &field);
+                submit |= entered(ui, &field);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    submit |= ui.button("Connect").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if submit
+            && let Dialog::AskUsername(prompt) = &self.dialog
+        {
+            let username = prompt.username.trim().to_owned();
+            if !username.is_empty() {
+                let (title, mut session, material) =
+                    (prompt.title.clone(), prompt.session.clone(), prompt.material.clone());
+                session.username = username; // in-memory only; not persisted
+                self.dialog = Dialog::None;
+                self.open_connecting_tab(
+                    title,
+                    self.params_for(&session, material),
+                    ctx,
+                );
+            }
+        }
+        if cancel {
+            self.dialog = Dialog::None;
         }
     }
 
@@ -846,10 +983,8 @@ impl App {
                 ui.set_width(300.0);
                 ui.heading("New folder");
                 let field = ui.add(egui::TextEdit::singleline(name).hint_text("Folder name"));
-                field.request_focus();
-                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    submit = true;
-                }
+                autofocus(ui, &field);
+                submit |= entered(ui, &field);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     submit |= ui.button("Create").clicked();
@@ -879,10 +1014,8 @@ impl App {
                 ui.set_width(300.0);
                 ui.heading("Rename folder");
                 let field = ui.add(egui::TextEdit::singleline(name));
-                field.request_focus();
-                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    submit = true;
-                }
+                autofocus(ui, &field);
+                submit |= entered(ui, &field);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     submit |= ui.button("Rename").clicked();
@@ -1005,7 +1138,7 @@ impl App {
     fn show_unlock_vault(&mut self, ctx: &egui::Context) {
         let mut submit = false;
         let mut cancel = false;
-        if let Dialog::UnlockVault { password, error } = &mut self.dialog {
+        if let Dialog::UnlockVault { password, remember, error } = &mut self.dialog {
             egui::Modal::new(egui::Id::new("unlock-vault")).show(ctx, |ui| {
                 ui.set_width(320.0);
                 ui.heading("Unlock vault");
@@ -1015,21 +1148,17 @@ impl App {
                         .password(true)
                         .hint_text("Master password"),
                 );
-                field.request_focus();
+                autofocus(ui, &field);
+                submit |= entered(ui, &field);
+                ui.checkbox(remember, "Remember on this device")
+                    .on_hover_text("Stores the key in your OS keyring so it unlocks automatically.");
                 if let Some(error) = error {
                     ui.colored_label(Color32::LIGHT_RED, error.as_str());
                 }
-                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    submit = true;
-                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Unlock").clicked() {
-                        submit = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
+                    submit |= ui.button("Unlock").clicked();
+                    cancel |= ui.button("Cancel").clicked();
                 });
             });
         }
@@ -1042,11 +1171,13 @@ impl App {
     }
 
     fn try_unlock_vault(&mut self) {
-        let Dialog::UnlockVault { password, error } = &mut self.dialog else { return };
+        let Dialog::UnlockVault { password, remember, error } = &mut self.dialog else { return };
         match Vault::open(self.vault_path.clone(), password) {
             Ok(vault) => {
+                let remember = *remember;
                 self.vault = VaultState::Unlocked(Box::new(vault));
                 self.dialog = Dialog::None;
+                self.apply_remember(remember);
             }
             Err(VaultError::BadPassword) => {
                 *error = Some("Incorrect master password.".into());
@@ -1055,10 +1186,22 @@ impl App {
         }
     }
 
+    /// Enables or disables keyring auto-unlock to match the "remember" choice.
+    fn apply_remember(&mut self, remember: bool) {
+        let result = if remember {
+            self.vault.unlocked().map(|v| v.enable_keyring_unlock()).unwrap_or(Ok(()))
+        } else {
+            Vault::disable_keyring_unlock()
+        };
+        if let Err(e) = result {
+            self.error = Some(format!("Could not update the saved password: {e:#}"));
+        }
+    }
+
     fn show_create_vault(&mut self, ctx: &egui::Context) {
         let mut submit = false;
         let mut cancel = false;
-        if let Dialog::CreateVault { password, confirm, error } = &mut self.dialog {
+        if let Dialog::CreateVault { password, confirm, remember, error } = &mut self.dialog {
             egui::Modal::new(egui::Id::new("create-vault")).show(ctx, |ui| {
                 ui.set_width(340.0);
                 ui.heading("Create vault");
@@ -1069,30 +1212,27 @@ impl App {
                     .weak(),
                 );
                 ui.add_space(6.0);
-                ui.add(
+                let pw_field = ui.add(
                     egui::TextEdit::singleline(password)
                         .password(true)
                         .hint_text("Master password"),
                 );
+                autofocus(ui, &pw_field);
                 let confirm_field = ui.add(
                     egui::TextEdit::singleline(confirm)
                         .password(true)
                         .hint_text("Confirm password"),
                 );
-                if confirm_field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    submit = true;
-                }
+                submit |= entered(ui, &confirm_field);
+                ui.checkbox(remember, "Remember on this device")
+                    .on_hover_text("Stores the key in your OS keyring so it unlocks automatically.");
                 if let Some(error) = error {
                     ui.colored_label(Color32::LIGHT_RED, error.as_str());
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Create").clicked() {
-                        submit = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
+                    submit |= ui.button("Create").clicked();
+                    cancel |= ui.button("Cancel").clicked();
                 });
             });
         }
@@ -1105,7 +1245,9 @@ impl App {
     }
 
     fn try_create_vault(&mut self) {
-        let Dialog::CreateVault { password, confirm, error } = &mut self.dialog else { return };
+        let Dialog::CreateVault { password, confirm, remember, error } = &mut self.dialog else {
+            return;
+        };
         if password.len() < 8 {
             *error = Some("Use at least 8 characters.".into());
             return;
@@ -1116,8 +1258,10 @@ impl App {
         }
         match Vault::create(self.vault_path.clone(), password) {
             Ok(vault) => {
+                let remember = *remember;
                 self.vault = VaultState::Unlocked(Box::new(vault));
                 self.dialog = Dialog::None;
+                self.apply_remember(remember);
             }
             Err(e) => *error = Some(format!("{e:#}")),
         }
@@ -1283,8 +1427,8 @@ impl App {
             Ok(p) => p,
             Err(_) => return self.set_form_error("Port must be a number."),
         };
-        if host.is_empty() || username.is_empty() {
-            return self.set_form_error("Host and username are required.");
+        if host.is_empty() {
+            return self.set_form_error("A host is required.");
         }
 
         // Build the session, reusing the id when editing so a default vault name is stable.
@@ -1473,10 +1617,8 @@ impl App {
                                 .password(true)
                                 .hint_text("Password"),
                         );
-                        field.request_focus();
-                        if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            connect = true;
-                        }
+                        autofocus(ui, &field);
+                        connect |= entered(ui, &field);
                     }
                     ConnectAuth::VaultSecret => {
                         if !vault_unlocked {
@@ -2110,6 +2252,20 @@ fn connecting_view(ui: &mut egui::Ui, c: &Connecting, tab_id: u64) -> Option<u64
         }
     });
     retry
+}
+
+/// Requests focus for a field only when nothing else is focused, so auto-focus
+/// works on first open without stealing focus every frame (which would break
+/// Enter-to-submit, since the field would never register as losing focus).
+fn autofocus(ui: &egui::Ui, resp: &egui::Response) {
+    if ui.memory(|m| m.focused().is_none()) {
+        resp.request_focus();
+    }
+}
+
+/// True if Enter was pressed to submit this single-line field.
+fn entered(ui: &egui::Ui, resp: &egui::Response) -> bool {
+    resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
 }
 
 /// A menu button that shows its keyboard shortcut; returns whether it was clicked.
