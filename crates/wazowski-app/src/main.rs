@@ -1,13 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod conn_log;
 mod connect;
 mod sftp_ui;
 
 use app::App;
 
 fn main() -> eframe::Result {
-    env_logger::init();
+    conn_log::init();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Wazowski")

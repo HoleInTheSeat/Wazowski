@@ -5562,6 +5562,7 @@ dependencies = [
  "dirs",
  "egui",
  "log",
+ "rand 0.10.3",
  "russh",
  "russh-sftp",
  "tempfile",

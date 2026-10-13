@@ -234,6 +234,12 @@ async fn establish_inner(params: &ConnectParams) -> Result<Handle<Handler>, Conn
         verdict.clone(),
     );
 
+    log::info!(
+        "connecting to {}:{}{}",
+        params.host,
+        params.port,
+        if params.legacy_algorithms { " (legacy algorithms enabled)" } else { "" }
+    );
     let mut handle = match client::connect(config, (params.host.as_str(), params.port), handler)
         .await
     {
@@ -252,7 +258,9 @@ async fn establish_inner(params: &ConnectParams) -> Result<Handle<Handler>, Conn
         }
     };
 
+    log::info!("transport established; authenticating as {}", params.username);
     authenticate(&mut handle, &params.username, &params.auth).await?;
+    log::info!("authenticated; opening shell");
     Ok(handle)
 }
 
@@ -572,9 +580,15 @@ fn preferred_algorithms(legacy: bool) -> russh::Preferred {
     let mut mac = preferred.mac.into_owned();
     mac.extend_from_slice(&[russh::mac::HMAC_SHA256, russh::mac::HMAC_SHA1]);
 
+    // Old gear often presents only an ssh-rsa (already in the defaults) or an
+    // ssh-dss host key; advertise DSA so host-key negotiation can succeed.
+    let mut key = preferred.key.into_owned();
+    key.push(russh::keys::Algorithm::Dsa);
+
     preferred.kex = Cow::Owned(dedup(kex));
     preferred.cipher = Cow::Owned(dedup(cipher));
     preferred.mac = Cow::Owned(dedup(mac));
+    preferred.key = Cow::Owned(dedup(key));
     preferred
 }
 

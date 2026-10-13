@@ -13,6 +13,7 @@ russh.workspace = true
 russh-sftp.workspace = true
 tokio.workspace = true
 dirs.workspace = true
+rand.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

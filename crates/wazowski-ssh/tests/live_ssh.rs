@@ -240,3 +240,80 @@ fn sftp_list_upload_download() {
 
     assert!(sftp.canonicalize(".").is_ok());
 }
+
+/// Starts an sshd restricted to legacy algorithms (like old ProCurve gear):
+/// group14-sha1 KEX, aes128-cbc, hmac-sha1, and an RSA host key advertised as ssh-rsa.
+fn start_legacy_server(kex: &str) -> TestServer {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let host_key = d.join("host_rsa");
+    // RSA host key so the server can advertise ssh-rsa.
+    let status = Command::new("ssh-keygen")
+        .args(["-q", "-t", "rsa", "-b", "2048", "-N", "", "-f"])
+        .arg(&host_key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let client_key = d.join("client_ed25519");
+    keygen(&client_key);
+    let client_key_pem = fs::read_to_string(&client_key).unwrap();
+    let authorized = d.join("authorized_keys");
+    fs::copy(client_key.with_extension("pub"), &authorized).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&authorized, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let port = free_port();
+    let config = d.join("sshd_config");
+    let mut f = fs::File::create(&config).unwrap();
+    writeln!(
+        f,
+        "Port {port}\nListenAddress 127.0.0.1\nHostKey {host}\nPidFile {pid}\n\
+         AuthorizedKeysFile {auth}\nUsePAM no\nStrictModes no\n\
+         KexAlgorithms {kex}\nCiphers aes128-cbc\nMACs hmac-sha1\n\
+         HostKeyAlgorithms ssh-rsa\nPubkeyAcceptedAlgorithms +ssh-rsa\n\
+         PasswordAuthentication no\nPubkeyAuthentication yes\n\
+         Subsystem sftp internal-sftp\n",
+        host = host_key.display(),
+        pid = d.join("sshd.pid").display(),
+        auth = authorized.display(),
+    )
+    .unwrap();
+    let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap();
+    let child = Command::new(sshd).arg("-D").arg("-f").arg(&config).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "legacy sshd did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    TestServer { child, port, client_key_pem, _dir: dir }
+}
+
+#[test]
+#[ignore = "spawns a local sshd"]
+fn legacy_mode_connects_to_restricted_server() {
+    for kex in [
+        "diffie-hellman-group14-sha1",
+        "diffie-hellman-group1-sha1",
+        "diffie-hellman-group-exchange-sha1",
+    ] {
+        let server = start_legacy_server(kex);
+        let known_hosts = tempfile::NamedTempFile::new().unwrap();
+        let params = ConnectParams {
+            host: "127.0.0.1".into(),
+            port: server.port,
+            username: whoami(),
+            auth: AuthMaterial::Key { pem: server.client_key_pem.clone(), passphrase: None },
+            policy: HostKeyPolicy::AcceptNew,
+            size: TermSize::default(),
+            known_hosts: Some(known_hosts.path().to_path_buf()),
+            legacy_algorithms: true,
+        };
+        connect(params, || {})
+            .unwrap_or_else(|e| panic!("legacy mode failed to connect with {kex}: {e}"));
+    }
+}

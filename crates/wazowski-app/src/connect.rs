@@ -12,13 +12,13 @@ use egui::Context;
 use wazowski_ssh::{ConnectError, ConnectParams, SshBackend, UnknownHostKey, connect};
 use wazowski_term::BackendEvent;
 
+use crate::conn_log::{self, LogSink};
+
 /// A connection attempt running on a worker thread.
 pub struct PendingConnect {
-    /// Tab title to use once connected.
-    pub title: String,
-    /// The parameters, kept so the attempt can be retried after trusting a host.
-    pub params: ConnectParams,
     result: Receiver<Result<Connected, ConnectError>>,
+    /// Captures the handshake log (including russh negotiation) for display.
+    sink: LogSink,
 }
 
 /// A freshly established session, handed to the app to wrap in a terminal tab.
@@ -43,9 +43,11 @@ pub enum Progress {
 
 impl PendingConnect {
     /// Spawns a worker thread that connects with `params` and repaints `ctx` on completion.
-    pub fn spawn(title: String, params: ConnectParams, ctx: &Context) -> Self {
+    pub fn spawn(params: ConnectParams, ctx: &Context) -> Self {
+        // Register the log sink before the worker starts so no lines are missed.
+        let sink = conn_log::register();
         let (tx, rx) = std::sync::mpsc::channel();
-        let worker_params = params.clone();
+        let worker_params = params;
         let repaint = ctx.clone();
         thread::Builder::new()
             .name("wz-connect".into())
@@ -59,7 +61,12 @@ impl PendingConnect {
                 repaint.request_repaint();
             })
             .expect("spawning a thread should not fail");
-        Self { title, params, result: rx }
+        Self { result: rx, sink }
+    }
+
+    /// Drains newly captured handshake log lines into `buf`.
+    pub fn drain_log(&self, buf: &mut Vec<String>) {
+        self.sink.drain_into(buf);
     }
 
     /// Checks whether the attempt has finished, without blocking.
