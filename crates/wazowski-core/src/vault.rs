@@ -48,18 +48,37 @@ const KEYRING_ACCOUNT: &str = "master-key";
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct MasterKey([u8; KEY_LEN]);
 
-/// A secret entry: a connection password, or a named private key with its optional passphrase.
+/// A stored credential: a password or a private key, each with an optional
+/// username. When a session references the entry, a username here overrides the
+/// one on the session (like MobaXterm's named credentials).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Secret {
-    /// A login password.
-    Password(String),
-    /// A private key in PEM/OpenSSH form, with an optional passphrase to decrypt it.
+    /// A login password, with an optional username.
+    Password {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        password: String,
+    },
+    /// A private key in PEM/OpenSSH form, with an optional passphrase and username.
     PrivateKey {
         pem: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         passphrase: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
     },
+}
+
+impl Secret {
+    /// The username this credential overrides the session's with, if any.
+    pub fn username(&self) -> Option<&str> {
+        match self {
+            Secret::Password { username, .. } | Secret::PrivateKey { username, .. } => {
+                username.as_deref()
+            }
+        }
+    }
 }
 
 /// The decrypted contents of the vault: named secrets.
@@ -377,18 +396,22 @@ mod tests {
         let path = dir.path().join("vault.enc");
 
         let mut vault = Vault::create(path.clone(), "correct horse").unwrap();
-        vault.put("prod-root", Secret::Password("hunter2".into())).unwrap();
+        vault.put("prod-root", Secret::Password { username: None, password: "hunter2".into() }).unwrap();
         vault
             .put(
                 "deploy-key",
-                Secret::PrivateKey { pem: "-----BEGIN-----\nx\n".into(), passphrase: Some("pw".into()) },
+                Secret::PrivateKey {
+                    pem: "-----BEGIN-----\nx\n".into(),
+                    passphrase: Some("pw".into()),
+                    username: Some("deploy".into()),
+                },
             )
             .unwrap();
         drop(vault);
 
         let reopened = Vault::open(path, "correct horse").unwrap();
         assert_eq!(reopened.names(), vec!["deploy-key", "prod-root"]);
-        assert_eq!(reopened.get("prod-root"), Some(&Secret::Password("hunter2".into())));
+        assert_eq!(reopened.get("prod-root"), Some(&Secret::Password { username: None, password: "hunter2".into() }));
     }
 
     #[test]
@@ -445,14 +468,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
         let mut vault = fast_vault(path.clone(), "old");
-        vault.put("x", Secret::Password("secret".into())).unwrap();
+        vault.put("x", Secret::Password { username: None, password: "secret".into() }).unwrap();
         let old_salt = vault.salt;
         vault.change_password("new").unwrap();
         assert_ne!(vault.salt, old_salt, "salt should be rotated");
 
         assert!(matches!(Vault::open(path.clone(), "old"), Err(VaultError::BadPassword)));
         let reopened = Vault::open(path, "new").unwrap();
-        assert_eq!(reopened.get("x"), Some(&Secret::Password("secret".into())));
+        assert_eq!(reopened.get("x"), Some(&Secret::Password { username: None, password: "secret".into() }));
     }
 
     // Touches the real OS keyring, so it is not run by default. Run with:
@@ -463,12 +486,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
         let mut vault = Vault::create(path.clone(), "master").unwrap();
-        vault.put("x", Secret::Password("s3cret".into())).unwrap();
+        vault.put("x", Secret::Password { username: None, password: "s3cret".into() }).unwrap();
         vault.enable_keyring_unlock().unwrap();
         drop(vault);
 
         let opened = Vault::open_with_keyring(path).unwrap().expect("cached key should open it");
-        assert_eq!(opened.get("x"), Some(&Secret::Password("s3cret".into())));
+        assert_eq!(opened.get("x"), Some(&Secret::Password { username: None, password: "s3cret".into() }));
 
         Vault::disable_keyring_unlock().unwrap();
     }
@@ -477,7 +500,7 @@ mod tests {
     fn remove_secret() {
         let dir = tempdir().unwrap();
         let mut vault = fast_vault(dir.path().join("vault.enc"), "pw");
-        vault.put("a", Secret::Password("1".into())).unwrap();
+        vault.put("a", Secret::Password { username: None, password: "1".into() }).unwrap();
         assert!(vault.remove("a").unwrap());
         assert!(!vault.remove("a").unwrap());
         assert!(vault.get("a").is_none());

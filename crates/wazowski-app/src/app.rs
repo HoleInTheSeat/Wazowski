@@ -101,6 +101,7 @@ enum Dialog {
     HostKey { info: UnknownHostKey, changed: bool, tab_id: u64 },
     QuickConnect(ConnectAuthForm),
     VaultManager(VaultManagerState),
+    CreateCredential(CredentialPrompt),
 }
 
 /// How a quick connection should authenticate.
@@ -158,6 +159,8 @@ struct SecretForm {
     original: Option<String>,
     name: String,
     kind: SecretKind,
+    /// Optional username stored with the credential (overrides the session's).
+    username: String,
     value: String,
     passphrase: String,
 }
@@ -174,8 +177,22 @@ impl SecretForm {
             original: None,
             name: String::new(),
             kind: SecretKind::Password,
+            username: String::new(),
             value: String::new(),
             passphrase: String::new(),
+        }
+    }
+
+    /// Builds the vault secret this form describes (value assumed non-empty).
+    fn to_secret(&self) -> Secret {
+        let username = (!self.username.trim().is_empty()).then(|| self.username.trim().to_owned());
+        match self.kind {
+            SecretKind::Password => Secret::Password { username, password: self.value.clone() },
+            SecretKind::Key => Secret::PrivateKey {
+                pem: self.value.clone(),
+                passphrase: (!self.passphrase.is_empty()).then(|| self.passphrase.clone()),
+                username,
+            },
         }
     }
 }
@@ -217,6 +234,29 @@ enum SecretSource {
     Existing,
     /// Create and store a new credential.
     New,
+}
+
+/// A successfully resolved credential for a connection.
+struct ResolvedAuth {
+    material: AuthMaterial,
+    /// Username override from the vault entry, if it carried one.
+    username: Option<String>,
+}
+
+/// Why a session's credential could not be resolved.
+enum AuthProblem {
+    /// The referenced vault entry does not exist yet; prompt to create it
+    /// (MobaXterm-style placeholder: created on first use).
+    Missing { name: String, kind: AuthMethod },
+    /// Any other problem, already phrased for display.
+    Message(String),
+}
+
+/// Prompt to create a missing named credential, then continue connecting.
+struct CredentialPrompt {
+    form: SecretForm,
+    /// The session to connect once the credential exists.
+    then_connect: Session,
 }
 
 pub struct App {
@@ -297,30 +337,42 @@ impl App {
     // --- Connecting ---------------------------------------------------------
 
     /// Starts connecting to `session`, resolving its credentials from the vault.
+    /// A missing named credential opens a prompt to create it, then continues.
     fn start_connect(&mut self, session: &Session, ctx: &egui::Context) {
-        let auth = match self.resolve_auth(&session.auth) {
-            Ok(auth) => auth,
-            Err(e) => {
-                self.error = Some(e);
-                return;
+        match self.resolve_auth(&session.auth) {
+            Ok(resolved) => self.connect_with(&session.name, session, resolved, ctx),
+            Err(AuthProblem::Missing { name, kind }) => {
+                let mut form = SecretForm::new();
+                form.name = name;
+                form.username = session.username.clone();
+                form.kind = match kind {
+                    AuthMethod::Key => SecretKind::Key,
+                    _ => SecretKind::Password,
+                };
+                self.dialog = Dialog::CreateCredential(CredentialPrompt {
+                    form,
+                    then_connect: session.clone(),
+                });
             }
-        };
-        self.connect_with(&session.name, session, auth, ctx);
+            Err(AuthProblem::Message(m)) => self.error = Some(m),
+        }
     }
 
-    /// Spawns a connection to `session` with already-resolved credentials.
+    /// Spawns a connection to `session` with already-resolved credentials,
+    /// letting the vault entry's username override the session's.
     fn connect_with(
         &mut self,
         title: &str,
         session: &Session,
-        auth: AuthMaterial,
+        resolved: ResolvedAuth,
         ctx: &egui::Context,
     ) {
+        let username = resolved.username.unwrap_or_else(|| session.username.clone());
         let params = ConnectParams {
             host: session.host.clone(),
             port: session.port,
-            username: session.username.clone(),
-            auth,
+            username,
+            auth: resolved.material,
             policy: HostKeyPolicy::Strict,
             size: TermSize::default(),
             known_hosts: None,
@@ -359,14 +411,17 @@ impl App {
     }
 
     /// Resolves a quick-connect auth choice into connect material.
-    fn resolve_form_auth(&self, form: &ConnectAuthForm) -> Result<AuthMaterial, String> {
+    fn resolve_form_auth(&self, form: &ConnectAuthForm) -> Result<ResolvedAuth, String> {
         match form.method {
-            ConnectAuth::Agent => Ok(AuthMaterial::Agent),
+            ConnectAuth::Agent => Ok(ResolvedAuth { material: AuthMaterial::Agent, username: None }),
             ConnectAuth::Password => {
                 if form.password.is_empty() {
                     return Err("Enter a password.".into());
                 }
-                Ok(AuthMaterial::Password(form.password.clone()))
+                Ok(ResolvedAuth {
+                    material: AuthMaterial::Password(form.password.clone()),
+                    username: None,
+                })
             }
             ConnectAuth::VaultSecret => {
                 let name = form
@@ -374,39 +429,32 @@ impl App {
                     .as_deref()
                     .ok_or("Choose a vault entry.".to_string())?;
                 let vault = self.vault.unlocked().ok_or("Unlock the vault first.".to_string())?;
-                match vault.get(name) {
-                    Some(Secret::Password(p)) => Ok(AuthMaterial::Password(p.clone())),
-                    Some(Secret::PrivateKey { pem, passphrase }) => Ok(AuthMaterial::Key {
-                        pem: pem.clone(),
-                        passphrase: passphrase.clone(),
-                    }),
-                    None => Err(format!("No vault entry named '{name}'.")),
-                }
+                let secret = vault.get(name).ok_or(format!("No vault entry named '{name}'."))?;
+                Ok(ResolvedAuth { material: material_from(secret), username: secret.username().map(str::to_owned) })
             }
         }
     }
 
-    /// Turns a session's stored auth choice into connect-ready material.
-    fn resolve_auth(&self, auth: &Auth) -> Result<AuthMaterial, String> {
-        match auth {
-            Auth::Agent => Ok(AuthMaterial::Agent),
-            Auth::Password { secret } => match self.vault.unlocked() {
-                Some(vault) => match vault.get(secret) {
-                    Some(Secret::Password(p)) => Ok(AuthMaterial::Password(p.clone())),
-                    _ => Err(format!("No password named '{secret}' in the vault.")),
-                },
-                None => Err("Unlock the vault to use a saved password.".into()),
-            },
-            Auth::Key { secret } => match self.vault.unlocked() {
-                Some(vault) => match vault.get(secret) {
-                    Some(Secret::PrivateKey { pem, passphrase }) => Ok(AuthMaterial::Key {
-                        pem: pem.clone(),
-                        passphrase: passphrase.clone(),
-                    }),
-                    _ => Err(format!("No private key named '{secret}' in the vault.")),
-                },
-                None => Err("Unlock the vault to use a saved key.".into()),
-            },
+    /// Turns a session's stored auth choice into connect-ready material, or a
+    /// problem the caller can act on (e.g. a missing credential to create).
+    fn resolve_auth(&self, auth: &Auth) -> Result<ResolvedAuth, AuthProblem> {
+        let (name, kind) = match auth {
+            Auth::Agent => {
+                return Ok(ResolvedAuth { material: AuthMaterial::Agent, username: None });
+            }
+            Auth::Password { secret } => (secret, AuthMethod::Password),
+            Auth::Key { secret } => (secret, AuthMethod::Key),
+        };
+        let vault = self
+            .vault
+            .unlocked()
+            .ok_or(AuthProblem::Message("Unlock the vault to use saved credentials.".into()))?;
+        match vault.get(name) {
+            Some(secret) => Ok(ResolvedAuth {
+                material: material_from(secret),
+                username: secret.username().map(str::to_owned),
+            }),
+            None => Err(AuthProblem::Missing { name: name.clone(), kind }),
         }
     }
 
@@ -745,7 +793,106 @@ impl App {
             Dialog::HostKey { .. } => self.show_host_key(ctx),
             Dialog::QuickConnect(_) => self.show_quick_connect(ctx),
             Dialog::VaultManager(_) => self.show_vault_manager(ctx),
+            Dialog::CreateCredential(_) => self.show_create_credential(ctx),
         }
+    }
+
+    /// First-use prompt to create a session's referenced-but-missing credential.
+    fn show_create_credential(&mut self, ctx: &egui::Context) {
+        let mut save = false;
+        let mut cancel = false;
+        if let Dialog::CreateCredential(prompt) = &mut self.dialog {
+            let form = &mut prompt.form;
+            egui::Modal::new(egui::Id::new("create-credential")).show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.heading("Create credential");
+                ui.label(
+                    RichText::new(format!(
+                        "This session needs a vault entry named '{}'. Create it now.",
+                        form.name
+                    ))
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                egui::Grid::new("cred-fields").num_columns(2).show(ui, |ui| {
+                    ui.label("Type");
+                    egui::ComboBox::from_id_salt("cred-kind")
+                        .selected_text(match form.kind {
+                            SecretKind::Password => "Password",
+                            SecretKind::Key => "Private key",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut form.kind, SecretKind::Password, "Password");
+                            ui.selectable_value(&mut form.kind, SecretKind::Key, "Private key");
+                        });
+                    ui.end_row();
+                    ui.label("Username");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.username)
+                            .hint_text("(optional, overrides the session's)"),
+                    );
+                    ui.end_row();
+                    match form.kind {
+                        SecretKind::Password => {
+                            ui.label("Password");
+                            let resp = ui.add(egui::TextEdit::singleline(&mut form.value).password(true));
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                save = true;
+                            }
+                            ui.end_row();
+                        }
+                        SecretKind::Key => {
+                            ui.label("Private key");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut form.value)
+                                    .hint_text("Paste the PEM private key")
+                                    .desired_rows(3),
+                            );
+                            ui.end_row();
+                            ui.label("Passphrase");
+                            ui.add(egui::TextEdit::singleline(&mut form.passphrase).password(true));
+                            ui.end_row();
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save and connect").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        }
+        if save {
+            self.save_credential_and_connect(ctx);
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// Stores the prompted credential, then resumes connecting to its session.
+    fn save_credential_and_connect(&mut self, ctx: &egui::Context) {
+        let Dialog::CreateCredential(prompt) = &self.dialog else { return };
+        if prompt.form.value.is_empty() {
+            return self.set_credential_error("Enter the credential value.");
+        }
+        let name = prompt.form.name.clone();
+        let secret = prompt.form.to_secret();
+        let session = prompt.then_connect.clone();
+        if let Err(e) = self.store_secret(&name, secret) {
+            return self.set_credential_error(&e);
+        }
+        self.dialog = Dialog::None;
+        self.start_connect(&session, ctx);
+    }
+
+    fn set_credential_error(&mut self, message: &str) {
+        // Surfaced via the global error bar (the modal has no error line of its own).
+        self.error = Some(message.to_owned());
     }
 
     fn show_unlock_vault(&mut self, ctx: &egui::Context) {
@@ -1053,11 +1200,16 @@ impl App {
                     if new_name.is_empty() { format!("session/{}", session.id) } else { new_name };
                 // Store the typed value under that name (blank keeps any existing one).
                 if !secret_input.is_empty() {
+                    // Store the session's username with the credential so it is self-contained.
+                    let cred_user = (!username.is_empty()).then(|| username.clone());
                     let secret = match method {
-                        AuthMethod::Password => Secret::Password(secret_input),
+                        AuthMethod::Password => {
+                            Secret::Password { username: cred_user, password: secret_input }
+                        }
                         AuthMethod::Key => Secret::PrivateKey {
                             pem: secret_input,
                             passphrase: (!key_passphrase.is_empty()).then_some(key_passphrase),
+                            username: cred_user,
                         },
                         AuthMethod::Agent => unreachable!("agent has no secret"),
                     };
@@ -1407,6 +1559,12 @@ impl App {
                                     );
                                 });
                             ui.end_row();
+                            ui.label("Username");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.username)
+                                    .hint_text("(optional, overrides session)"),
+                            );
+                            ui.end_row();
                             match form.kind {
                                 SecretKind::Password => {
                                     ui.label("Password");
@@ -1512,7 +1670,8 @@ impl App {
             Ok(k) => k,
             Err(e) => return self.set_vault_error(&format!("{e:#}")),
         };
-        let secret = Secret::PrivateKey { pem: generated.private_pem, passphrase: None };
+        let secret =
+            Secret::PrivateKey { pem: generated.private_pem, passphrase: None, username: None };
         if let Err(e) = self.store_secret(&name, secret) {
             return self.set_vault_error(&e);
         }
@@ -1526,9 +1685,13 @@ impl App {
     /// Loads an existing secret into the manager's edit form (values left blank
     /// so they are only overwritten when the user types a new value).
     fn begin_edit_secret(&mut self, name: &str) {
-        let kind = match self.vault.unlocked().and_then(|v| v.get(name)) {
-            Some(Secret::Password(_)) => SecretKind::Password,
-            Some(Secret::PrivateKey { .. }) => SecretKind::Key,
+        let (kind, username) = match self.vault.unlocked().and_then(|v| v.get(name)) {
+            Some(secret @ Secret::Password { .. }) => {
+                (SecretKind::Password, secret.username().unwrap_or_default().to_owned())
+            }
+            Some(secret @ Secret::PrivateKey { .. }) => {
+                (SecretKind::Key, secret.username().unwrap_or_default().to_owned())
+            }
             None => return,
         };
         if let Dialog::VaultManager(state) = &mut self.dialog {
@@ -1536,6 +1699,7 @@ impl App {
                 original: Some(name.to_owned()),
                 name: name.to_owned(),
                 kind,
+                username,
                 value: String::new(),
                 passphrase: String::new(),
             });
@@ -1573,13 +1737,7 @@ impl App {
         if form.value.is_empty() {
             return self.set_vault_error("Enter a value.");
         }
-        let secret = match form.kind {
-            SecretKind::Password => Secret::Password(form.value.clone()),
-            SecretKind::Key => Secret::PrivateKey {
-                pem: form.value.clone(),
-                passphrase: (!form.passphrase.is_empty()).then(|| form.passphrase.clone()),
-            },
-        };
+        let secret = form.to_secret();
         let result = match self.vault.unlocked_mut() {
             Some(vault) => vault.put(&name, secret).map_err(|e| format!("{e:#}")),
             None => Err("The vault is locked.".into()),
@@ -1722,6 +1880,16 @@ fn initial_vault_state(path: &std::path::Path) -> VaultState {
     match Vault::open_with_keyring(path.to_path_buf()) {
         Ok(Some(vault)) => VaultState::Unlocked(Box::new(vault)),
         _ => VaultState::Locked,
+    }
+}
+
+/// Converts a stored secret into connect-ready auth material.
+fn material_from(secret: &Secret) -> AuthMaterial {
+    match secret {
+        Secret::Password { password, .. } => AuthMaterial::Password(password.clone()),
+        Secret::PrivateKey { pem, passphrase, .. } => {
+            AuthMaterial::Key { pem: pem.clone(), passphrase: passphrase.clone() }
+        }
     }
 }
 
