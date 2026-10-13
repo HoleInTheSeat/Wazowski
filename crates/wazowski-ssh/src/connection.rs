@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use russh::client::{self, Handle};
+#[cfg(unix)]
 use russh::keys::agent::client::AgentClient;
 use russh::keys::ssh_key::HashAlg;
 use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, decode_secret_key};
@@ -306,7 +307,19 @@ async fn authenticate_key(
     Ok(handle.authenticate_publickey(username, key).await.map_err(to_other)?.success())
 }
 
+/// SSH-agent auth is currently only wired up on Unix (Unix domain socket).
+#[cfg(not(unix))]
+async fn authenticate_agent(
+    _handle: &mut Handle<Handler>,
+    _username: &str,
+) -> Result<bool, ConnectError> {
+    Err(ConnectError::Other(anyhow!(
+        "SSH-agent authentication isn't supported on this platform yet; use a key or password"
+    )))
+}
+
 /// Tries each identity the SSH agent offers until one authenticates.
+#[cfg(unix)]
 async fn authenticate_agent(
     handle: &mut Handle<Handler>,
     username: &str,
@@ -338,10 +351,12 @@ async fn authenticate_agent(
 }
 
 /// Adapts an [`AgentClient`] to russh's [`Signer`] so the agent signs auth challenges.
+#[cfg(unix)]
 struct AgentSigner(AgentClient<tokio::net::UnixStream>);
 
 /// Errors from agent signing. russh's [`Signer`] requires `From<SendError>`,
 /// which [`russh::Error`] does not provide, so this wraps both.
+#[cfg(unix)]
 #[derive(Debug, thiserror::Error)]
 enum SignError {
     #[error(transparent)]
@@ -350,6 +365,7 @@ enum SignError {
     Keys(#[from] russh::keys::Error),
 }
 
+#[cfg(unix)]
 impl russh::Signer for AgentSigner {
     type Error = SignError;
 
