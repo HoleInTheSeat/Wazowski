@@ -25,6 +25,7 @@ const PADDING: f32 = 4.0;
 pub struct TerminalView<'a> {
     terminal: &'a mut Terminal,
     font: FontId,
+    interactive: bool,
 }
 
 /// Maps between screen positions and terminal cells.
@@ -53,7 +54,7 @@ impl Grid {
 
 impl<'a> TerminalView<'a> {
     pub fn new(terminal: &'a mut Terminal) -> Self {
-        Self { terminal, font: FontId::monospace(14.0) }
+        Self { terminal, font: FontId::monospace(14.0), interactive: true }
     }
 
     pub fn font_size(mut self, size: f32) -> Self {
@@ -61,13 +62,21 @@ impl<'a> TerminalView<'a> {
         self
     }
 
+    /// When `false` (e.g. a modal dialog is open), the terminal won't take focus
+    /// or accept keyboard/mouse input, so keystrokes can't leak to the session.
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> Response {
-        let Self { terminal: t, font } = self;
+        let Self { terminal: t, font, interactive } = self;
         t.process(ui.ctx());
 
         let rect = ui.available_rect_before_wrap();
         let id = Id::new(("wazowski-terminal", t.id()));
-        let response = ui.interact(rect, id, Sense::click_and_drag());
+        let sense = if interactive { Sense::click_and_drag() } else { Sense::hover() };
+        let response = ui.interact(rect, id, sense);
         ui.advance_cursor_after_rect(rect);
 
         let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
@@ -81,6 +90,16 @@ impl<'a> TerminalView<'a> {
             cell_height: cell.y.round() as u16,
         });
         let grid = Grid { origin: inner.min, cell, cols, rows };
+
+        // While non-interactive (a dialog is up), give up focus so input goes to
+        // the dialog, not the remote session.
+        if !interactive {
+            if response.has_focus() {
+                response.surrender_focus();
+            }
+            paint(ui, t, rect, &grid, &font, false);
+            return response;
+        }
 
         if response.clicked() || response.drag_started() || ui.memory(|m| m.focused().is_none()) {
             response.request_focus();

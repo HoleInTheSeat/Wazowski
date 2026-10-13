@@ -992,12 +992,14 @@ impl App {
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
+        // A terminal shouldn't take keystrokes while a modal dialog is open.
+        let interactive = matches!(self.dialog, Dialog::None);
         // Collect retry/copy actions to apply after the borrow ends.
         let mut retry = None;
         match self.tabs.get_mut(self.active) {
             Some(tab) => match &mut tab.content {
                 TabContent::Terminal(terminal) => {
-                    TerminalView::new(terminal).show(ui);
+                    TerminalView::new(terminal).interactive(interactive).show(ui);
                 }
                 TabContent::Connecting(c) => {
                     if let Some(action) = connecting_view(ui, c, tab.id) {
