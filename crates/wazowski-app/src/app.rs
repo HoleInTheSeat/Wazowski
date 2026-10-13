@@ -105,6 +105,8 @@ enum Dialog {
     NewFolder { name: String },
     RenameFolder { old: String, name: String },
     ConfirmDeleteVault,
+    ConfirmQuit,
+    ConfirmImportVault { src: PathBuf },
     AskUsername(UsernamePrompt),
 }
 
@@ -281,6 +283,8 @@ pub struct App {
     dialog: Dialog,
     quick_connect: String,
     next_tab_id: u64,
+    /// Set once the user has confirmed quitting, so the window is allowed to close.
+    quitting: bool,
 }
 
 impl App {
@@ -300,6 +304,7 @@ impl App {
             dialog: Dialog::None,
             quick_connect: String::new(),
             next_tab_id: 1,
+            quitting: false,
         };
         app.open_local_shell(ctx);
         app
@@ -620,8 +625,11 @@ impl App {
                         }
                     }
                 }
+                ui.separator();
+                if ui.button("Import vault…").clicked() {
+                    self.import_vault();
+                }
                 if exists {
-                    ui.separator();
                     if ui.button("Back up vault…").clicked() {
                         self.backup_vault();
                     }
@@ -897,8 +905,99 @@ impl App {
             Dialog::NewFolder { .. } => self.show_new_folder(ctx),
             Dialog::RenameFolder { .. } => self.show_rename_folder(ctx),
             Dialog::ConfirmDeleteVault => self.show_confirm_delete_vault(ctx),
+            Dialog::ConfirmQuit => self.show_confirm_quit(ctx),
+            Dialog::ConfirmImportVault { .. } => self.show_confirm_import_vault(ctx),
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
         }
+    }
+
+    fn show_confirm_quit(&mut self, ctx: &egui::Context) {
+        let open = self.tabs.len();
+        let mut quit = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("confirm-quit")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading("Quit Wazowski?");
+            ui.label(format!(
+                "{open} tab{} open. Closing the window will end {} session{}.",
+                if open == 1 { " is" } else { "s are" },
+                if open == 1 { "that" } else { "those" },
+                if open == 1 { "" } else { "s" },
+            ));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Quit").clicked() {
+                    quit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if quit {
+            self.quitting = true;
+            self.dialog = Dialog::None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// Picks a vault file to import; confirms if one already exists.
+    fn import_vault(&mut self) {
+        let Some(src) = rfd::FileDialog::new().pick_file() else { return };
+        if Vault::exists(&self.vault_path) {
+            self.dialog = Dialog::ConfirmImportVault { src };
+        } else {
+            self.copy_imported_vault(&src);
+        }
+    }
+
+    fn show_confirm_import_vault(&mut self, ctx: &egui::Context) {
+        let mut import = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("confirm-import")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading(RichText::new("⚠ Replace existing vault?").color(Color32::LIGHT_RED));
+            ui.label(
+                "Importing will overwrite your current vault file and its stored \
+                 credentials. Back up first if unsure.",
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                import |= ui.button("Replace and import").clicked();
+                cancel |= ui.button("Cancel").clicked();
+            });
+        });
+        if import
+            && let Dialog::ConfirmImportVault { src } = &self.dialog
+        {
+            let src = src.clone();
+            self.copy_imported_vault(&src);
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// Copies an external vault file into place and resets vault state.
+    fn copy_imported_vault(&mut self, src: &std::path::Path) {
+        if let Some(parent) = self.vault_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.error = Some(format!("Could not prepare the vault directory: {e}"));
+            return;
+        }
+        if let Err(e) = std::fs::copy(src, &self.vault_path) {
+            self.error = Some(format!("Import failed: {e}"));
+            self.dialog = Dialog::None;
+            return;
+        }
+        // The imported vault has its own password; clear any stale saved key.
+        let _ = Vault::disable_keyring_unlock();
+        self.vault = initial_vault_state(&self.vault_path);
+        self.dialog = Dialog::None;
     }
 
     fn show_confirm_delete_vault(&mut self, ctx: &egui::Context) {
@@ -2012,6 +2111,18 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Confirm before closing the window while sessions/shells are open.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+            if self.tabs.is_empty() {
+                self.quitting = true;
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if !matches!(self.dialog, Dialog::ConfirmQuit) {
+                    self.dialog = Dialog::ConfirmQuit;
+                }
+            }
+        }
 
         // Drop tabs whose shells/sessions have ended (connecting tabs stay).
         let before = self.tabs.len();
