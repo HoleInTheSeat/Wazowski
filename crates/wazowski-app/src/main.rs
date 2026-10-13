@@ -2,6 +2,7 @@
 
 mod app;
 mod connect;
+mod sftp_ui;
 
 use app::App;
 

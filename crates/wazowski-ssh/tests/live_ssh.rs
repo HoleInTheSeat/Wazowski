@@ -186,3 +186,57 @@ fn wrong_key_is_rejected() {
 fn whoami() -> String {
     std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_else(|_| "root".into())
 }
+
+#[test]
+#[ignore = "spawns a local sshd"]
+fn sftp_list_upload_download() {
+    use std::io::Write as _;
+
+    let server = start_server();
+    let known_hosts = tempfile::NamedTempFile::new().unwrap();
+    let params = ConnectParams {
+        host: "127.0.0.1".into(),
+        port: server.port,
+        username: whoami(),
+        auth: AuthMaterial::Key { pem: server.client_key_pem.clone(), passphrase: None },
+        policy: HostKeyPolicy::AcceptNew,
+        size: TermSize::default(),
+        known_hosts: Some(known_hosts.path().to_path_buf()),
+        legacy_algorithms: false,
+    };
+    let (backend, _rx) = connect(params, || {}).expect("connect failed");
+    let sftp = backend.sftp();
+
+    // A scratch directory under the system temp dir, addressed absolutely.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().to_str().unwrap().to_string();
+
+    // Upload a local file.
+    let local_up = dir.path().join("upload.txt");
+    std::fs::File::create(&local_up).unwrap().write_all(b"sftp-roundtrip").unwrap();
+    let remote = format!("{base}/remote.txt");
+    sftp.upload(local_up, &remote).expect("upload failed");
+
+    // It should show up in a listing.
+    let entries = sftp.list_dir(&base).expect("list failed");
+    assert!(
+        entries.iter().any(|e| e.name == "remote.txt" && !e.is_dir),
+        "uploaded file not listed: {:?}",
+        entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+
+    // Download it back and compare.
+    let local_down = dir.path().join("download.txt");
+    sftp.download(&remote, local_down.clone()).expect("download failed");
+    assert_eq!(std::fs::read(&local_down).unwrap(), b"sftp-roundtrip");
+
+    // mkdir, rename, remove.
+    let sub = format!("{base}/sub");
+    sftp.mkdir(&sub).expect("mkdir failed");
+    let renamed = format!("{base}/renamed.txt");
+    sftp.rename(&remote, &renamed).expect("rename failed");
+    sftp.remove(&renamed, false).expect("remove file failed");
+    sftp.remove(&sub, true).expect("remove dir failed");
+
+    assert!(sftp.canonicalize(".").is_ok());
+}

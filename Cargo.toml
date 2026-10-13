@@ -28,9 +28,10 @@ tempfile = "3"
 thiserror = "2"
 russh = { version = "0.64", features = ["des"] }
 russh-sftp = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "macros", "time", "fs"] }
 futures = "0.3"
 dirs = "6"
 wazowski-ssh = { path = "crates/wazowski-ssh" }
+rfd = "0.15"
 wazowski-core = { path = "crates/wazowski-core" }
 wazowski-term = { path = "crates/wazowski-term" }

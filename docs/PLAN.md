@@ -44,8 +44,10 @@ implements a `Backend` trait and is plugged into a `Terminal`.
    saved sessions in a session-manager sidebar. Secrets live in an encrypted
    vault (Argon2id + XChaCha20-Poly1305), optionally unlocked via the OS
    keyring. Credentials are referenced by name so keys can be shared.
-3. **SFTP sidebar** — browse the remote filesystem of the active SSH tab,
-   upload/download, drag and drop, follow the terminal's working directory.
+3. **SFTP sidebar** ✅ — file browser beside the active SSH tab (shares the SSH
+   connection), navigate directories, upload/download via native dialogs,
+   new folder, delete. Operations run off the UI thread. (Drag-and-drop and
+   following the terminal's working directory: future polish.)
 4. **Quick servers** — panel to start/stop HTTP, TFTP, FTP, SFTP servers on a
    chosen folder and port, with live logs.
 5. **Power features** — SSH tunnels, split panes, multi-exec, serial, Telnet,

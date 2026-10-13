@@ -12,6 +12,8 @@
 
 mod connection;
 mod host_key;
+mod sftp;
 
 pub use connection::{AuthMaterial, ConnectError, ConnectParams, SshBackend, connect};
+pub use sftp::{FileEntry, Sftp};
 pub use host_key::{HostKeyPolicy, UnknownHostKey, trust_host};

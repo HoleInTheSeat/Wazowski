@@ -10,11 +10,16 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::ssh_key::HashAlg;
 use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, decode_secret_key};
 use russh::{ChannelMsg, Disconnect};
+use tokio::io::AsyncWriteExt;
+use std::sync::Arc as StdArc;
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use wazowski_term::{Backend, BackendEvent, TermSize};
 
 use crate::host_key::{self, Handler, HostKeyPolicy, UnknownHostKey, Verdict};
+use crate::sftp::{FileEntry, Sftp, SftpOp, SftpReply, SftpRequest};
 
 /// Resolved credentials for a connection. The caller fetches these from the
 /// vault (or the agent) before connecting, so this crate never touches secrets at rest.
@@ -77,7 +82,17 @@ pub struct SshBackend {
     /// `Option` so [`Drop`] can drop the sender before joining the thread:
     /// closing the channel is what tells the event loop to shut down.
     cmds: Option<UnboundedSender<Cmd>>,
+    /// Sender for SFTP requests over the same connection.
+    sftp: UnboundedSender<SftpRequest>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+impl SshBackend {
+    /// Returns a handle for SFTP operations on this session. The SFTP subsystem
+    /// is opened lazily on first use.
+    pub fn sftp(&self) -> Sftp {
+        Sftp::new(self.sftp.clone())
+    }
 }
 
 impl Backend for SshBackend {
@@ -119,25 +134,28 @@ pub fn connect(
 ) -> Result<(SshBackend, Receiver<BackendEvent>), ConnectError> {
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel(256);
     let (cmd_tx, cmd_rx) = unbounded_channel();
+    let (sftp_tx, sftp_rx) = unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
     let thread = thread::Builder::new()
         .name(format!("ssh-{}", params.host))
         .spawn(move || {
-            let runtime = match Builder::new_multi_thread().worker_threads(1).enable_all().build() {
+            let runtime = match Builder::new_multi_thread().worker_threads(2).enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = ready_tx.send(Err(ConnectError::Other(e.into())));
                     return;
                 }
             };
-            runtime.block_on(session_task(params, wake, out_tx, cmd_rx, ready_tx));
+            runtime.block_on(session_task(params, wake, out_tx, cmd_rx, sftp_rx, ready_tx));
         })
         .map_err(|e| ConnectError::Other(e.into()))?;
 
     // Wait for the task to report whether the handshake succeeded.
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok((SshBackend { cmds: Some(cmd_tx), thread: Some(thread) }, out_rx)),
+        Ok(Ok(())) => {
+            Ok((SshBackend { cmds: Some(cmd_tx), sftp: sftp_tx, thread: Some(thread) }, out_rx))
+        }
         Ok(Err(e)) => {
             let _ = thread.join();
             Err(e)
@@ -157,6 +175,7 @@ async fn session_task(
     wake: impl Fn() + Send,
     out: SyncSender<BackendEvent>,
     cmds: UnboundedReceiver<Cmd>,
+    sftp: UnboundedReceiver<SftpRequest>,
     ready: std::sync::mpsc::Sender<Result<(), ConnectError>>,
 ) {
     match establish(&params).await {
@@ -165,7 +184,7 @@ async fn session_task(
             if ready.send(Ok(())).is_err() {
                 return;
             }
-            if let Err(e) = pump(handle, params, &wake, &out, cmds).await {
+            if let Err(e) = pump(handle, params, &wake, &out, cmds, sftp).await {
                 log::warn!("ssh session ended: {e:#}");
             }
             let _ = out.send(BackendEvent::Exited);
@@ -347,6 +366,7 @@ async fn pump(
     wake: &(impl Fn() + Send),
     out: &SyncSender<BackendEvent>,
     mut cmds: UnboundedReceiver<Cmd>,
+    mut sftp_rx: UnboundedReceiver<SftpRequest>,
 ) -> anyhow::Result<()> {
     let channel = handle.channel_open_session().await?;
     let size = params.size;
@@ -362,6 +382,11 @@ async fn pump(
         )
         .await?;
     channel.request_shell(true).await?;
+
+    // Opened lazily on the first SFTP request, then reused.
+    let mut sftp_session: Option<StdArc<SftpSession>> = None;
+    // Set to false once all SFTP handles are dropped, to stop polling that arm.
+    let mut sftp_open = true;
 
     let mut channel = channel;
     loop {
@@ -385,6 +410,21 @@ async fn pump(
                     return Ok(());
                 }
             },
+            request = sftp_rx.recv(), if sftp_open => match request {
+                Some(request) => {
+                    match ensure_sftp(&handle, &mut sftp_session).await {
+                        Ok(session) => {
+                            // Run the op concurrently so transfers don't block the shell.
+                            tokio::spawn(run_sftp_op(session, request));
+                        }
+                        Err(e) => {
+                            let _ = request.reply.send(Err(e));
+                        }
+                    }
+                }
+                // All SFTP handles dropped; stop selecting on this arm.
+                None => sftp_open = false,
+            },
             msg = channel.wait() => match msg {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                     // A full output channel means the terminal is gone; stop.
@@ -402,6 +442,103 @@ async fn pump(
 
 fn to_other(e: russh::Error) -> ConnectError {
     ConnectError::Other(anyhow!(e))
+}
+
+/// Opens the SFTP subsystem on first use and returns a clone of the session
+/// (cheap; the session is `Arc`-backed internally).
+async fn ensure_sftp(
+    handle: &Handle<Handler>,
+    slot: &mut Option<StdArc<SftpSession>>,
+) -> Result<StdArc<SftpSession>, String> {
+    if slot.is_none() {
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("could not open an SFTP channel: {e}"))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| format!("the server refused SFTP: {e}"))?;
+        let session = SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| format!("could not start SFTP: {e}"))?;
+        *slot = Some(StdArc::new(session));
+    }
+    Ok(StdArc::clone(slot.as_ref().expect("just set")))
+}
+
+/// Runs one SFTP operation and sends its result back to the caller.
+async fn run_sftp_op(session: StdArc<SftpSession>, request: SftpRequest) {
+    let result = execute_sftp(&session, request.op).await.map_err(|e| e.to_string());
+    let _ = request.reply.send(result);
+}
+
+async fn execute_sftp(
+    session: &SftpSession,
+    op: SftpOp,
+) -> Result<SftpReply, russh_sftp::client::error::Error> {
+    Ok(match op {
+        SftpOp::Canonicalize(path) => SftpReply::Path(session.canonicalize(path).await?),
+        SftpOp::ListDir(path) => {
+            let entries = session
+                .read_dir(path)
+                .await?
+                .map(|entry| {
+                    let md = entry.metadata();
+                    FileEntry {
+                        name: entry.file_name(),
+                        is_dir: md.is_dir(),
+                        is_symlink: md.is_symlink(),
+                        size: md.size.unwrap_or(0),
+                        mtime: md.mtime,
+                    }
+                })
+                .collect();
+            SftpReply::Entries(entries)
+        }
+        SftpOp::Download { remote, local } => {
+            let mut source = session.open(remote).await?;
+            let mut dest = tokio::fs::File::create(&local)
+                .await
+                .map_err(russh_sftp::client::error::Error::from)?;
+            tokio::io::copy(&mut source, &mut dest)
+                .await
+                .map_err(russh_sftp::client::error::Error::from)?;
+            SftpReply::Done
+        }
+        SftpOp::Upload { local, remote } => {
+            let mut source = tokio::fs::File::open(&local)
+                .await
+                .map_err(russh_sftp::client::error::Error::from)?;
+            let mut dest = session
+                .open_with_flags(
+                    remote,
+                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                )
+                .await?;
+            tokio::io::copy(&mut source, &mut dest)
+                .await
+                .map_err(russh_sftp::client::error::Error::from)?;
+            dest.shutdown().await.map_err(russh_sftp::client::error::Error::from)?;
+            SftpReply::Done
+        }
+        SftpOp::Mkdir(path) => {
+            session.create_dir(path).await?;
+            SftpReply::Done
+        }
+        SftpOp::Remove { path, is_dir } => {
+            if is_dir {
+                session.remove_dir(path).await?;
+            } else {
+                session.remove_file(path).await?;
+            }
+            SftpReply::Done
+        }
+        SftpOp::Rename { from, to } => {
+            session.rename(from, to).await?;
+            SftpReply::Done
+        }
+    })
 }
 
 /// Algorithm preferences. With `legacy` set, weak-but-widely-compatible

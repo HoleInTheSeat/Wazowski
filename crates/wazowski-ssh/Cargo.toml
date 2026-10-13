@@ -10,6 +10,7 @@ log.workspace = true
 wazowski-term.workspace = true
 wazowski-core.workspace = true
 russh.workspace = true
+russh-sftp.workspace = true
 tokio.workspace = true
 dirs.workspace = true
 thiserror.workspace = true

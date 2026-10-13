@@ -13,6 +13,7 @@ use wazowski_ssh::{
 use wazowski_term::{LocalPty, TermSize, Terminal, TerminalView};
 
 use crate::connect::{Connected, PendingConnect, Progress};
+use crate::sftp_ui::FileBrowser;
 
 const NEW_TAB: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::T);
@@ -26,6 +27,10 @@ struct Tab {
     terminal: Terminal,
     /// Label shown on the tab; a session name or "Shell".
     label: String,
+    /// Present for SSH tabs: the SFTP file browser for the same session.
+    files: Option<FileBrowser>,
+    /// Whether the file panel is shown.
+    show_files: bool,
 }
 
 /// Where the encrypted vault stands this session.
@@ -195,13 +200,20 @@ impl App {
         let size = TermSize::default();
         let ctx = ctx.clone();
         match LocalPty::spawn(size, move || ctx.request_repaint()) {
-            Ok((pty, output)) => self.push_tab(Terminal::new(Box::new(pty), output, size), "Shell"),
+            Ok((pty, output)) => {
+                self.push_tab(Terminal::new(Box::new(pty), output, size), "Shell", None)
+            }
             Err(e) => self.error = Some(format!("Could not start a shell: {e:#}")),
         }
     }
 
-    fn push_tab(&mut self, terminal: Terminal, label: impl Into<String>) {
-        self.tabs.push(Tab { terminal, label: label.into() });
+    fn push_tab(&mut self, terminal: Terminal, label: impl Into<String>, files: Option<FileBrowser>) {
+        self.tabs.push(Tab {
+            terminal,
+            label: label.into(),
+            show_files: files.is_some(),
+            files,
+        });
         self.active = self.tabs.len() - 1;
     }
 
@@ -324,8 +336,10 @@ impl App {
                 Progress::Waiting => i += 1,
                 Progress::Ready(Connected { backend, output }) => {
                     let pending = self.pending.remove(i);
+                    // Grab an SFTP handle before the backend is boxed into the terminal.
+                    let files = FileBrowser::new(backend.sftp());
                     let term = Terminal::new(Box::new(backend), output, TermSize::default());
-                    self.push_tab(term, pending.title);
+                    self.push_tab(term, pending.title, Some(files));
                 }
                 Progress::Failed(message) => {
                     self.pending.remove(i);
@@ -546,6 +560,7 @@ impl App {
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         let mut close = None;
+        let mut toggle_files = None;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, tab) in self.tabs.iter().enumerate() {
@@ -564,8 +579,24 @@ impl App {
                 for pending in &self.pending {
                     ui.label(RichText::new(format!("⏳ {}", pending.title)).weak());
                 }
+                // A toggle for the SFTP panel, for the active SSH tab.
+                if let Some(tab) = self.tabs.get(self.active)
+                    && tab.files.is_some()
+                {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut shown = tab.show_files;
+                        if ui.toggle_value(&mut shown, "📁 Files").clicked() {
+                            toggle_files = Some(shown);
+                        }
+                    });
+                }
             });
         });
+        if let Some(show) = toggle_files
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.show_files = show;
+        }
         if let Some(i) = close {
             self.close_tab(i);
         }
@@ -1328,6 +1359,18 @@ impl eframe::App for App {
                 });
             });
         }
+        // SFTP file browser for the active SSH tab, when shown.
+        if let Some(tab) = self.tabs.get_mut(self.active)
+            && tab.show_files
+            && let Some(files) = &mut tab.files
+        {
+            egui::Panel::right("files")
+                .resizable(true)
+                .default_size(300.0)
+                .size_range(220.0..=560.0)
+                .show(ui, |ui| files.ui(ui, &ctx));
+        }
+
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.central(ui));
 
         self.show_dialog(&ctx);
