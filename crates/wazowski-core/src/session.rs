@@ -42,6 +42,9 @@ pub struct Session {
     pub username: String,
     #[serde(default)]
     pub auth: Auth,
+    /// Offer legacy SSH algorithms (SHA-1 KEX, CBC ciphers) for old equipment.
+    #[serde(default)]
+    pub legacy: bool,
 }
 
 fn default_port() -> u16 {
@@ -59,6 +62,7 @@ impl Session {
             port: default_port(),
             username: username.into(),
             auth: Auth::default(),
+            legacy: false,
         }
     }
 

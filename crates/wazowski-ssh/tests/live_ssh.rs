@@ -139,6 +139,7 @@ fn key_auth_runs_a_remote_shell() {
         policy: HostKeyPolicy::AcceptNew,
         size: TermSize::default(),
         known_hosts: Some(known_hosts.path().to_path_buf()),
+        legacy_algorithms: false,
     };
 
     let (backend, rx): (_, Receiver<BackendEvent>) = connect(params, || {}).expect("connect failed");
@@ -173,6 +174,7 @@ fn wrong_key_is_rejected() {
         policy: HostKeyPolicy::AcceptNew,
         size: TermSize::default(),
         known_hosts: Some(known_hosts.path().to_path_buf()),
+        legacy_algorithms: false,
     };
 
     match connect(params, || {}).map(|_| ()) {

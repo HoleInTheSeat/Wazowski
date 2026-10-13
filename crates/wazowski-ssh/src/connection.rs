@@ -40,6 +40,10 @@ pub struct ConnectParams {
     pub size: TermSize,
     /// Path to the `known_hosts` file. `None` uses `~/.ssh/known_hosts`.
     pub known_hosts: Option<PathBuf>,
+    /// Also offer legacy key exchanges, ciphers, and MACs (e.g. SHA-1 KEX,
+    /// CBC ciphers) so old equipment such as HPE/ProCurve switches can connect.
+    /// Off by default; these algorithms are weak and should be opt-in per host.
+    pub legacy_algorithms: bool,
 }
 
 /// Why a connection attempt failed, in a form the UI can act on.
@@ -194,6 +198,7 @@ async fn establish_inner(params: &ConnectParams) -> Result<Handle<Handler>, Conn
         inactivity_timeout: Some(Duration::from_secs(3600)),
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
+        preferred: preferred_algorithms(params.legacy_algorithms),
         ..Default::default()
     });
 
@@ -397,4 +402,85 @@ async fn pump(
 
 fn to_other(e: russh::Error) -> ConnectError {
     ConnectError::Other(anyhow!(e))
+}
+
+/// Algorithm preferences. With `legacy` set, weak-but-widely-compatible
+/// algorithms are appended after the modern defaults, so a modern server still
+/// negotiates strong ones while old gear (ProCurve, legacy IOS) can still connect.
+fn preferred_algorithms(legacy: bool) -> russh::Preferred {
+    use std::borrow::Cow;
+
+    let mut preferred = russh::Preferred::DEFAULT;
+    if !legacy {
+        return preferred;
+    }
+
+    let mut kex = preferred.kex.into_owned();
+    kex.extend_from_slice(&[
+        russh::kex::DH_GEX_SHA256,
+        russh::kex::DH_G14_SHA256,
+        russh::kex::DH_GEX_SHA1,
+        russh::kex::DH_G14_SHA1,
+        russh::kex::DH_G1_SHA1,
+    ]);
+
+    let mut cipher = preferred.cipher.into_owned();
+    cipher.extend_from_slice(&[
+        russh::cipher::AES_256_CBC,
+        russh::cipher::AES_192_CBC,
+        russh::cipher::AES_128_CBC,
+        russh::cipher::TRIPLE_DES_CBC,
+    ]);
+
+    let mut mac = preferred.mac.into_owned();
+    mac.extend_from_slice(&[russh::mac::HMAC_SHA256, russh::mac::HMAC_SHA1]);
+
+    preferred.kex = Cow::Owned(dedup(kex));
+    preferred.cipher = Cow::Owned(dedup(cipher));
+    preferred.mac = Cow::Owned(dedup(mac));
+    preferred
+}
+
+/// Removes duplicates while keeping first-seen order (preference order matters).
+fn dedup<T: PartialEq + Clone>(items: Vec<T>) -> Vec<T> {
+    let mut out: Vec<T> = Vec::with_capacity(items.len());
+    for item in items {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preferred_algorithms;
+
+    #[test]
+    fn legacy_adds_old_algorithms_without_losing_modern() {
+        let modern = preferred_algorithms(false);
+        assert!(!modern.kex.contains(&russh::kex::DH_G14_SHA1));
+        assert!(!modern.cipher.contains(&russh::cipher::AES_256_CBC));
+        assert!(!modern.mac.contains(&russh::mac::HMAC_SHA1));
+
+        let legacy = preferred_algorithms(true);
+        // Modern algorithms stay, ranked ahead of the legacy ones.
+        assert!(legacy.kex.contains(&russh::kex::MLKEM768X25519_SHA256));
+        assert!(legacy.kex.contains(&russh::kex::DH_G14_SHA1));
+        assert!(legacy.kex.contains(&russh::kex::DH_G1_SHA1));
+        assert!(legacy.cipher.contains(&russh::cipher::AES_256_CBC));
+        assert!(legacy.cipher.contains(&russh::cipher::TRIPLE_DES_CBC));
+        assert!(legacy.mac.contains(&russh::mac::HMAC_SHA1));
+    }
+
+    #[test]
+    fn legacy_lists_have_no_duplicates() {
+        let legacy = preferred_algorithms(true);
+        let mut kex = legacy.kex.to_vec();
+        let len = kex.len();
+        kex.dedup();
+        kex.sort_by_key(|n| n.as_ref().to_owned());
+        kex.dedup();
+        assert_eq!(kex.len(), len, "kex list has duplicates");
+    }
 }

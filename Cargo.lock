@@ -4007,6 +4007,7 @@ dependencies = [
  "data-encoding",
  "delegate",
  "der",
+ "des",
  "digest",
  "ecdsa",
  "ed25519-dalek",

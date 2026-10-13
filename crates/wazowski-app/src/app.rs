@@ -61,6 +61,74 @@ enum Dialog {
     CreateVault { password: String, confirm: String, error: Option<String> },
     EditSession(SessionForm),
     HostKey { info: UnknownHostKey, changed: bool, title: String, params: ConnectParams },
+    QuickConnect(ConnectAuthForm),
+    VaultManager(VaultManagerState),
+}
+
+/// How a quick connection should authenticate.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ConnectAuth {
+    Agent,
+    Password,
+    VaultSecret,
+}
+
+/// State of the quick-connect auth chooser.
+struct ConnectAuthForm {
+    session: Session,
+    method: ConnectAuth,
+    password: String,
+    /// Selected vault entry name, when using `VaultSecret`.
+    secret_name: Option<String>,
+    error: Option<String>,
+}
+
+impl ConnectAuthForm {
+    fn new(session: Session) -> Self {
+        Self {
+            session,
+            method: ConnectAuth::Agent,
+            password: String::new(),
+            secret_name: None,
+            error: None,
+        }
+    }
+}
+
+/// State of the vault manager dialog.
+#[derive(Default)]
+struct VaultManagerState {
+    /// An open add/edit form, if any.
+    form: Option<SecretForm>,
+    error: Option<String>,
+}
+
+/// Fields for adding or editing one vault entry.
+struct SecretForm {
+    /// Name of the entry being edited, or `None` when adding.
+    original: Option<String>,
+    name: String,
+    kind: SecretKind,
+    value: String,
+    passphrase: String,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum SecretKind {
+    Password,
+    Key,
+}
+
+impl SecretForm {
+    fn new() -> Self {
+        Self {
+            original: None,
+            name: String::new(),
+            kind: SecretKind::Password,
+            value: String::new(),
+            passphrase: String::new(),
+        }
+    }
 }
 
 /// Editable fields for the new/edit-session dialog.
@@ -76,6 +144,7 @@ struct SessionForm {
     /// Secret entered for password/key methods (blank keeps the existing one when editing).
     secret_input: String,
     key_passphrase: String,
+    legacy: bool,
     error: Option<String>,
 }
 
@@ -156,6 +225,17 @@ impl App {
                 return;
             }
         };
+        self.connect_with(&session.name, session, auth, ctx);
+    }
+
+    /// Spawns a connection to `session` with already-resolved credentials.
+    fn connect_with(
+        &mut self,
+        title: &str,
+        session: &Session,
+        auth: AuthMaterial,
+        ctx: &egui::Context,
+    ) {
         let params = ConnectParams {
             host: session.host.clone(),
             port: session.port,
@@ -164,22 +244,51 @@ impl App {
             policy: HostKeyPolicy::Strict,
             size: TermSize::default(),
             known_hosts: None,
+            legacy_algorithms: session.legacy,
         };
-        self.pending.push(PendingConnect::spawn(session.name.clone(), params, ctx));
+        self.pending.push(PendingConnect::spawn(title.to_owned(), params, ctx));
     }
 
-    /// Quick-connect to `user@host[:port]` with agent auth, without saving a session.
-    fn quick_connect(&mut self, ctx: &egui::Context) {
+    /// Opens the auth chooser for a quick `user@host[:port]` connection.
+    fn quick_connect(&mut self) {
         let input = self.quick_connect.trim();
         if input.is_empty() {
             return;
         }
         match parse_target(input) {
             Ok(session) => {
-                self.start_connect(&session, ctx);
+                self.dialog = Dialog::QuickConnect(ConnectAuthForm::new(session));
                 self.quick_connect.clear();
             }
             Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Resolves a quick-connect auth choice into connect material.
+    fn resolve_form_auth(&self, form: &ConnectAuthForm) -> Result<AuthMaterial, String> {
+        match form.method {
+            ConnectAuth::Agent => Ok(AuthMaterial::Agent),
+            ConnectAuth::Password => {
+                if form.password.is_empty() {
+                    return Err("Enter a password.".into());
+                }
+                Ok(AuthMaterial::Password(form.password.clone()))
+            }
+            ConnectAuth::VaultSecret => {
+                let name = form
+                    .secret_name
+                    .as_deref()
+                    .ok_or("Choose a vault entry.".to_string())?;
+                let vault = self.vault.unlocked().ok_or("Unlock the vault first.".to_string())?;
+                match vault.get(name) {
+                    Some(Secret::Password(p)) => Ok(AuthMaterial::Password(p.clone())),
+                    Some(Secret::PrivateKey { pem, passphrase }) => Ok(AuthMaterial::Key {
+                        pem: pem.clone(),
+                        passphrase: passphrase.clone(),
+                    }),
+                    None => Err(format!("No vault entry named '{name}'.")),
+                }
+            }
         }
     }
 
@@ -312,10 +421,18 @@ impl App {
                     }
                 }
                 VaultState::Unlocked(_) => {
-                    ui.label("Vault unlocked");
+                    if ui.button("Manage secrets…").clicked() {
+                        self.dialog = Dialog::VaultManager(VaultManagerState::default());
+                    }
+                    ui.separator();
                     if ui.button("Remember on this device").clicked()
                         && let Some(vault) = self.vault.unlocked()
                         && let Err(e) = vault.enable_keyring_unlock()
+                    {
+                        self.error = Some(format!("{e:#}"));
+                    }
+                    if ui.button("Forget on this device").clicked()
+                        && let Err(e) = Vault::disable_keyring_unlock()
                     {
                         self.error = Some(format!("{e:#}"));
                     }
@@ -354,7 +471,7 @@ impl App {
                     .desired_width(f32::INFINITY),
             );
             if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                self.quick_connect(ctx);
+                self.quick_connect();
             }
         });
         ui.separator();
@@ -483,6 +600,8 @@ impl App {
             Dialog::CreateVault { .. } => self.show_create_vault(ctx),
             Dialog::EditSession(_) => self.show_edit_session(ctx),
             Dialog::HostKey { .. } => self.show_host_key(ctx),
+            Dialog::QuickConnect(_) => self.show_quick_connect(ctx),
+            Dialog::VaultManager(_) => self.show_vault_manager(ctx),
         }
     }
 
@@ -661,6 +780,12 @@ impl App {
                         }
                     }
                 });
+                ui.add_space(4.0);
+                ui.checkbox(&mut form.legacy, "Legacy mode (old switches: SHA-1 KEX, CBC ciphers)")
+                    .on_hover_text(
+                        "Enables weak but widely compatible algorithms. Use only for old \
+                         equipment such as HPE/ProCurve switches.",
+                    );
                 if form.method != AuthMethod::Agent && self.vault.unlocked().is_none() {
                     ui.colored_label(
                         Color32::LIGHT_YELLOW,
@@ -693,7 +818,7 @@ impl App {
         // Copy the fields out first so the `self.dialog` borrow ends before we
         // touch the vault and session store.
         let Dialog::EditSession(form) = &self.dialog else { return };
-        let (id, name, folder, host, port_str, username, method, secret_input, key_passphrase) = (
+        let (id, name, folder, host, port_str, username, method, secret_input, key_passphrase, legacy) = (
             form.id.clone(),
             form.name.trim().to_owned(),
             form.folder.trim().to_owned(),
@@ -703,6 +828,7 @@ impl App {
             form.method,
             form.secret_input.clone(),
             form.key_passphrase.clone(),
+            form.legacy,
         );
 
         let port: u16 = match port_str.parse() {
@@ -720,6 +846,7 @@ impl App {
         }
         session.folder = folder;
         session.port = port;
+        session.legacy = legacy;
         let secret_name = format!("session/{}", session.id);
 
         session.auth = match method {
@@ -829,6 +956,341 @@ impl App {
         }
         self.pending.push(PendingConnect::spawn(title, params, ctx));
     }
+
+    fn show_quick_connect(&mut self, ctx: &egui::Context) {
+        let mut connect = false;
+        let mut cancel = false;
+        let secret_names = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
+        let vault_unlocked = self.vault.unlocked().is_some();
+
+        if let Dialog::QuickConnect(form) = &mut self.dialog {
+            egui::Modal::new(egui::Id::new("quick-connect")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading(format!("Connect to {}", form.session.address()));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Auth");
+                    egui::ComboBox::from_id_salt("quick-auth")
+                        .selected_text(match form.method {
+                            ConnectAuth::Agent => "SSH agent",
+                            ConnectAuth::Password => "Password",
+                            ConnectAuth::VaultSecret => "Vault entry",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut form.method, ConnectAuth::Agent, "SSH agent");
+                            ui.selectable_value(&mut form.method, ConnectAuth::Password, "Password");
+                            ui.selectable_value(
+                                &mut form.method,
+                                ConnectAuth::VaultSecret,
+                                "Vault entry",
+                            );
+                        });
+                });
+                match form.method {
+                    ConnectAuth::Agent => {}
+                    ConnectAuth::Password => {
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut form.password)
+                                .password(true)
+                                .hint_text("Password"),
+                        );
+                        field.request_focus();
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            connect = true;
+                        }
+                    }
+                    ConnectAuth::VaultSecret => {
+                        if !vault_unlocked {
+                            ui.colored_label(Color32::LIGHT_YELLOW, "Unlock the vault first.");
+                        } else if secret_names.is_empty() {
+                            ui.colored_label(Color32::LIGHT_YELLOW, "The vault has no entries yet.");
+                        } else {
+                            let selected =
+                                form.secret_name.clone().unwrap_or_else(|| "Choose…".into());
+                            egui::ComboBox::from_id_salt("quick-secret")
+                                .selected_text(selected)
+                                .show_ui(ui, |ui| {
+                                    for name in &secret_names {
+                                        ui.selectable_value(
+                                            &mut form.secret_name,
+                                            Some(name.clone()),
+                                            name,
+                                        );
+                                    }
+                                });
+                        }
+                    }
+                }
+                if let Some(error) = &form.error {
+                    ui.colored_label(Color32::LIGHT_RED, error.as_str());
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Connect").clicked() {
+                        connect = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        }
+
+        if connect {
+            // Resolve auth, then start the connection outside the dialog borrow.
+            let Dialog::QuickConnect(form) = &self.dialog else { return };
+            match self.resolve_form_auth(form) {
+                Ok(auth) => {
+                    let session = form.session.clone();
+                    self.dialog = Dialog::None;
+                    self.connect_with(&session.address(), &session, auth, ctx);
+                }
+                Err(e) => {
+                    if let Dialog::QuickConnect(form) = &mut self.dialog {
+                        form.error = Some(e);
+                    }
+                }
+            }
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn show_vault_manager(&mut self, ctx: &egui::Context) {
+        // Actions collected inside the closure, applied after, to avoid
+        // borrowing `self` while the vault/dialog are borrowed.
+        enum Action {
+            None,
+            NewSecret,
+            Edit(String),
+            Delete(String),
+            SaveForm,
+            CancelForm,
+            Close,
+        }
+        let mut action = Action::None;
+        let names = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
+
+        if let Dialog::VaultManager(state) = &mut self.dialog {
+            egui::Modal::new(egui::Id::new("vault-manager")).show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.heading("Vault secrets");
+                ui.label(
+                    RichText::new("Named passwords and private keys, shareable across sessions.")
+                        .weak(),
+                );
+                ui.add_space(6.0);
+
+                match &mut state.form {
+                    None => {
+                        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            if names.is_empty() {
+                                ui.label(RichText::new("No secrets yet.").weak());
+                            }
+                            for name in &names {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(name);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("Delete").clicked() {
+                                                action = Action::Delete(name.clone());
+                                            }
+                                            if ui.small_button("Edit").clicked() {
+                                                action = Action::Edit(name.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("New secret").clicked() {
+                                action = Action::NewSecret;
+                            }
+                            if ui.button("Close").clicked() {
+                                action = Action::Close;
+                            }
+                        });
+                    }
+                    Some(form) => {
+                        let editing = form.original.is_some();
+                        ui.heading(if editing { "Edit secret" } else { "New secret" });
+                        egui::Grid::new("secret-fields").num_columns(2).show(ui, |ui| {
+                            ui.label("Name");
+                            ui.add_enabled(
+                                !editing,
+                                egui::TextEdit::singleline(&mut form.name),
+                            );
+                            ui.end_row();
+                            ui.label("Type");
+                            egui::ComboBox::from_id_salt("secret-kind")
+                                .selected_text(match form.kind {
+                                    SecretKind::Password => "Password",
+                                    SecretKind::Key => "Private key",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut form.kind,
+                                        SecretKind::Password,
+                                        "Password",
+                                    );
+                                    ui.selectable_value(
+                                        &mut form.kind,
+                                        SecretKind::Key,
+                                        "Private key",
+                                    );
+                                });
+                            ui.end_row();
+                            match form.kind {
+                                SecretKind::Password => {
+                                    ui.label("Password");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut form.value)
+                                            .password(true)
+                                            .hint_text(if editing { "(unchanged)" } else { "" }),
+                                    );
+                                    ui.end_row();
+                                }
+                                SecretKind::Key => {
+                                    ui.label("Private key");
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut form.value)
+                                            .desired_rows(3)
+                                            .hint_text(if editing {
+                                                "(unchanged)"
+                                            } else {
+                                                "Paste PEM private key"
+                                            }),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Passphrase");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut form.passphrase)
+                                            .password(true),
+                                    );
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                action = Action::SaveForm;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Action::CancelForm;
+                            }
+                        });
+                    }
+                }
+
+                if let Some(error) = &state.error {
+                    ui.colored_label(Color32::LIGHT_RED, error.as_str());
+                }
+            });
+        }
+
+        match action {
+            Action::None => {}
+            Action::Close => self.dialog = Dialog::None,
+            Action::NewSecret => {
+                if let Dialog::VaultManager(state) = &mut self.dialog {
+                    state.form = Some(SecretForm::new());
+                    state.error = None;
+                }
+            }
+            Action::CancelForm => {
+                if let Dialog::VaultManager(state) = &mut self.dialog {
+                    state.form = None;
+                    state.error = None;
+                }
+            }
+            Action::Edit(name) => self.begin_edit_secret(&name),
+            Action::Delete(name) => self.delete_secret(&name),
+            Action::SaveForm => self.save_secret_form(),
+        }
+    }
+
+    /// Loads an existing secret into the manager's edit form (values left blank
+    /// so they are only overwritten when the user types a new value).
+    fn begin_edit_secret(&mut self, name: &str) {
+        let kind = match self.vault.unlocked().and_then(|v| v.get(name)) {
+            Some(Secret::Password(_)) => SecretKind::Password,
+            Some(Secret::PrivateKey { .. }) => SecretKind::Key,
+            None => return,
+        };
+        if let Dialog::VaultManager(state) = &mut self.dialog {
+            state.form = Some(SecretForm {
+                original: Some(name.to_owned()),
+                name: name.to_owned(),
+                kind,
+                value: String::new(),
+                passphrase: String::new(),
+            });
+            state.error = None;
+        }
+    }
+
+    fn delete_secret(&mut self, name: &str) {
+        let result = match self.vault.unlocked_mut() {
+            Some(vault) => vault.remove(name).map(|_| ()),
+            None => return,
+        };
+        if let Dialog::VaultManager(state) = &mut self.dialog
+            && let Err(e) = result
+        {
+            state.error = Some(format!("{e:#}"));
+        }
+    }
+
+    fn save_secret_form(&mut self) {
+        let Dialog::VaultManager(state) = &self.dialog else { return };
+        let Some(form) = &state.form else { return };
+        let editing = form.original.is_some();
+        let name = form.name.trim().to_owned();
+        if name.is_empty() {
+            return self.set_vault_error("Name is required.");
+        }
+        // When editing with a blank value, keep the existing secret unchanged.
+        if editing && form.value.is_empty() {
+            if let Dialog::VaultManager(state) = &mut self.dialog {
+                state.form = None;
+            }
+            return;
+        }
+        if form.value.is_empty() {
+            return self.set_vault_error("Enter a value.");
+        }
+        let secret = match form.kind {
+            SecretKind::Password => Secret::Password(form.value.clone()),
+            SecretKind::Key => Secret::PrivateKey {
+                pem: form.value.clone(),
+                passphrase: (!form.passphrase.is_empty()).then(|| form.passphrase.clone()),
+            },
+        };
+        let result = match self.vault.unlocked_mut() {
+            Some(vault) => vault.put(&name, secret).map_err(|e| format!("{e:#}")),
+            None => Err("The vault is locked.".into()),
+        };
+        match result {
+            Ok(()) => {
+                if let Dialog::VaultManager(state) = &mut self.dialog {
+                    state.form = None;
+                    state.error = None;
+                }
+            }
+            Err(e) => self.set_vault_error(&e),
+        }
+    }
+
+    fn set_vault_error(&mut self, message: &str) {
+        if let Dialog::VaultManager(state) = &mut self.dialog {
+            state.error = Some(message.to_owned());
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -896,6 +1358,7 @@ impl SessionForm {
             method: AuthMethod::Agent,
             secret_input: String::new(),
             key_passphrase: String::new(),
+            legacy: false,
             error: None,
         }
     }
@@ -916,6 +1379,7 @@ impl SessionForm {
             method,
             secret_input: String::new(),
             key_passphrase: String::new(),
+            legacy: session.legacy,
             error: None,
         }
     }
