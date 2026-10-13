@@ -872,6 +872,12 @@ impl App {
                     Ok(())
                 }
             }
+            TreeAction::MoveFolder { from, folder, to, parent } => {
+                self.transfer_folder(&from, &folder, &to, &parent, false)
+            }
+            TreeAction::CopyFolder { from, folder, to, parent } => {
+                self.transfer_folder(&from, &folder, &to, &parent, true)
+            }
             TreeAction::NewSessionIn(store, folder) => {
                 let mut form = SessionForm::new();
                 form.folder = folder;
@@ -909,6 +915,85 @@ impl App {
 
     fn shared_mut(&mut self, id: &str) -> Option<&mut SharedSource> {
         self.shared.iter_mut().find(|s| s.id() == id)
+    }
+
+    /// A read-only reference to the given store.
+    fn store_ref(&self, store: &StoreId) -> Option<&SessionStore> {
+        match store {
+            StoreId::Local => Some(&self.sessions),
+            StoreId::Shared(id) => self.shared.iter().find(|s| s.id() == id).map(|s| s.store()),
+        }
+    }
+
+    /// Moves or copies a folder (with all its subfolders and sessions) to a new
+    /// parent, possibly in a different store.
+    fn transfer_folder(
+        &mut self,
+        from: &StoreId,
+        folder: &str,
+        to: &StoreId,
+        parent: &str,
+        copy: bool,
+    ) -> anyhow::Result<()> {
+        let base = folder.rsplit('/').next().unwrap_or(folder);
+        let new_base = if parent.is_empty() { base.to_owned() } else { format!("{parent}/{base}") };
+        if new_base == folder && from == to {
+            return Ok(()); // no-op
+        }
+        // Can't move a folder into itself or its own subtree (same store).
+        if !copy && from == to && (new_base == folder || new_base.starts_with(&format!("{folder}/")))
+        {
+            anyhow::bail!("can't move a folder into itself");
+        }
+        let prefix = format!("{folder}/");
+        let repath = |f: &str| -> String {
+            if f == folder {
+                new_base.clone()
+            } else if let Some(rest) = f.strip_prefix(&prefix) {
+                format!("{new_base}/{rest}")
+            } else {
+                f.to_owned()
+            }
+        };
+
+        // Same-store move is just a re-path (handles subtree + collisions).
+        if !copy && from == to {
+            return self.store_rename_folder(from, folder, &new_base);
+        }
+
+        // Snapshot the subtree from the source.
+        let src = self.store_ref(from).ok_or_else(|| anyhow::anyhow!("source is gone"))?;
+        let folders: Vec<String> =
+            src.folders().into_iter().filter(|f| f == folder || f.starts_with(&prefix)).collect();
+        let sessions: Vec<Session> = src
+            .all()
+            .iter()
+            .filter(|s| s.folder == folder || s.folder.starts_with(&prefix))
+            .cloned()
+            .collect();
+
+        // Recreate in the destination.
+        self.store_add_folder(to, &new_base)?;
+        for f in &folders {
+            self.store_add_folder(to, &repath(f))?;
+        }
+        for session in &sessions {
+            let mut moved = session.clone();
+            if copy {
+                moved.id = Session::new("", "", "").id;
+            }
+            moved.folder = repath(&session.folder);
+            self.store_upsert(to, moved)?;
+        }
+
+        // For a move, remove the originals.
+        if !copy {
+            for session in &sessions {
+                self.store_remove(from, &session.id)?;
+            }
+            self.store_remove_folder(from, folder)?;
+        }
+        Ok(())
     }
 
     /// A cloned session from the given store.
@@ -2578,6 +2663,8 @@ enum TreeAction {
     Duplicate(StoreId, String),
     MoveTo { from: StoreId, id: String, to: StoreId, folder: String },
     CopyTo { from: StoreId, id: String, to: StoreId, folder: String },
+    MoveFolder { from: StoreId, folder: String, to: StoreId, parent: String },
+    CopyFolder { from: StoreId, folder: String, to: StoreId, parent: String },
     NewSessionIn(StoreId, String),
     NewFolderIn(StoreId, String),
     RenameFolder(StoreId, String),
@@ -2684,6 +2771,24 @@ fn render_folder(
                 *action = Some(TreeAction::RenameFolder(store.clone(), full.to_owned()));
                 ui.close();
             }
+            // Move/copy the whole folder (subfolders and sessions included).
+            destination_menu(ui, "Move folder to", destinations, |to, parent| {
+                *action = Some(TreeAction::MoveFolder {
+                    from: store.clone(),
+                    folder: full.to_owned(),
+                    to,
+                    parent,
+                });
+            });
+            destination_menu(ui, "Copy folder to", destinations, |to, parent| {
+                *action = Some(TreeAction::CopyFolder {
+                    from: store.clone(),
+                    folder: full.to_owned(),
+                    to,
+                    parent,
+                });
+            });
+            ui.separator();
             if ui.button("Delete folder").clicked() {
                 *action = Some(TreeAction::DeleteFolder(store.clone(), full.to_owned()));
                 ui.close();
