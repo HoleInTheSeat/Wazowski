@@ -752,8 +752,24 @@ impl App {
     fn session_tree(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut action: Option<TreeAction> = None;
 
+        // Destinations for move/copy: the local store plus every reachable share.
+        let mut destinations = vec![Destination {
+            store: StoreId::Local,
+            label: "Local".into(),
+            folders: self.sessions.folders(),
+        }];
+        for source in &self.shared {
+            if source.available() {
+                destinations.push(Destination {
+                    store: StoreId::Shared(source.id().to_owned()),
+                    label: source.name().to_owned(),
+                    folders: source.store().folders(),
+                });
+            }
+        }
+
         // Local sessions.
-        render_store(ui, &StoreId::Local, &self.sessions, true, &mut action);
+        render_store(ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action);
 
         // Fill a bit of blank space with a right-click menu for the local store.
         let bg = ui.allocate_response(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
@@ -780,7 +796,7 @@ impl App {
                 if let Some(note) = source.status() {
                     ui.label(RichText::new(format!("⚠ {note}")).color(ui.visuals().warn_fg_color));
                 }
-                render_store(ui, &store, source.store(), editable, &mut action);
+                render_store(ui, &store, source.store(), editable, &destinations, &mut action);
             });
             resp.header_response.context_menu(|ui| {
                 if ui.button("Sync now").clicked() {
@@ -836,7 +852,26 @@ impl App {
                     Ok(())
                 }
             }
-            TreeAction::MoveTo { store, id, folder } => self.store_move(&store, &id, &folder),
+            TreeAction::MoveTo { from, id, to, folder } => {
+                if from == to {
+                    self.store_move(&from, &id, &folder)
+                } else if let Some(mut session) = self.session_in(&from, &id) {
+                    session.folder = folder;
+                    self.store_upsert(&to, session).and_then(|()| self.store_remove(&from, &id))
+                } else {
+                    Ok(())
+                }
+            }
+            TreeAction::CopyTo { from, id, to, folder } => {
+                if let Some(original) = self.session_in(&from, &id) {
+                    let mut copy = original.clone();
+                    copy.id = Session::new("", "", "").id; // fresh id so it's independent
+                    copy.folder = folder;
+                    self.store_upsert(&to, copy)
+                } else {
+                    Ok(())
+                }
+            }
             TreeAction::NewSessionIn(store, folder) => {
                 let mut form = SessionForm::new();
                 form.folder = folder;
@@ -2541,7 +2576,8 @@ enum TreeAction {
     Edit(StoreId, String),
     Delete(StoreId, String),
     Duplicate(StoreId, String),
-    MoveTo { store: StoreId, id: String, folder: String },
+    MoveTo { from: StoreId, id: String, to: StoreId, folder: String },
+    CopyTo { from: StoreId, id: String, to: StoreId, folder: String },
     NewSessionIn(StoreId, String),
     NewFolderIn(StoreId, String),
     RenameFolder(StoreId, String),
@@ -2572,11 +2608,19 @@ impl FolderNode {
     }
 }
 
+/// A move/copy destination: a store and its folders.
+struct Destination {
+    store: StoreId,
+    label: String,
+    folders: Vec<String>,
+}
+
 fn render_store(
     ui: &mut egui::Ui,
     store: &StoreId,
     sessions: &SessionStore,
     editable: bool,
+    destinations: &[Destination],
     action: &mut Option<TreeAction>,
 ) {
     // Build a nested tree; folder paths synthesize their ancestor nodes.
@@ -2593,11 +2637,11 @@ fn render_store(
 
     // Root-level sessions, then each top-level folder recursively.
     for (id, name) in &root.sessions {
-        session_row(ui, store, id, name, &folders, editable, action);
+        session_row(ui, store, id, name, destinations, editable, action);
     }
     let children: Vec<_> = root.children.iter().collect();
     for (segment, node) in children {
-        render_folder(ui, store, segment, segment, node, &folders, editable, action);
+        render_folder(ui, store, segment, segment, node, destinations, editable, action);
     }
 }
 
@@ -2610,7 +2654,7 @@ fn render_folder(
     segment: &str,
     full: &str,
     node: &FolderNode,
-    all_folders: &[String],
+    destinations: &[Destination],
     editable: bool,
     action: &mut Option<TreeAction>,
 ) {
@@ -2619,11 +2663,11 @@ fn render_folder(
         .default_open(true);
     let resp = header.show(ui, |ui| {
         for (id, name) in &node.sessions {
-            session_row(ui, store, id, name, all_folders, editable, action);
+            session_row(ui, store, id, name, destinations, editable, action);
         }
         for (child_segment, child) in &node.children {
             let child_full = format!("{full}/{child_segment}");
-            render_folder(ui, store, child_segment, &child_full, child, all_folders, editable, action);
+            render_folder(ui, store, child_segment, &child_full, child, destinations, editable, action);
         }
     });
     if editable {
@@ -2662,7 +2706,7 @@ fn session_row(
     store: &StoreId,
     id: &str,
     name: &str,
-    folders: &[String],
+    destinations: &[Destination],
     editable: bool,
     action: &mut Option<TreeAction>,
 ) {
@@ -2684,31 +2728,54 @@ fn session_row(
                 *action = Some(TreeAction::Duplicate(store.clone(), id.to_owned()));
                 ui.close();
             }
-            ui.menu_button("Move to", |ui| {
-                if ui.button("(root)").clicked() {
-                    *action = Some(TreeAction::MoveTo {
-                        store: store.clone(),
-                        id: id.to_owned(),
-                        folder: String::new(),
-                    });
-                    ui.close();
-                }
-                for folder in folders {
-                    if ui.button(folder).clicked() {
-                        *action = Some(TreeAction::MoveTo {
-                            store: store.clone(),
-                            id: id.to_owned(),
-                            folder: folder.clone(),
-                        });
-                        ui.close();
-                    }
-                }
+            // Move/Copy to a store + folder. A single destination collapses the
+            // store level; multiple destinations nest store → folder.
+            destination_menu(ui, "Move to", destinations, |to, folder| {
+                *action = Some(TreeAction::MoveTo {
+                    from: store.clone(),
+                    id: id.to_owned(),
+                    to,
+                    folder,
+                });
+            });
+            destination_menu(ui, "Copy to", destinations, |to, folder| {
+                *action = Some(TreeAction::CopyTo {
+                    from: store.clone(),
+                    id: id.to_owned(),
+                    to,
+                    folder,
+                });
             });
             ui.separator();
             if ui.button("Delete").clicked() {
                 *action = Some(TreeAction::Delete(store.clone(), id.to_owned()));
                 ui.close();
             }
+        }
+    });
+}
+
+/// A nested "Move to / Copy to" menu over destinations (store → folder).
+fn destination_menu(
+    ui: &mut egui::Ui,
+    label: &str,
+    destinations: &[Destination],
+    mut chosen: impl FnMut(StoreId, String),
+) {
+    ui.menu_button(label, |ui| {
+        for dest in destinations {
+            ui.menu_button(&dest.label, |ui| {
+                if ui.button("(root)").clicked() {
+                    chosen(dest.store.clone(), String::new());
+                    ui.close();
+                }
+                for folder in &dest.folders {
+                    if ui.button(folder).clicked() {
+                        chosen(dest.store.clone(), folder.clone());
+                        ui.close();
+                    }
+                }
+            });
         }
     });
 }
