@@ -222,14 +222,20 @@ impl SessionStore {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
+        self.save_as(&self.path)
+    }
+
+    /// Writes the store to an arbitrary path (used to mirror a shared store to
+    /// both its cache and the shared file).
+    pub fn save_as(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
         let file = StoreFile { sessions: self.sessions.clone(), folders: self.folders.clone() };
         let text = toml::to_string_pretty(&file).context("could not serialize sessions")?;
-        write_atomic(&self.path, text.as_bytes())
-            .with_context(|| format!("could not write {}", self.path.display()))
+        write_atomic(path, text.as_bytes())
+            .with_context(|| format!("could not write {}", path.display()))
     }
 }
 

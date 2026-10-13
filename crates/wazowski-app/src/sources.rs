@@ -82,6 +82,8 @@ pub struct SharedSource {
     store: SessionStore,
     /// Whether the shared file was reachable at the last load/sync.
     available: bool,
+    /// Whether the last failure was specifically "file not found".
+    missing: bool,
     /// A note about the last sync problem, for display.
     status: Option<String>,
 }
@@ -96,6 +98,7 @@ impl SharedSource {
             cache_path,
             store: SessionStore::default(),
             available: false,
+            missing: false,
             status: None,
         };
         source.reload();
@@ -114,47 +117,55 @@ impl SharedSource {
                     self.status = Some(format!("could not update cache: {e}"));
                 }
                 self.available = true;
+                self.missing = false;
                 self.status = None;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // The file is missing. If its directory is reachable, the share
-                // is online but empty (e.g. a brand-new source); otherwise it is
-                // offline and we fall back to the cache.
-                let dir_ok = self.def.path.parent().map(|p| p.is_dir()).unwrap_or(false);
-                self.available = dir_ok;
-                self.status = if dir_ok {
-                    None
-                } else {
-                    Some("share unavailable — showing cache".into())
-                };
-            }
             Err(e) => {
+                // The shared file is unreachable (deleted, or the location is
+                // offline). Fall back to the cache, read-only, and tell the user.
                 self.available = false;
-                self.status = Some(format!("share unavailable ({e}) — showing cache"));
+                self.missing = e.kind() == std::io::ErrorKind::NotFound;
+                self.status = Some(if self.missing {
+                    "shared file not found — using local cache (read-only)".into()
+                } else {
+                    format!("share offline ({e}) — using local cache (read-only)")
+                });
             }
         }
         // Load from the cache (empty store if neither share nor cache exists).
         self.store = SessionStore::load(self.cache_path.clone()).unwrap_or_default();
     }
 
-    /// Copies the cache (just written by a mutation) to the shared file.
+    /// Writes the current store to the shared file (and refreshes the cache).
     fn write_through(&mut self) -> Result<()> {
-        if let Some(parent) = self.def.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("could not reach {}", parent.display()))?;
-        }
-        fs::copy(&self.cache_path, &self.def.path)
+        self.store
+            .save_as(&self.def.path)
             .with_context(|| format!("could not write {}", self.def.path.display()))?;
+        let _ = self.store.save_as(&self.cache_path);
         self.available = true;
+        self.missing = false;
         self.status = None;
         Ok(())
     }
 
-    /// Applies a store mutation (which saves to the cache), then writes through
-    /// to the share. Editing is only allowed while the share is reachable.
+    /// Applies a store mutation, then writes through to the share. Mutations are
+    /// refused while the share is offline, to avoid conflicting with it.
     fn mutate(&mut self, f: impl FnOnce(&mut SessionStore) -> Result<()>) -> Result<()> {
+        if !self.available {
+            anyhow::bail!("the shared source is offline; changes are disabled");
+        }
         f(&mut self.store)?;
         self.write_through()
+    }
+
+    /// (Re)creates the shared file from the current cache contents.
+    pub fn create(&mut self) -> Result<()> {
+        self.write_through()
+    }
+
+    /// Whether the shared file is specifically missing (vs the location offline).
+    pub fn missing(&self) -> bool {
+        self.missing
     }
 
     // --- Accessors -------------------------------------------------------
@@ -226,8 +237,10 @@ mod tests {
         let cache = dir.path().join("cache");
         let def = SourceDef { id: "t1".into(), name: "Team".into(), path: share.clone() };
 
-        // Create and add a session; it should write through to the share.
+        // A brand-new source has no file yet; create() writes an empty one.
         let mut source = SharedSource::open(def.clone(), &cache);
+        assert!(!source.available());
+        source.create().unwrap();
         assert!(source.available());
         source.upsert(Session::new("web", "example.com", "root")).unwrap();
         assert!(share.exists(), "share file should be written");

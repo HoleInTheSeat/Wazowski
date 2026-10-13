@@ -110,6 +110,7 @@ enum Dialog {
     ConfirmImportVault { src: PathBuf },
     AskUsername(UsernamePrompt),
     AddSource { name: String, path: String },
+    MissingShare { id: String },
 }
 
 /// Prompt for a username at connect time when the session has none.
@@ -777,7 +778,7 @@ impl App {
             let editable = source.available();
             let resp = header.show(ui, |ui| {
                 if let Some(note) = source.status() {
-                    ui.label(RichText::new(note).weak().italics());
+                    ui.label(RichText::new(format!("⚠ {note}")).color(ui.visuals().warn_fg_color));
                 }
                 render_store(ui, &store, source.store(), editable, &mut action);
             });
@@ -856,6 +857,9 @@ impl App {
             TreeAction::SyncSource(id) => {
                 if let Some(source) = self.shared.iter_mut().find(|s| s.id() == id) {
                     source.reload();
+                    if source.missing() {
+                        self.dialog = Dialog::MissingShare { id };
+                    }
                 }
                 Ok(())
             }
@@ -1039,6 +1043,58 @@ impl App {
             Dialog::ConfirmImportVault { .. } => self.show_confirm_import_vault(ctx),
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
             Dialog::AddSource { .. } => self.show_add_source(ctx),
+            Dialog::MissingShare { .. } => self.show_missing_share(ctx),
+        }
+    }
+
+    fn show_missing_share(&mut self, ctx: &egui::Context) {
+        let Dialog::MissingShare { id } = &self.dialog else { return };
+        let id = id.clone();
+        let name = self
+            .shared
+            .iter()
+            .find(|s| s.id() == id)
+            .map(|s| s.name().to_owned())
+            .unwrap_or_default();
+        let mut choice: Option<u8> = None;
+        egui::Modal::new(egui::Id::new("missing-share")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.heading(RichText::new("⚠ Shared file missing").color(Color32::LIGHT_RED));
+            ui.label(format!(
+                "The shared file for '{name}' no longer exists. Your local cache is \
+                 still available (read-only). What would you like to do?"
+            ));
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                if ui.button("Create it now (from local cache)").clicked() {
+                    choice = Some(0);
+                }
+                if ui.button("Keep using local cache").clicked() {
+                    choice = Some(1);
+                }
+                if ui.button("Remove shared source").clicked() {
+                    choice = Some(2);
+                }
+            });
+        });
+        match choice {
+            Some(0) => {
+                if let Some(source) = self.shared.iter_mut().find(|s| s.id() == id) {
+                    match source.create() {
+                        Ok(()) => source.reload(),
+                        Err(e) => self.error = Some(format!("Could not create the file: {e:#}")),
+                    }
+                }
+                self.dialog = Dialog::None;
+            }
+            Some(1) => self.dialog = Dialog::None,
+            Some(2) => {
+                if let Err(e) = self.remove_source(&id) {
+                    self.error = Some(format!("{e:#}"));
+                }
+                self.dialog = Dialog::None;
+            }
+            _ => {}
         }
     }
 
@@ -1112,7 +1168,15 @@ impl App {
             return;
         }
         let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
-        self.shared.push(SharedSource::open(def, &cache));
+        let mut source = SharedSource::open(def, &cache);
+        // A new source's file usually doesn't exist yet; create it so the share
+        // is immediately usable (and later deletion registers as offline).
+        if !source.available()
+            && let Err(e) = source.create()
+        {
+            self.error = Some(format!("Added, but could not create the shared file: {e:#}"));
+        }
+        self.shared.push(source);
     }
 
     fn show_confirm_quit(&mut self, ctx: &egui::Context) {
