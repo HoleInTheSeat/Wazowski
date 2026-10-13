@@ -38,10 +38,12 @@ implements a `Backend` trait and is plugged into a `Terminal`.
 
 ## Phases
 
-1. **Foundation** — workspace, window, tabs, local shell in a working terminal
+1. **Foundation** ✅ — workspace, window, tabs, local shell in a working terminal
    (colors, cursor, scrollback, keyboard input, copy/paste, resize).
-2. **SSH** — password/key/agent auth, host key verification (known_hosts),
-   saved sessions in a session-manager sidebar, credentials in the keychain.
+2. **SSH** ✅ — password/key/agent auth, host key verification (known_hosts),
+   saved sessions in a session-manager sidebar. Secrets live in an encrypted
+   vault (Argon2id + XChaCha20-Poly1305), optionally unlocked via the OS
+   keyring. Credentials are referenced by name so keys can be shared.
 3. **SFTP sidebar** — browse the remote filesystem of the active SSH tab,
    upload/download, drag and drop, follow the terminal's working directory.
 4. **Quick servers** — panel to start/stop HTTP, TFTP, FTP, SFTP servers on a
