@@ -4,6 +4,7 @@ mod app;
 mod conn_log;
 mod connect;
 mod sftp_ui;
+mod sources;
 
 use app::App;
 

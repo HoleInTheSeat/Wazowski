@@ -5525,11 +5525,15 @@ name = "wazowski-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "directories",
  "eframe",
  "egui",
  "env_logger",
  "log",
  "rfd",
+ "serde",
+ "tempfile",
+ "toml",
  "wazowski-core",
  "wazowski-ssh",
  "wazowski-term",

@@ -14,6 +14,7 @@ use wazowski_term::{LocalPty, TermSize, Terminal, TerminalView};
 
 use crate::connect::{Connected, PendingConnect, Progress};
 use crate::sftp_ui::FileBrowser;
+use crate::sources::{self, SharedSource, SourceDef, SourcesConfig};
 
 const NEW_TAB: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::T);
@@ -102,12 +103,13 @@ enum Dialog {
     QuickConnect(ConnectAuthForm),
     VaultManager(VaultManagerState),
     CreateCredential(CredentialPrompt),
-    NewFolder { name: String },
-    RenameFolder { old: String, name: String },
+    NewFolder { target: StoreId, name: String },
+    RenameFolder { target: StoreId, old: String, name: String },
     ConfirmDeleteVault,
     ConfirmQuit,
     ConfirmImportVault { src: PathBuf },
     AskUsername(UsernamePrompt),
+    AddSource { name: String, path: String },
 }
 
 /// Prompt for a username at connect time when the session has none.
@@ -232,6 +234,8 @@ struct SessionForm {
     key_passphrase: String,
     legacy: bool,
     error: Option<String>,
+    /// Which store to save into.
+    target: StoreId,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -285,6 +289,20 @@ pub struct App {
     next_tab_id: u64,
     /// Set once the user has confirmed quitting, so the window is allowed to close.
     quitting: bool,
+    /// Configured shared sources and their live state.
+    sources_config: SourcesConfig,
+    shared: Vec<SharedSource>,
+    /// When shared sources were last auto-synced.
+    last_sync: std::time::Instant,
+}
+
+/// Which session store an action targets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StoreId {
+    /// The user's personal local store.
+    Local,
+    /// A shared source, by its id.
+    Shared(String),
 }
 
 impl App {
@@ -293,6 +311,18 @@ impl App {
         let sessions = SessionStore::load(sessions_path).unwrap_or_default();
         let vault_path = Vault::default_path().unwrap_or_else(|_| "vault.enc".into());
         let vault = initial_vault_state(&vault_path);
+
+        // Load shared sources and open each (refreshing its cache from the share).
+        let sources_config = SourcesConfig::default_path()
+            .and_then(SourcesConfig::load)
+            .or_else(|_| SourcesConfig::load("sources.toml".into()))
+            .expect("loading a missing sources file yields an empty config");
+        let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
+        let shared = sources_config
+            .defs
+            .iter()
+            .map(|def| SharedSource::open(def.clone(), &cache))
+            .collect();
 
         let mut app = Self {
             tabs: Vec::new(),
@@ -305,6 +335,9 @@ impl App {
             quick_connect: String::new(),
             next_tab_id: 1,
             quitting: false,
+            sources_config,
+            shared,
+            last_sync: std::time::Instant::now(),
         };
         app.open_local_shell(ctx);
         app
@@ -596,6 +629,10 @@ impl App {
                 if ui.button("New session…").clicked() {
                     self.dialog = Dialog::EditSession(SessionForm::new());
                 }
+                ui.separator();
+                if ui.button("Add shared source…").clicked() {
+                    self.dialog = Dialog::AddSource { name: String::new(), path: String::new() };
+                }
             });
             ui.menu_button("Vault", |ui| {
                 let exists = !matches!(self.vault, VaultState::Absent);
@@ -712,67 +749,60 @@ impl App {
     }
 
     fn session_tree(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Snapshot the tree so the borrow of `self.sessions` ends before we act.
-        let mut by_folder: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        for folder in self.sessions.folders() {
-            by_folder.entry(folder).or_default();
-        }
-        for session in self.sessions.all() {
-            by_folder
-                .entry(session.folder.clone())
-                .or_default()
-                .push((session.id.clone(), session.name.clone()));
-        }
-        let all_folders = self.sessions.folders();
-
         let mut action: Option<TreeAction> = None;
 
-        // Root-level sessions first.
-        if let Some(entries) = by_folder.get("") {
-            for (id, name) in entries {
-                session_row(ui, id, name, &all_folders, &mut action);
-            }
-        }
-        // Then each folder.
-        for (folder, entries) in by_folder.iter().filter(|(f, _)| !f.is_empty()) {
-            let header = egui::CollapsingHeader::new(format!("📁 {folder}")).default_open(true);
-            let header_resp = header.show(ui, |ui| {
-                for (id, name) in entries {
-                    session_row(ui, id, name, &all_folders, &mut action);
-                }
-            });
-            header_resp.header_response.context_menu(|ui| {
-                if ui.button("New session here").clicked() {
-                    let mut form = SessionForm::new();
-                    form.folder = folder.clone();
-                    self.dialog = Dialog::EditSession(form);
-                    ui.close();
-                }
-                if ui.button("Rename folder").clicked() {
-                    self.dialog =
-                        Dialog::RenameFolder { old: folder.clone(), name: folder.clone() };
-                    ui.close();
-                }
-                if ui.button("Delete folder").clicked() {
-                    action = Some(TreeAction::DeleteFolder(folder.clone()));
-                    ui.close();
-                }
-            });
-        }
+        // Local sessions.
+        render_store(ui, &StoreId::Local, &self.sessions, true, &mut action);
 
-        // Fill the rest of the pane with a clickable background, so right-clicking
-        // empty space offers New session / New folder.
-        let bg = ui.allocate_response(ui.available_size(), egui::Sense::click());
+        // Fill a bit of blank space with a right-click menu for the local store.
+        let bg = ui.allocate_response(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
         bg.context_menu(|ui| {
             if ui.button("New session").clicked() {
-                self.dialog = Dialog::EditSession(SessionForm::new());
+                action = Some(TreeAction::NewSessionIn(StoreId::Local, String::new()));
                 ui.close();
             }
             if ui.button("New folder").clicked() {
-                self.dialog = Dialog::NewFolder { name: String::new() };
+                action = Some(TreeAction::NewFolderIn(StoreId::Local));
                 ui.close();
             }
         });
+
+        // Each shared source as its own collapsible section.
+        for source in &self.shared {
+            let badge = if source.available() { "" } else { "  (offline)" };
+            let header = egui::CollapsingHeader::new(format!("🌐 {}{badge}", source.name()))
+                .id_salt(("shared-source", source.id()))
+                .default_open(true);
+            let store = StoreId::Shared(source.id().to_owned());
+            let editable = source.available();
+            let resp = header.show(ui, |ui| {
+                if let Some(note) = source.status() {
+                    ui.label(RichText::new(note).weak().italics());
+                }
+                render_store(ui, &store, source.store(), editable, &mut action);
+            });
+            resp.header_response.context_menu(|ui| {
+                if ui.button("Sync now").clicked() {
+                    action = Some(TreeAction::SyncSource(source.id().to_owned()));
+                    ui.close();
+                }
+                if editable {
+                    if ui.button("New session here").clicked() {
+                        action = Some(TreeAction::NewSessionIn(store.clone(), String::new()));
+                        ui.close();
+                    }
+                    if ui.button("New folder").clicked() {
+                        action = Some(TreeAction::NewFolderIn(store.clone()));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("Remove source").clicked() {
+                    action = Some(TreeAction::RemoveSource(source.id().to_owned()));
+                    ui.close();
+                }
+            });
+        }
 
         self.apply_tree_action(action, ctx);
     }
@@ -780,35 +810,135 @@ impl App {
     fn apply_tree_action(&mut self, action: Option<TreeAction>, ctx: &egui::Context) {
         let Some(action) = action else { return };
         let result = match action {
-            TreeAction::Connect(id) => {
-                if let Some(session) = self.sessions.get(&id).cloned() {
+            TreeAction::Connect(store, id) => {
+                if let Some(session) = self.session_in(&store, &id) {
                     self.start_connect(&session, ctx);
                 }
                 Ok(())
             }
-            TreeAction::Edit(id) => {
-                if let Some(session) = self.sessions.get(&id).cloned() {
-                    self.dialog = Dialog::EditSession(SessionForm::from_session(&session));
+            TreeAction::Edit(store, id) => {
+                if let Some(session) = self.session_in(&store, &id) {
+                    let mut form = SessionForm::from_session(&session);
+                    form.target = store;
+                    self.dialog = Dialog::EditSession(form);
                 }
                 Ok(())
             }
-            TreeAction::Delete(id) => self.sessions.remove(&id).map(|_| ()),
-            TreeAction::Duplicate(id) => {
-                if let Some(original) = self.sessions.get(&id).cloned() {
+            TreeAction::Delete(store, id) => self.store_remove(&store, &id),
+            TreeAction::Duplicate(store, id) => {
+                if let Some(original) = self.session_in(&store, &id) {
                     let mut copy = original.clone();
                     copy.id = Session::new("", "", "").id; // fresh id
                     copy.name = format!("{} copy", original.name);
-                    self.sessions.upsert(copy)
+                    self.store_upsert(&store, copy)
                 } else {
                     Ok(())
                 }
             }
-            TreeAction::MoveTo { id, folder } => self.sessions.move_to_folder(&id, &folder),
-            TreeAction::DeleteFolder(name) => self.sessions.remove_folder(&name),
+            TreeAction::MoveTo { store, id, folder } => self.store_move(&store, &id, &folder),
+            TreeAction::NewSessionIn(store, folder) => {
+                let mut form = SessionForm::new();
+                form.folder = folder;
+                form.target = store;
+                self.dialog = Dialog::EditSession(form);
+                Ok(())
+            }
+            TreeAction::NewFolderIn(store) => {
+                self.dialog = Dialog::NewFolder { target: store, name: String::new() };
+                Ok(())
+            }
+            TreeAction::RenameFolder(store, name) => {
+                self.dialog =
+                    Dialog::RenameFolder { target: store, old: name.clone(), name };
+                Ok(())
+            }
+            TreeAction::DeleteFolder(store, name) => self.store_remove_folder(&store, &name),
+            TreeAction::SyncSource(id) => {
+                if let Some(source) = self.shared.iter_mut().find(|s| s.id() == id) {
+                    source.reload();
+                }
+                Ok(())
+            }
+            TreeAction::RemoveSource(id) => self.remove_source(&id),
         };
         if let Err(e) = result {
             self.error = Some(format!("{e:#}"));
         }
+    }
+
+    // --- Store routing ------------------------------------------------------
+
+    fn shared_mut(&mut self, id: &str) -> Option<&mut SharedSource> {
+        self.shared.iter_mut().find(|s| s.id() == id)
+    }
+
+    /// A cloned session from the given store.
+    fn session_in(&self, store: &StoreId, id: &str) -> Option<Session> {
+        match store {
+            StoreId::Local => self.sessions.get(id).cloned(),
+            StoreId::Shared(sid) => {
+                self.shared.iter().find(|s| s.id() == sid).and_then(|s| s.store().get(id).cloned())
+            }
+        }
+    }
+
+    fn store_upsert(&mut self, store: &StoreId, session: Session) -> anyhow::Result<()> {
+        match store {
+            StoreId::Local => self.sessions.upsert(session),
+            StoreId::Shared(id) => self.offline_guard(id)?.upsert(session),
+        }
+    }
+
+    fn store_remove(&mut self, store: &StoreId, id: &str) -> anyhow::Result<()> {
+        match store {
+            StoreId::Local => self.sessions.remove(id).map(|_| ()),
+            StoreId::Shared(sid) => self.offline_guard(sid)?.remove(id),
+        }
+    }
+
+    fn store_move(&mut self, store: &StoreId, id: &str, folder: &str) -> anyhow::Result<()> {
+        match store {
+            StoreId::Local => self.sessions.move_to_folder(id, folder),
+            StoreId::Shared(sid) => self.offline_guard(sid)?.move_to_folder(id, folder),
+        }
+    }
+
+    fn store_add_folder(&mut self, store: &StoreId, name: &str) -> anyhow::Result<()> {
+        match store {
+            StoreId::Local => self.sessions.add_folder(name).map(|_| ()),
+            StoreId::Shared(sid) => self.offline_guard(sid)?.add_folder(name),
+        }
+    }
+
+    fn store_rename_folder(&mut self, store: &StoreId, old: &str, new: &str) -> anyhow::Result<()> {
+        match store {
+            StoreId::Local => self.sessions.rename_folder(old, new),
+            StoreId::Shared(sid) => self.offline_guard(sid)?.rename_folder(old, new),
+        }
+    }
+
+    fn store_remove_folder(&mut self, store: &StoreId, name: &str) -> anyhow::Result<()> {
+        match store {
+            StoreId::Local => self.sessions.remove_folder(name),
+            StoreId::Shared(sid) => self.offline_guard(sid)?.remove_folder(name),
+        }
+    }
+
+    /// Returns the shared source for writing, or an error if it is offline.
+    fn offline_guard(&mut self, id: &str) -> anyhow::Result<&mut SharedSource> {
+        let source = self
+            .shared_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("that shared source is gone"))?;
+        if !source.available() {
+            anyhow::bail!("the share is offline; changes are disabled until it is reachable");
+        }
+        Ok(source)
+    }
+
+    fn remove_source(&mut self, id: &str) -> anyhow::Result<()> {
+        self.sources_config.remove(id)?;
+        self.shared.retain(|s| s.id() != id);
+        Ok(())
     }
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
@@ -908,7 +1038,81 @@ impl App {
             Dialog::ConfirmQuit => self.show_confirm_quit(ctx),
             Dialog::ConfirmImportVault { .. } => self.show_confirm_import_vault(ctx),
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
+            Dialog::AddSource { .. } => self.show_add_source(ctx),
         }
+    }
+
+    fn show_add_source(&mut self, ctx: &egui::Context) {
+        let mut add = false;
+        let mut cancel = false;
+        let mut browse = false;
+        if let Dialog::AddSource { name, path } = &mut self.dialog {
+            egui::Modal::new(egui::Id::new("add-source")).show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.heading("Add shared source");
+                ui.label(
+                    RichText::new(
+                        "Point at a sessions file on a shared or synced location (network \
+                         mount, NAS, Dropbox…). It is cached locally so it stays available \
+                         offline. Secrets are never stored in the share.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                egui::Grid::new("add-source-fields").num_columns(2).show(ui, |ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(name);
+                    ui.end_row();
+                    ui.label("Shared file");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(path)
+                                .hint_text("/path/to/team-sessions.toml")
+                                .desired_width(240.0),
+                        );
+                        browse |= ui.button("Browse…").clicked();
+                    });
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    add |= ui.button("Add").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if browse
+            && let Some(picked) = rfd::FileDialog::new()
+                .set_file_name("team-sessions.toml")
+                .save_file()
+            && let Dialog::AddSource { path, .. } = &mut self.dialog
+        {
+            *path = picked.to_string_lossy().into_owned();
+        }
+        if add
+            && let Dialog::AddSource { name, path } = &self.dialog
+        {
+            let (name, path) = (name.trim().to_owned(), path.trim().to_owned());
+            if name.is_empty() || path.is_empty() {
+                self.error = Some("Give the source a name and a file path.".into());
+            } else {
+                self.add_source(name, path.into());
+                self.dialog = Dialog::None;
+            }
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn add_source(&mut self, name: String, path: PathBuf) {
+        let def = SourceDef { id: Session::new("", "", "").id, name, path };
+        if let Err(e) = self.sources_config.add(def.clone()) {
+            self.error = Some(format!("{e:#}"));
+            return;
+        }
+        let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
+        self.shared.push(SharedSource::open(def, &cache));
     }
 
     fn show_confirm_quit(&mut self, ctx: &egui::Context) {
@@ -1077,7 +1281,7 @@ impl App {
     fn show_new_folder(&mut self, ctx: &egui::Context) {
         let mut submit = false;
         let mut cancel = false;
-        if let Dialog::NewFolder { name } = &mut self.dialog {
+        if let Dialog::NewFolder { name, .. } = &mut self.dialog {
             egui::Modal::new(egui::Id::new("new-folder")).show(ctx, |ui| {
                 ui.set_width(300.0);
                 ui.heading("New folder");
@@ -1092,10 +1296,10 @@ impl App {
             });
         }
         if submit
-            && let Dialog::NewFolder { name } = &self.dialog
+            && let Dialog::NewFolder { target, name } = &self.dialog
         {
-            let name = name.clone();
-            if let Err(e) = self.sessions.add_folder(&name) {
+            let (target, name) = (target.clone(), name.clone());
+            if let Err(e) = self.store_add_folder(&target, &name) {
                 self.error = Some(format!("{e:#}"));
             }
             self.dialog = Dialog::None;
@@ -1123,10 +1327,10 @@ impl App {
             });
         }
         if submit
-            && let Dialog::RenameFolder { old, name } = &self.dialog
+            && let Dialog::RenameFolder { target, old, name } = &self.dialog
         {
-            let (old, name) = (old.clone(), name.clone());
-            if let Err(e) = self.sessions.rename_folder(&old, &name) {
+            let (target, old, name) = (target.clone(), old.clone(), name.clone());
+            if let Err(e) = self.store_rename_folder(&target, &old, &name) {
                 self.error = Some(format!("{e:#}"));
             }
             self.dialog = Dialog::None;
@@ -1521,6 +1725,7 @@ impl App {
             form.secret_input.clone(),
             form.key_passphrase.clone(),
         );
+        let target = form.target.clone();
 
         let port: u16 = match port_str.parse() {
             Ok(p) => p,
@@ -1579,7 +1784,7 @@ impl App {
             AuthMethod::Key => Auth::Key { secret: secret_name },
         };
 
-        if let Err(e) = self.sessions.upsert(session) {
+        if let Err(e) = self.store_upsert(&target, session) {
             return self.set_form_error(&format!("{e:#}"));
         }
         self.dialog = Dialog::None;
@@ -2124,6 +2329,18 @@ impl eframe::App for App {
             }
         }
 
+        // Periodically re-read shared sources so others' changes appear.
+        if !self.shared.is_empty() {
+            const SYNC_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+            if self.last_sync.elapsed() >= SYNC_EVERY {
+                for source in &mut self.shared {
+                    source.reload();
+                }
+                self.last_sync = std::time::Instant::now();
+            }
+            ctx.request_repaint_after(SYNC_EVERY);
+        }
+
         // Drop tabs whose shells/sessions have ended (connecting tabs stay).
         let before = self.tabs.len();
         self.tabs.retain(|t| !t.is_dead());
@@ -2202,6 +2419,7 @@ impl SessionForm {
             key_passphrase: String::new(),
             legacy: false,
             error: None,
+            target: StoreId::Local,
         }
     }
 
@@ -2228,6 +2446,7 @@ impl SessionForm {
             key_passphrase: String::new(),
             legacy: session.legacy,
             error: None,
+            target: StoreId::Local,
         }
     }
 }
@@ -2245,56 +2464,134 @@ fn initial_vault_state(path: &std::path::Path) -> VaultState {
 
 /// An action chosen from the session tree, applied after rendering.
 enum TreeAction {
-    Connect(String),
-    Edit(String),
-    Delete(String),
-    Duplicate(String),
-    MoveTo { id: String, folder: String },
-    DeleteFolder(String),
+    Connect(StoreId, String),
+    Edit(StoreId, String),
+    Delete(StoreId, String),
+    Duplicate(StoreId, String),
+    MoveTo { store: StoreId, id: String, folder: String },
+    NewSessionIn(StoreId, String),
+    NewFolderIn(StoreId),
+    RenameFolder(StoreId, String),
+    DeleteFolder(StoreId, String),
+    SyncSource(String),
+    RemoveSource(String),
+}
+
+/// Renders one store's folders and sessions, emitting a [`TreeAction`] on
+/// interaction. `editable` is false for an offline shared source (view only).
+fn render_store(
+    ui: &mut egui::Ui,
+    store: &StoreId,
+    sessions: &SessionStore,
+    editable: bool,
+    action: &mut Option<TreeAction>,
+) {
+    let folders = sessions.folders();
+    let mut by_folder: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for folder in &folders {
+        by_folder.entry(folder.clone()).or_default();
+    }
+    for session in sessions.all() {
+        by_folder
+            .entry(session.folder.clone())
+            .or_default()
+            .push((session.id.clone(), session.name.clone()));
+    }
+
+    if let Some(entries) = by_folder.get("") {
+        for (id, name) in entries {
+            session_row(ui, store, id, name, &folders, editable, action);
+        }
+    }
+    for (folder, entries) in by_folder.iter().filter(|(f, _)| !f.is_empty()) {
+        let header = egui::CollapsingHeader::new(format!("📁 {folder}"))
+            .id_salt((store_salt(store), folder))
+            .default_open(true);
+        let resp = header.show(ui, |ui| {
+            for (id, name) in entries {
+                session_row(ui, store, id, name, &folders, editable, action);
+            }
+        });
+        if editable {
+            resp.header_response.context_menu(|ui| {
+                if ui.button("New session here").clicked() {
+                    *action = Some(TreeAction::NewSessionIn(store.clone(), folder.clone()));
+                    ui.close();
+                }
+                if ui.button("Rename folder").clicked() {
+                    *action = Some(TreeAction::RenameFolder(store.clone(), folder.clone()));
+                    ui.close();
+                }
+                if ui.button("Delete folder").clicked() {
+                    *action = Some(TreeAction::DeleteFolder(store.clone(), folder.clone()));
+                    ui.close();
+                }
+            });
+        }
+    }
+}
+
+/// A stable salt per store so folder headers in different stores don't collide.
+fn store_salt(store: &StoreId) -> String {
+    match store {
+        StoreId::Local => "local".into(),
+        StoreId::Shared(id) => format!("shared:{id}"),
+    }
 }
 
 /// Renders one session row: double-click connects, right-click opens its menu.
 fn session_row(
     ui: &mut egui::Ui,
+    store: &StoreId,
     id: &str,
     name: &str,
     folders: &[String],
+    editable: bool,
     action: &mut Option<TreeAction>,
 ) {
     let resp = ui.selectable_label(false, format!("🖥 {name}"));
     if resp.double_clicked() {
-        *action = Some(TreeAction::Connect(id.to_owned()));
+        *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
     }
     resp.context_menu(|ui| {
         if ui.button("Connect").clicked() {
-            *action = Some(TreeAction::Connect(id.to_owned()));
+            *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
             ui.close();
         }
-        if ui.button("Edit…").clicked() {
-            *action = Some(TreeAction::Edit(id.to_owned()));
-            ui.close();
-        }
-        if ui.button("Duplicate").clicked() {
-            *action = Some(TreeAction::Duplicate(id.to_owned()));
-            ui.close();
-        }
-        ui.menu_button("Move to", |ui| {
-            if ui.button("(root)").clicked() {
-                *action = Some(TreeAction::MoveTo { id: id.to_owned(), folder: String::new() });
+        if editable {
+            if ui.button("Edit…").clicked() {
+                *action = Some(TreeAction::Edit(store.clone(), id.to_owned()));
                 ui.close();
             }
-            for folder in folders {
-                if ui.button(folder).clicked() {
-                    *action =
-                        Some(TreeAction::MoveTo { id: id.to_owned(), folder: folder.clone() });
+            if ui.button("Duplicate").clicked() {
+                *action = Some(TreeAction::Duplicate(store.clone(), id.to_owned()));
+                ui.close();
+            }
+            ui.menu_button("Move to", |ui| {
+                if ui.button("(root)").clicked() {
+                    *action = Some(TreeAction::MoveTo {
+                        store: store.clone(),
+                        id: id.to_owned(),
+                        folder: String::new(),
+                    });
                     ui.close();
                 }
+                for folder in folders {
+                    if ui.button(folder).clicked() {
+                        *action = Some(TreeAction::MoveTo {
+                            store: store.clone(),
+                            id: id.to_owned(),
+                            folder: folder.clone(),
+                        });
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            if ui.button("Delete").clicked() {
+                *action = Some(TreeAction::Delete(store.clone(), id.to_owned()));
+                ui.close();
             }
-        });
-        ui.separator();
-        if ui.button("Delete").clicked() {
-            *action = Some(TreeAction::Delete(id.to_owned()));
-            ui.close();
         }
     });
 }

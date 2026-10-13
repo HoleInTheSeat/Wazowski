@@ -15,6 +15,12 @@ wazowski-term.workspace = true
 wazowski-core.workspace = true
 wazowski-ssh.workspace = true
 rfd.workspace = true
+directories.workspace = true
+toml.workspace = true
+serde = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
