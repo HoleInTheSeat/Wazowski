@@ -14,7 +14,9 @@ use wazowski_term::{LocalPty, TermSize, Terminal, TerminalView};
 
 use crate::connect::{Connected, PendingConnect, Progress};
 use crate::sftp_ui::FileBrowser;
-use crate::sources::{self, SharedSource, SourceDef, SourcesConfig};
+use crate::sources::{
+    self, GitAuthKind, SharedSource, SourceDef, SourceKind, SourcesConfig,
+};
 
 const NEW_TAB: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::T);
@@ -109,9 +111,42 @@ enum Dialog {
     ConfirmQuit,
     ConfirmImportVault { src: PathBuf },
     AskUsername(UsernamePrompt),
-    AddSource { name: String, path: String },
+    AddSource(AddSourceForm),
     MissingShare { id: String },
     DropMenu { payload: DragPayload, to: StoreId, folder: String },
+}
+
+/// Fields for the "Add shared source" dialog (folder or git).
+struct AddSourceForm {
+    name: String,
+    kind: SourceKind,
+    // Folder:
+    path: String,
+    // Git:
+    url: String,
+    branch: String,
+    file: String,
+    auth: GitAuthKind,
+    username: String,
+    token: String,
+    key_path: String,
+}
+
+impl Default for AddSourceForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: SourceKind::Folder,
+            path: String::new(),
+            url: String::new(),
+            branch: String::new(),
+            file: "wazowski-sessions.toml".into(),
+            auth: GitAuthKind::None,
+            username: String::new(),
+            token: String::new(),
+            key_path: String::new(),
+        }
+    }
 }
 
 /// Prompt for a username at connect time when the session has none.
@@ -640,7 +675,7 @@ impl App {
                 }
                 ui.separator();
                 if ui.button("Add shared source…").clicked() {
-                    self.dialog = Dialog::AddSource { name: String::new(), path: String::new() };
+                    self.dialog = Dialog::AddSource(AddSourceForm::default());
                 }
             });
             ui.menu_button("Vault", |ui| {
@@ -1096,6 +1131,7 @@ impl App {
     fn remove_source(&mut self, id: &str) -> anyhow::Result<()> {
         self.sources_config.remove(id)?;
         self.shared.retain(|s| s.id() != id);
+        sources::delete_git_token(id);
         Ok(())
     }
 
@@ -1198,7 +1234,7 @@ impl App {
             Dialog::ConfirmQuit => self.show_confirm_quit(ctx),
             Dialog::ConfirmImportVault { .. } => self.show_confirm_import_vault(ctx),
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
-            Dialog::AddSource { .. } => self.show_add_source(ctx),
+            Dialog::AddSource(_) => self.show_add_source(ctx),
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
             Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
         }
@@ -1302,34 +1338,102 @@ impl App {
     fn show_add_source(&mut self, ctx: &egui::Context) {
         let mut add = false;
         let mut cancel = false;
-        let mut browse = false;
-        if let Dialog::AddSource { name, path } = &mut self.dialog {
+        let mut browse_folder = false;
+        let mut browse_key = false;
+        if let Dialog::AddSource(f) = &mut self.dialog {
             egui::Modal::new(egui::Id::new("add-source")).show(ctx, |ui| {
-                ui.set_width(440.0);
+                ui.set_width(460.0);
                 ui.heading("Add shared source");
                 ui.label(
                     RichText::new(
-                        "Point at a sessions file on a shared or synced location (network \
-                         mount, NAS, Dropbox…). It is cached locally so it stays available \
-                         offline. Secrets are never stored in the share.",
+                        "Shared sessions are cached locally (available offline) and never \
+                         store secrets — credentials are created locally on first use.",
                     )
                     .weak(),
                 );
                 ui.add_space(6.0);
                 egui::Grid::new("add-source-fields").num_columns(2).show(ui, |ui| {
                     ui.label("Name");
-                    ui.text_edit_singleline(name);
+                    ui.text_edit_singleline(&mut f.name);
                     ui.end_row();
-                    ui.label("Shared file");
+                    ui.label("Type");
                     ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(path)
-                                .hint_text("/path/to/team-sessions.toml")
-                                .desired_width(240.0),
-                        );
-                        browse |= ui.button("Browse…").clicked();
+                        ui.selectable_value(&mut f.kind, SourceKind::Folder, "Folder / file");
+                        ui.selectable_value(&mut f.kind, SourceKind::Git, "Git repo");
                     });
                     ui.end_row();
+
+                    match f.kind {
+                        SourceKind::Folder => {
+                            ui.label("Shared file");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.path)
+                                        .hint_text("/path/to/team-sessions.toml")
+                                        .desired_width(240.0),
+                                );
+                                browse_folder |= ui.button("Browse…").clicked();
+                            });
+                            ui.end_row();
+                        }
+                        SourceKind::Git => {
+                            ui.label("Repository URL");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.url)
+                                    .hint_text("https://… or git@…:group/repo.git"),
+                            );
+                            ui.end_row();
+                            ui.label("Branch");
+                            ui.add(egui::TextEdit::singleline(&mut f.branch).hint_text("(default)"));
+                            ui.end_row();
+                            ui.label("File in repo");
+                            ui.text_edit_singleline(&mut f.file);
+                            ui.end_row();
+                            ui.label("Auth");
+                            egui::ComboBox::from_id_salt("git-auth")
+                                .selected_text(match f.auth {
+                                    GitAuthKind::None => "None / ambient",
+                                    GitAuthKind::Https => "HTTPS token",
+                                    GitAuthKind::Ssh => "SSH key",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut f.auth, GitAuthKind::None, "None / ambient");
+                                    ui.selectable_value(&mut f.auth, GitAuthKind::Https, "HTTPS token");
+                                    ui.selectable_value(&mut f.auth, GitAuthKind::Ssh, "SSH key");
+                                });
+                            ui.end_row();
+                            match f.auth {
+                                GitAuthKind::Https => {
+                                    ui.label("Username");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut f.username)
+                                            .hint_text("(optional for GitHub PATs)"),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Token");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut f.token)
+                                            .password(true)
+                                            .hint_text("stored in your OS keyring"),
+                                    );
+                                    ui.end_row();
+                                }
+                                GitAuthKind::Ssh => {
+                                    ui.label("Private key");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut f.key_path)
+                                                .hint_text("(optional; uses agent if blank)")
+                                                .desired_width(240.0),
+                                        );
+                                        browse_key |= ui.button("Browse…").clicked();
+                                    });
+                                    ui.end_row();
+                                }
+                                GitAuthKind::None => {}
+                            }
+                        }
+                    }
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -1338,23 +1442,29 @@ impl App {
                 });
             });
         }
-        if browse
+        if browse_folder
             && let Some(picked) = rfd::FileDialog::new()
                 .set_file_name("team-sessions.toml")
                 .save_file()
-            && let Dialog::AddSource { path, .. } = &mut self.dialog
+            && let Dialog::AddSource(f) = &mut self.dialog
         {
-            *path = picked.to_string_lossy().into_owned();
+            f.path = picked.to_string_lossy().into_owned();
+        }
+        if browse_key
+            && let Some(picked) = rfd::FileDialog::new().pick_file()
+            && let Dialog::AddSource(f) = &mut self.dialog
+        {
+            f.key_path = picked.to_string_lossy().into_owned();
         }
         if add
-            && let Dialog::AddSource { name, path } = &self.dialog
+            && let Dialog::AddSource(f) = &self.dialog
         {
-            let (name, path) = (name.trim().to_owned(), path.trim().to_owned());
-            if name.is_empty() || path.is_empty() {
-                self.error = Some("Give the source a name and a file path.".into());
-            } else {
-                self.add_source(name, path.into());
-                self.dialog = Dialog::None;
+            match self.build_source_def(f) {
+                Ok((def, token)) => {
+                    self.add_source(def, token);
+                    self.dialog = Dialog::None;
+                }
+                Err(e) => self.error = Some(e),
             }
         }
         if cancel {
@@ -1362,8 +1472,60 @@ impl App {
         }
     }
 
-    fn add_source(&mut self, name: String, path: PathBuf) {
-        let def = SourceDef { id: Session::new("", "", "").id, name, path };
+    /// Validates the add-source form into a [`SourceDef`] (and an HTTPS token to stash).
+    fn build_source_def(&self, f: &AddSourceForm) -> Result<(SourceDef, Option<String>), String> {
+        let name = f.name.trim().to_owned();
+        if name.is_empty() {
+            return Err("Give the source a name.".into());
+        }
+        let id = Session::new("", "", "").id;
+        let mut def = SourceDef {
+            id,
+            name,
+            kind: f.kind,
+            path: PathBuf::new(),
+            url: String::new(),
+            branch: f.branch.trim().to_owned(),
+            file: if f.file.trim().is_empty() {
+                "wazowski-sessions.toml".into()
+            } else {
+                f.file.trim().to_owned()
+            },
+            auth: f.auth,
+            username: f.username.trim().to_owned(),
+            key_path: f.key_path.trim().to_owned(),
+        };
+        let mut token = None;
+        match f.kind {
+            SourceKind::Folder => {
+                if f.path.trim().is_empty() {
+                    return Err("Choose a shared file path.".into());
+                }
+                def.path = PathBuf::from(f.path.trim());
+            }
+            SourceKind::Git => {
+                if f.url.trim().is_empty() {
+                    return Err("Enter the repository URL.".into());
+                }
+                def.url = f.url.trim().to_owned();
+                if f.auth == GitAuthKind::Https {
+                    if f.token.is_empty() {
+                        return Err("Enter the HTTPS token (or choose a different auth).".into());
+                    }
+                    token = Some(f.token.clone());
+                }
+            }
+        }
+        Ok((def, token))
+    }
+
+    fn add_source(&mut self, def: SourceDef, token: Option<String>) {
+        if let Some(token) = token
+            && let Err(e) = sources::store_git_token(&def.id, &token)
+        {
+            self.error = Some(format!("Could not store the token: {e:#}"));
+            return;
+        }
         if let Err(e) = self.sources_config.add(def.clone()) {
             self.error = Some(format!("{e:#}"));
             return;
@@ -1373,6 +1535,7 @@ impl App {
         // A new source's file usually doesn't exist yet; create it so the share
         // is immediately usable (and later deletion registers as offline).
         if !source.available()
+            && source.missing()
             && let Err(e) = source.create()
         {
             self.error = Some(format!("Added, but could not create the shared file: {e:#}"));

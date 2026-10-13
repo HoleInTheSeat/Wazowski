@@ -1,0 +1,157 @@
+//! A git-backed shared source, driven by the system `git` binary.
+//!
+//! Shelling out to `git` means any host works the same (GitHub, GitLab,
+//! Forgejo, …) and the user's existing SSH agent / credential helpers apply.
+//! Private repos can authenticate with an HTTPS token (sent as a Basic auth
+//! header, never written to the repo config) or an SSH key.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+use base64::Engine;
+
+/// How a git remote authenticates.
+#[derive(Clone)]
+pub enum GitAuth {
+    /// Public repo, or rely on the user's ambient git credentials.
+    None,
+    /// HTTPS with a personal access token (works for GitHub/GitLab/Forgejo/…).
+    Https { username: String, token: String },
+    /// SSH, optionally with an explicit private key (else the agent/default key).
+    Ssh { key_path: Option<PathBuf> },
+}
+
+/// A working clone of a shared-sessions repo.
+pub struct GitRepo {
+    work_dir: PathBuf,
+    url: String,
+    /// Branch to track; empty means the remote default.
+    branch: String,
+    /// Path of the sessions file within the repo.
+    file: String,
+    auth: GitAuth,
+}
+
+impl GitRepo {
+    pub fn new(
+        work_dir: PathBuf,
+        url: String,
+        branch: String,
+        file: String,
+        auth: GitAuth,
+    ) -> Self {
+        Self { work_dir, url, branch, file, auth }
+    }
+
+    /// Pulls the latest and returns the sessions-file bytes (`None` if absent).
+    pub fn fetch(&self) -> Result<Option<Vec<u8>>> {
+        // A clone failure is the real "offline" signal (no remote reachable).
+        self.ensure_clone()?;
+        // Fast-forward if possible; failures (empty repo, unborn branch, briefly
+        // offline after an existing clone) are non-fatal — we still read the clone.
+        let _ = self.git(&["pull", "--ff-only"]);
+        let path = self.work_dir.join(&self.file);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("reading the sessions file in the clone"),
+        }
+    }
+
+    /// Writes the sessions file, commits, and pushes.
+    pub fn publish(&self, bytes: &[u8]) -> Result<()> {
+        self.ensure_clone()?;
+        let path = self.work_dir.join(&self.file);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&path, bytes).context("writing the sessions file")?;
+        self.git(&["add", "--", &self.file]).context("git add failed")?;
+        // Commit; a no-op commit returns non-zero, which is fine.
+        let committed = self.git(&[
+            "-c",
+            "user.name=Wazowski",
+            "-c",
+            "user.email=wazowski@localhost",
+            "commit",
+            "-m",
+            "Update sessions",
+        ]);
+        if committed.is_err() && !self.is_clean()? {
+            committed.context("git commit failed")?;
+        }
+        // Push the current branch, setting upstream so later pushes are simple.
+        self.git(&["push", "--set-upstream", "origin", "HEAD"]).context("git push failed")?;
+        Ok(())
+    }
+
+    /// Clones the repo on first use.
+    fn ensure_clone(&self) -> Result<()> {
+        if self.work_dir.join(".git").is_dir() {
+            return Ok(());
+        }
+        if let Some(parent) = self.work_dir.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let dir = self.work_dir.to_string_lossy().into_owned();
+        // Clone without pinning a branch so even an empty repo clones cleanly.
+        self.git_in(None, &["clone", &self.url, &dir]).context("git clone failed")?;
+        // Switch to the requested branch if one was given (best effort; it may
+        // not exist yet in an empty repo, in which case the first publish makes it).
+        if !self.branch.is_empty() {
+            let _ = self.git(&["checkout", &self.branch]);
+            let _ = self.git(&["checkout", "-B", &self.branch]);
+        }
+        Ok(())
+    }
+
+    /// Whether the working tree has no uncommitted changes.
+    fn is_clean(&self) -> Result<bool> {
+        let out = self.command(Some(&self.work_dir)).args(["status", "--porcelain"]).output()?;
+        Ok(out.stdout.is_empty())
+    }
+
+    /// Runs a git command in the work dir.
+    fn git(&self, args: &[&str]) -> Result<()> {
+        self.git_in(Some(&self.work_dir), args)
+    }
+
+    fn git_in(&self, cwd: Option<&std::path::Path>, args: &[&str]) -> Result<()> {
+        let out = self.command(cwd).args(args).output().context("could not run git")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!("{}", stderr.trim().lines().last().unwrap_or("git error"));
+        }
+        Ok(())
+    }
+
+    /// Builds a `git` command with auth wired in and prompts disabled.
+    fn command(&self, cwd: Option<&std::path::Path>) -> Command {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.arg("-C").arg(dir);
+        }
+        // Never block on an interactive credential/host prompt.
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        match &self.auth {
+            GitAuth::None => {}
+            GitAuth::Https { username, token } => {
+                // Send Basic auth as a header so the token isn't written to .git/config.
+                let user = if username.is_empty() { "x-access-token" } else { username };
+                let encoded = base64::engine::general_purpose::STANDARD
+                    .encode(format!("{user}:{token}"));
+                cmd.arg("-c").arg(format!("http.extraHeader=Authorization: Basic {encoded}"));
+            }
+            GitAuth::Ssh { key_path } => {
+                let mut ssh =
+                    String::from("ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new");
+                if let Some(key) = key_path {
+                    ssh.push_str(&format!(" -i {}", key.display()));
+                }
+                cmd.env("GIT_SSH_COMMAND", ssh);
+            }
+        }
+        cmd
+    }
+}

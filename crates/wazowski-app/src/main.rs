@@ -3,6 +3,7 @@
 mod app;
 mod conn_log;
 mod connect;
+mod git;
 mod sftp_ui;
 mod sources;
 
