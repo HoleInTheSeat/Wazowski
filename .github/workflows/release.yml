@@ -24,9 +24,6 @@ jobs:
           - os: macos-latest
             name: wazowski-macos-aarch64
             bin: wazowski
-          - os: macos-13
-            name: wazowski-macos-x86_64
-            bin: wazowski
           - os: windows-latest
             name: wazowski-windows-x86_64.exe
             bin: wazowski.exe
