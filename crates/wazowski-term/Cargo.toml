@@ -1,0 +1,12 @@
+[package]
+name = "wazowski-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+alacritty_terminal.workspace = true
+portable-pty.workspace = true
+anyhow.workspace = true
+log.workspace = true
