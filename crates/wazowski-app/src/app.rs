@@ -102,6 +102,8 @@ enum Dialog {
     QuickConnect(ConnectAuthForm),
     VaultManager(VaultManagerState),
     CreateCredential(CredentialPrompt),
+    NewFolder { name: String },
+    RenameFolder { old: String, name: String },
 }
 
 /// How a quick connection should authenticate.
@@ -635,70 +637,107 @@ impl App {
         });
         ui.separator();
 
-        egui::ScrollArea::vertical().show(ui, |ui| self.session_tree(ui, ctx));
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            self.session_tree(ui, ctx);
+        });
     }
 
     fn session_tree(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Group session ids by folder so the borrow of `self.sessions` ends
-        // before we mutate `self` in response to a click.
-        let mut folders: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        // Snapshot the tree so the borrow of `self.sessions` ends before we act.
+        let mut by_folder: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for folder in self.sessions.folders() {
+            by_folder.entry(folder).or_default();
+        }
         for session in self.sessions.all() {
-            folders
+            by_folder
                 .entry(session.folder.clone())
                 .or_default()
                 .push((session.id.clone(), session.name.clone()));
         }
+        let all_folders = self.sessions.folders();
 
-        let mut connect_id = None;
-        let mut edit_id = None;
-        let mut delete_id = None;
+        let mut action: Option<TreeAction> = None;
 
-        for (folder, entries) in &folders {
-            let mut render = |ui: &mut egui::Ui| {
-                for (id, name) in entries {
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(false, format!("🖥 {name}")).double_clicked() {
-                            connect_id = Some(id.clone());
-                        }
-                        ui.menu_button("⋮", |ui| {
-                            if ui.button("Connect").clicked() {
-                                connect_id = Some(id.clone());
-                                ui.close();
-                            }
-                            if ui.button("Edit…").clicked() {
-                                edit_id = Some(id.clone());
-                                ui.close();
-                            }
-                            if ui.button("Delete").clicked() {
-                                delete_id = Some(id.clone());
-                                ui.close();
-                            }
-                        });
-                    });
-                }
-            };
-            if folder.is_empty() {
-                render(ui);
-            } else {
-                egui::CollapsingHeader::new(format!("📁 {folder}"))
-                    .default_open(true)
-                    .show(ui, &mut render);
+        // Root-level sessions first.
+        if let Some(entries) = by_folder.get("") {
+            for (id, name) in entries {
+                session_row(ui, id, name, &all_folders, &mut action);
             }
         }
+        // Then each folder.
+        for (folder, entries) in by_folder.iter().filter(|(f, _)| !f.is_empty()) {
+            let header = egui::CollapsingHeader::new(format!("📁 {folder}")).default_open(true);
+            let header_resp = header.show(ui, |ui| {
+                for (id, name) in entries {
+                    session_row(ui, id, name, &all_folders, &mut action);
+                }
+            });
+            header_resp.header_response.context_menu(|ui| {
+                if ui.button("New session here").clicked() {
+                    let mut form = SessionForm::new();
+                    form.folder = folder.clone();
+                    self.dialog = Dialog::EditSession(form);
+                    ui.close();
+                }
+                if ui.button("Rename folder").clicked() {
+                    self.dialog =
+                        Dialog::RenameFolder { old: folder.clone(), name: folder.clone() };
+                    ui.close();
+                }
+                if ui.button("Delete folder").clicked() {
+                    action = Some(TreeAction::DeleteFolder(folder.clone()));
+                    ui.close();
+                }
+            });
+        }
 
-        if let Some(id) = connect_id
-            && let Some(session) = self.sessions.get(&id).cloned()
-        {
-            self.start_connect(&session, ctx);
-        }
-        if let Some(id) = edit_id
-            && let Some(session) = self.sessions.get(&id).cloned()
-        {
-            self.dialog = Dialog::EditSession(SessionForm::from_session(&session));
-        }
-        if let Some(id) = delete_id
-            && let Err(e) = self.sessions.remove(&id)
-        {
+        // Fill the rest of the pane with a clickable background, so right-clicking
+        // empty space offers New session / New folder.
+        let bg = ui.allocate_response(ui.available_size(), egui::Sense::click());
+        bg.context_menu(|ui| {
+            if ui.button("New session").clicked() {
+                self.dialog = Dialog::EditSession(SessionForm::new());
+                ui.close();
+            }
+            if ui.button("New folder").clicked() {
+                self.dialog = Dialog::NewFolder { name: String::new() };
+                ui.close();
+            }
+        });
+
+        self.apply_tree_action(action, ctx);
+    }
+
+    fn apply_tree_action(&mut self, action: Option<TreeAction>, ctx: &egui::Context) {
+        let Some(action) = action else { return };
+        let result = match action {
+            TreeAction::Connect(id) => {
+                if let Some(session) = self.sessions.get(&id).cloned() {
+                    self.start_connect(&session, ctx);
+                }
+                Ok(())
+            }
+            TreeAction::Edit(id) => {
+                if let Some(session) = self.sessions.get(&id).cloned() {
+                    self.dialog = Dialog::EditSession(SessionForm::from_session(&session));
+                }
+                Ok(())
+            }
+            TreeAction::Delete(id) => self.sessions.remove(&id).map(|_| ()),
+            TreeAction::Duplicate(id) => {
+                if let Some(original) = self.sessions.get(&id).cloned() {
+                    let mut copy = original.clone();
+                    copy.id = Session::new("", "", "").id; // fresh id
+                    copy.name = format!("{} copy", original.name);
+                    self.sessions.upsert(copy)
+                } else {
+                    Ok(())
+                }
+            }
+            TreeAction::MoveTo { id, folder } => self.sessions.move_to_folder(&id, &folder),
+            TreeAction::DeleteFolder(name) => self.sessions.remove_folder(&name),
+        };
+        if let Err(e) = result {
             self.error = Some(format!("{e:#}"));
         }
     }
@@ -794,6 +833,74 @@ impl App {
             Dialog::QuickConnect(_) => self.show_quick_connect(ctx),
             Dialog::VaultManager(_) => self.show_vault_manager(ctx),
             Dialog::CreateCredential(_) => self.show_create_credential(ctx),
+            Dialog::NewFolder { .. } => self.show_new_folder(ctx),
+            Dialog::RenameFolder { .. } => self.show_rename_folder(ctx),
+        }
+    }
+
+    fn show_new_folder(&mut self, ctx: &egui::Context) {
+        let mut submit = false;
+        let mut cancel = false;
+        if let Dialog::NewFolder { name } = &mut self.dialog {
+            egui::Modal::new(egui::Id::new("new-folder")).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.heading("New folder");
+                let field = ui.add(egui::TextEdit::singleline(name).hint_text("Folder name"));
+                field.request_focus();
+                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    submit |= ui.button("Create").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if submit
+            && let Dialog::NewFolder { name } = &self.dialog
+        {
+            let name = name.clone();
+            if let Err(e) = self.sessions.add_folder(&name) {
+                self.error = Some(format!("{e:#}"));
+            }
+            self.dialog = Dialog::None;
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn show_rename_folder(&mut self, ctx: &egui::Context) {
+        let mut submit = false;
+        let mut cancel = false;
+        if let Dialog::RenameFolder { name, .. } = &mut self.dialog {
+            egui::Modal::new(egui::Id::new("rename-folder")).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.heading("Rename folder");
+                let field = ui.add(egui::TextEdit::singleline(name));
+                field.request_focus();
+                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    submit |= ui.button("Rename").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if submit
+            && let Dialog::RenameFolder { old, name } = &self.dialog
+        {
+            let (old, name) = (old.clone(), name.clone());
+            if let Err(e) = self.sessions.rename_folder(&old, &name) {
+                self.error = Some(format!("{e:#}"));
+            }
+            self.dialog = Dialog::None;
+        }
+        if cancel {
+            self.dialog = Dialog::None;
         }
     }
 
@@ -1881,6 +1988,62 @@ fn initial_vault_state(path: &std::path::Path) -> VaultState {
         Ok(Some(vault)) => VaultState::Unlocked(Box::new(vault)),
         _ => VaultState::Locked,
     }
+}
+
+/// An action chosen from the session tree, applied after rendering.
+enum TreeAction {
+    Connect(String),
+    Edit(String),
+    Delete(String),
+    Duplicate(String),
+    MoveTo { id: String, folder: String },
+    DeleteFolder(String),
+}
+
+/// Renders one session row: double-click connects, right-click opens its menu.
+fn session_row(
+    ui: &mut egui::Ui,
+    id: &str,
+    name: &str,
+    folders: &[String],
+    action: &mut Option<TreeAction>,
+) {
+    let resp = ui.selectable_label(false, format!("🖥 {name}"));
+    if resp.double_clicked() {
+        *action = Some(TreeAction::Connect(id.to_owned()));
+    }
+    resp.context_menu(|ui| {
+        if ui.button("Connect").clicked() {
+            *action = Some(TreeAction::Connect(id.to_owned()));
+            ui.close();
+        }
+        if ui.button("Edit…").clicked() {
+            *action = Some(TreeAction::Edit(id.to_owned()));
+            ui.close();
+        }
+        if ui.button("Duplicate").clicked() {
+            *action = Some(TreeAction::Duplicate(id.to_owned()));
+            ui.close();
+        }
+        ui.menu_button("Move to", |ui| {
+            if ui.button("(root)").clicked() {
+                *action = Some(TreeAction::MoveTo { id: id.to_owned(), folder: String::new() });
+                ui.close();
+            }
+            for folder in folders {
+                if ui.button(folder).clicked() {
+                    *action =
+                        Some(TreeAction::MoveTo { id: id.to_owned(), folder: folder.clone() });
+                    ui.close();
+                }
+            }
+        });
+        ui.separator();
+        if ui.button("Delete").clicked() {
+            *action = Some(TreeAction::Delete(id.to_owned()));
+            ui.close();
+        }
+    });
 }
 
 /// Converts a stored secret into connect-ready auth material.

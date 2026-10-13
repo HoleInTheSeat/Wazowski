@@ -81,13 +81,17 @@ impl Session {
 pub struct SessionStore {
     path: PathBuf,
     sessions: Vec<Session>,
+    /// Explicit folders, so empty ones persist (sessions also imply folders).
+    folders: Vec<String>,
 }
 
-/// The serialized file shape: `[[session]]` tables.
+/// The serialized file shape: `[[session]]` tables plus a `folders` list.
 #[derive(Default, Serialize, Deserialize)]
 struct StoreFile {
     #[serde(default, rename = "session")]
     sessions: Vec<Session>,
+    #[serde(default)]
+    folders: Vec<String>,
 }
 
 impl SessionStore {
@@ -100,16 +104,16 @@ impl SessionStore {
 
     /// Loads the store from `path`, returning an empty store if the file does not exist.
     pub fn load(path: PathBuf) -> Result<Self> {
-        let sessions = match fs::read_to_string(&path) {
+        let (sessions, folders) = match fs::read_to_string(&path) {
             Ok(text) => {
                 let file: StoreFile = toml::from_str(&text)
                     .with_context(|| format!("could not parse {}", path.display()))?;
-                file.sessions
+                (file.sessions, file.folders)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
             Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
         };
-        Ok(Self { path, sessions })
+        Ok(Self { path, sessions, folders })
     }
 
     /// All sessions, in stored order.
@@ -151,12 +155,78 @@ impl SessionStore {
         map
     }
 
+    /// All non-root folder names, sorted and de-duplicated: explicit folders plus
+    /// any implied by a session's folder.
+    pub fn folders(&self) -> Vec<String> {
+        let mut set: std::collections::BTreeSet<String> = self.folders.iter().cloned().collect();
+        for session in &self.sessions {
+            if !session.folder.is_empty() {
+                set.insert(session.folder.clone());
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Creates an empty folder (no-op if it already exists). Returns whether it was new.
+    pub fn add_folder(&mut self, name: &str) -> Result<bool> {
+        let name = name.trim();
+        if name.is_empty() || self.folders.iter().any(|f| f == name) {
+            return Ok(false);
+        }
+        self.folders.push(name.to_owned());
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Removes a folder, moving any sessions in it back to the root.
+    pub fn remove_folder(&mut self, name: &str) -> Result<()> {
+        self.folders.retain(|f| f != name);
+        for session in &mut self.sessions {
+            if session.folder == name {
+                session.folder.clear();
+            }
+        }
+        self.save()
+    }
+
+    /// Renames a folder, updating the sessions it contains.
+    pub fn rename_folder(&mut self, old: &str, new: &str) -> Result<()> {
+        let new = new.trim();
+        if new.is_empty() {
+            return Ok(());
+        }
+        for folder in &mut self.folders {
+            if folder == old {
+                *folder = new.to_owned();
+            }
+        }
+        if !self.folders.iter().any(|f| f == new) {
+            self.folders.push(new.to_owned());
+        }
+        self.folders.retain(|f| f != old);
+        for session in &mut self.sessions {
+            if session.folder == old {
+                session.folder = new.to_owned();
+            }
+        }
+        self.save()
+    }
+
+    /// Moves a session to a folder (empty string for the root) and saves.
+    pub fn move_to_folder(&mut self, id: &str, folder: &str) -> Result<()> {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+            session.folder = folder.to_owned();
+            self.save()?;
+        }
+        Ok(())
+    }
+
     fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
-        let file = StoreFile { sessions: self.sessions.clone() };
+        let file = StoreFile { sessions: self.sessions.clone(), folders: self.folders.clone() };
         let text = toml::to_string_pretty(&file).context("could not serialize sessions")?;
         write_atomic(&self.path, text.as_bytes())
             .with_context(|| format!("could not write {}", self.path.display()))
@@ -249,6 +319,34 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionStore::load(dir.path().join("nope.toml")).unwrap();
         assert!(store.all().is_empty());
+    }
+
+    #[test]
+    fn folder_crud() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let mut store = SessionStore::load(path.clone()).unwrap();
+        assert!(store.add_folder("work").unwrap());
+        assert!(!store.add_folder("work").unwrap()); // idempotent
+        let mut s = Session::new("a", "h", "u");
+        s.folder = "work".into();
+        let id = s.id.clone();
+        store.upsert(s).unwrap();
+        assert!(store.folders().contains(&"work".to_string()));
+
+        store.rename_folder("work", "prod").unwrap();
+        assert_eq!(store.get(&id).unwrap().folder, "prod");
+
+        store.move_to_folder(&id, "").unwrap();
+        assert_eq!(store.get(&id).unwrap().folder, "");
+
+        store.add_folder("empty").unwrap();
+        store.remove_folder("empty").unwrap();
+        assert!(!store.folders().contains(&"empty".to_string()));
+
+        // Folders persist across reload.
+        let reloaded = SessionStore::load(path).unwrap();
+        assert!(reloaded.folders().contains(&"prod".to_string()));
     }
 
     #[test]
