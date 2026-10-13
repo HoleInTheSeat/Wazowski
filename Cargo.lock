@@ -5330,6 +5330,8 @@ dependencies = [
  "egui",
  "env_logger",
  "log",
+ "wazowski-core",
+ "wazowski-ssh",
  "wazowski-term",
 ]
 

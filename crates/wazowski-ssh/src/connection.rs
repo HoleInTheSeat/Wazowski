@@ -18,6 +18,7 @@ use crate::host_key::{self, Handler, HostKeyPolicy, UnknownHostKey, Verdict};
 
 /// Resolved credentials for a connection. The caller fetches these from the
 /// vault (or the agent) before connecting, so this crate never touches secrets at rest.
+#[derive(Clone)]
 pub enum AuthMaterial {
     /// Try every key currently loaded in the SSH agent.
     Agent,
@@ -28,6 +29,7 @@ pub enum AuthMaterial {
 }
 
 /// Everything needed to open a session.
+#[derive(Clone)]
 pub struct ConnectParams {
     pub host: String,
     pub port: u16,
