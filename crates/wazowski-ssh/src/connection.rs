@@ -213,11 +213,19 @@ async fn establish(params: &ConnectParams) -> Result<Handle<Handler>, ConnectErr
 }
 
 async fn establish_inner(params: &ConnectParams) -> Result<Handle<Handler>, ConnectError> {
+    // Old gear (ProCurve) offers 2048-bit groups for group-exchange KEX, below
+    // russh's default 3072-bit minimum, so widen the accepted range in legacy mode.
+    let gex = if params.legacy_algorithms {
+        client::GexParams::new(2048, 2048, 8192).map_err(|e| ConnectError::Other(anyhow!(e)))?
+    } else {
+        client::GexParams::default()
+    };
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
         preferred: preferred_algorithms(params.legacy_algorithms),
+        gex,
         ..Default::default()
     });
 
