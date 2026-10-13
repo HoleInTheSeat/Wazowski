@@ -300,6 +300,12 @@ impl SharedSource {
         self.missing
     }
 
+    /// Whether the missing share can be recreated from the local cache. True only
+    /// for a folder source whose file is gone (a deleted git repo can't be remade).
+    pub fn can_recreate(&self) -> bool {
+        self.missing && matches!(self.backend, Backend::Folder(_))
+    }
+
     // --- Accessors -------------------------------------------------------
 
     pub fn id(&self) -> &str {

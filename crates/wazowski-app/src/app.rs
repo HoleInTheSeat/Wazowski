@@ -958,7 +958,7 @@ impl App {
             TreeAction::SyncSource(id) => {
                 if let Some(source) = self.shared.iter_mut().find(|s| s.id() == id) {
                     source.reload();
-                    if source.missing() {
+                    if !source.available() {
                         self.dialog = Dialog::MissingShare { id };
                     }
                 }
@@ -1287,23 +1287,24 @@ impl App {
     fn show_missing_share(&mut self, ctx: &egui::Context) {
         let Dialog::MissingShare { id } = &self.dialog else { return };
         let id = id.clone();
-        let name = self
-            .shared
-            .iter()
-            .find(|s| s.id() == id)
-            .map(|s| s.name().to_owned())
-            .unwrap_or_default();
+        let Some(source) = self.shared.iter().find(|s| s.id() == id) else {
+            self.dialog = Dialog::None;
+            return;
+        };
+        let name = source.name().to_owned();
+        let can_recreate = source.can_recreate();
+        let status = source.status().unwrap_or("the shared source is unavailable").to_owned();
         let mut choice: Option<u8> = None;
         egui::Modal::new(egui::Id::new("missing-share")).show(ctx, |ui| {
-            ui.set_width(400.0);
-            ui.heading(RichText::new("⚠ Shared file missing").color(Color32::LIGHT_RED));
-            ui.label(format!(
-                "The shared file for '{name}' no longer exists. Your local cache is \
-                 still available (read-only). What would you like to do?"
-            ));
+            ui.set_width(420.0);
+            ui.heading(RichText::new("⚠ Shared source unavailable").color(Color32::LIGHT_RED));
+            ui.label(format!("'{name}': {status}"));
+            ui.label(
+                RichText::new("Your local cache is still available (read-only).").weak(),
+            );
             ui.add_space(8.0);
             ui.vertical(|ui| {
-                if ui.button("Create it now (from local cache)").clicked() {
+                if can_recreate && ui.button("Create it now (from local cache)").clicked() {
                     choice = Some(0);
                 }
                 if ui.button("Keep using local cache").clicked() {
@@ -2997,12 +2998,11 @@ fn render_folder(
     // Header: a draggable folder label next to the collapse triangle.
     let (_toggle, header_inner, _body) = state
         .show_header(ui, |ui| {
-            ui.dnd_drag_source(
-                id.with("drag"),
+            drag_label(
+                ui,
+                format!("📁 {segment}"),
                 DragPayload::Folder { store: store.clone(), path: full.to_owned() },
-                |ui| ui.label(format!("📁 {segment}")),
             )
-            .response
         })
         .body(|ui| {
             for (id, name) in &node.sessions {
@@ -3065,6 +3065,19 @@ fn render_folder(
     }
 }
 
+/// A label that drags with the primary mouse button only (setting `payload`),
+/// leaving right-click free for a context menu. Returns the response.
+fn drag_label(ui: &mut egui::Ui, text: String, payload: DragPayload) -> egui::Response {
+    let resp = ui.add(egui::Button::new(text).frame(false).sense(egui::Sense::click_and_drag()));
+    if resp.dragged_by(egui::PointerButton::Primary) {
+        egui::DragAndDrop::set_payload(ui.ctx(), payload);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    resp
+}
+
 /// Whether a drop is a no-op or invalid (dropping a folder into itself/subtree).
 fn is_noop_drop(payload: &DragPayload, to: &StoreId, folder: &str) -> bool {
     match payload {
@@ -3100,15 +3113,12 @@ fn session_row(
     editable: bool,
     action: &mut Option<TreeAction>,
 ) {
-    // The row is a drag source; its inner response still handles click/menu.
-    let drag_id = egui::Id::new((store_salt(store), "session", id));
-    let resp = ui
-        .dnd_drag_source(
-            drag_id,
-            DragPayload::Session { store: store.clone(), id: id.to_owned() },
-            |ui| ui.selectable_label(false, format!("🖥 {name}")),
-        )
-        .inner;
+    // The row drags with the primary button; right-click still opens the menu.
+    let resp = drag_label(
+        ui,
+        format!("🖥 {name}"),
+        DragPayload::Session { store: store.clone(), id: id.to_owned() },
+    );
     if resp.double_clicked() {
         *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
     }

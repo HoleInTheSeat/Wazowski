@@ -44,13 +44,14 @@ impl GitRepo {
         Self { work_dir, url, branch, file, auth }
     }
 
-    /// Pulls the latest and returns the sessions-file bytes (`None` if absent).
+    /// Fetches the latest and returns the sessions-file bytes (`None` if absent).
+    /// Errors if the remote is unreachable or gone, so callers can go offline.
     pub fn fetch(&self) -> Result<Option<Vec<u8>>> {
-        // A clone failure is the real "offline" signal (no remote reachable).
         self.ensure_clone()?;
-        // Fast-forward if possible; failures (empty repo, unborn branch, briefly
-        // offline after an existing clone) are non-fatal — we still read the clone.
-        let _ = self.git(&["pull", "--ff-only"]);
+        // `fetch` reaching the remote is the online signal (a deleted repo or a
+        // dropped network fails here). Then fast-forward the working tree.
+        self.git(&["fetch", "--prune"]).context("could not reach the git remote")?;
+        let _ = self.git(&["merge", "--ff-only"]);
         let path = self.work_dir.join(&self.file);
         match std::fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
