@@ -103,7 +103,7 @@ enum Dialog {
     QuickConnect(ConnectAuthForm),
     VaultManager(VaultManagerState),
     CreateCredential(CredentialPrompt),
-    NewFolder { target: StoreId, name: String },
+    NewFolder { target: StoreId, parent: String, name: String },
     RenameFolder { target: StoreId, old: String, name: String },
     ConfirmDeleteVault,
     ConfirmQuit,
@@ -763,7 +763,7 @@ impl App {
                 ui.close();
             }
             if ui.button("New folder").clicked() {
-                action = Some(TreeAction::NewFolderIn(StoreId::Local));
+                action = Some(TreeAction::NewFolderIn(StoreId::Local, String::new()));
                 ui.close();
             }
         });
@@ -793,7 +793,7 @@ impl App {
                         ui.close();
                     }
                     if ui.button("New folder").clicked() {
-                        action = Some(TreeAction::NewFolderIn(store.clone()));
+                        action = Some(TreeAction::NewFolderIn(store.clone(), String::new()));
                         ui.close();
                     }
                 }
@@ -844,8 +844,8 @@ impl App {
                 self.dialog = Dialog::EditSession(form);
                 Ok(())
             }
-            TreeAction::NewFolderIn(store) => {
-                self.dialog = Dialog::NewFolder { target: store, name: String::new() };
+            TreeAction::NewFolderIn(store, parent) => {
+                self.dialog = Dialog::NewFolder { target: store, parent, name: String::new() };
                 Ok(())
             }
             TreeAction::RenameFolder(store, name) => {
@@ -1347,10 +1347,12 @@ impl App {
     fn show_new_folder(&mut self, ctx: &egui::Context) {
         let mut submit = false;
         let mut cancel = false;
-        if let Dialog::NewFolder { name, .. } = &mut self.dialog {
+        if let Dialog::NewFolder { parent, name, .. } = &mut self.dialog {
+            let heading =
+                if parent.is_empty() { "New folder".to_owned() } else { format!("New folder in {parent}") };
             egui::Modal::new(egui::Id::new("new-folder")).show(ctx, |ui| {
                 ui.set_width(300.0);
-                ui.heading("New folder");
+                ui.heading(heading);
                 let field = ui.add(egui::TextEdit::singleline(name).hint_text("Folder name"));
                 autofocus(ui, &field);
                 submit |= entered(ui, &field);
@@ -1362,10 +1364,15 @@ impl App {
             });
         }
         if submit
-            && let Dialog::NewFolder { target, name } = &self.dialog
+            && let Dialog::NewFolder { target, parent, name } = &self.dialog
         {
-            let (target, name) = (target.clone(), name.clone());
-            if let Err(e) = self.store_add_folder(&target, &name) {
+            let name = name.trim().trim_matches('/');
+            // Nest under the parent folder when creating a subfolder.
+            let full = if parent.is_empty() { name.to_owned() } else { format!("{parent}/{name}") };
+            let target = target.clone();
+            if !name.is_empty()
+                && let Err(e) = self.store_add_folder(&target, &full)
+            {
                 self.error = Some(format!("{e:#}"));
             }
             self.dialog = Dialog::None;
@@ -2536,7 +2543,7 @@ enum TreeAction {
     Duplicate(StoreId, String),
     MoveTo { store: StoreId, id: String, folder: String },
     NewSessionIn(StoreId, String),
-    NewFolderIn(StoreId),
+    NewFolderIn(StoreId, String),
     RenameFolder(StoreId, String),
     DeleteFolder(StoreId, String),
     SyncSource(String),
@@ -2545,6 +2552,26 @@ enum TreeAction {
 
 /// Renders one store's folders and sessions, emitting a [`TreeAction`] on
 /// interaction. `editable` is false for an offline shared source (view only).
+/// A node in the folder tree built from folder paths and session locations.
+#[derive(Default)]
+struct FolderNode {
+    children: BTreeMap<String, FolderNode>,
+    sessions: Vec<(String, String)>,
+}
+
+impl FolderNode {
+    /// Descends to (creating as needed) the node for a `/`-separated path.
+    fn at(&mut self, path: &str) -> &mut FolderNode {
+        let mut node = self;
+        if !path.is_empty() {
+            for segment in path.split('/') {
+                node = node.children.entry(segment.to_owned()).or_default();
+            }
+        }
+        node
+    }
+}
+
 fn render_store(
     ui: &mut egui::Ui,
     store: &StoreId,
@@ -2552,48 +2579,72 @@ fn render_store(
     editable: bool,
     action: &mut Option<TreeAction>,
 ) {
+    // Build a nested tree; folder paths synthesize their ancestor nodes.
     let folders = sessions.folders();
-    let mut by_folder: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut root = FolderNode::default();
     for folder in &folders {
-        by_folder.entry(folder.clone()).or_default();
+        root.at(folder);
     }
     for session in sessions.all() {
-        by_folder
-            .entry(session.folder.clone())
-            .or_default()
+        root.at(&session.folder)
+            .sessions
             .push((session.id.clone(), session.name.clone()));
     }
 
-    if let Some(entries) = by_folder.get("") {
-        for (id, name) in entries {
-            session_row(ui, store, id, name, &folders, editable, action);
-        }
+    // Root-level sessions, then each top-level folder recursively.
+    for (id, name) in &root.sessions {
+        session_row(ui, store, id, name, &folders, editable, action);
     }
-    for (folder, entries) in by_folder.iter().filter(|(f, _)| !f.is_empty()) {
-        let header = egui::CollapsingHeader::new(format!("📁 {folder}"))
-            .id_salt((store_salt(store), folder))
-            .default_open(true);
-        let resp = header.show(ui, |ui| {
-            for (id, name) in entries {
-                session_row(ui, store, id, name, &folders, editable, action);
+    let children: Vec<_> = root.children.iter().collect();
+    for (segment, node) in children {
+        render_folder(ui, store, segment, segment, node, &folders, editable, action);
+    }
+}
+
+/// Recursively renders one folder node (a collapsible header with its sessions
+/// and subfolders). `full` is the folder's full `/`-separated path.
+#[allow(clippy::too_many_arguments)]
+fn render_folder(
+    ui: &mut egui::Ui,
+    store: &StoreId,
+    segment: &str,
+    full: &str,
+    node: &FolderNode,
+    all_folders: &[String],
+    editable: bool,
+    action: &mut Option<TreeAction>,
+) {
+    let header = egui::CollapsingHeader::new(format!("📁 {segment}"))
+        .id_salt((store_salt(store), full))
+        .default_open(true);
+    let resp = header.show(ui, |ui| {
+        for (id, name) in &node.sessions {
+            session_row(ui, store, id, name, all_folders, editable, action);
+        }
+        for (child_segment, child) in &node.children {
+            let child_full = format!("{full}/{child_segment}");
+            render_folder(ui, store, child_segment, &child_full, child, all_folders, editable, action);
+        }
+    });
+    if editable {
+        resp.header_response.context_menu(|ui| {
+            if ui.button("New session here").clicked() {
+                *action = Some(TreeAction::NewSessionIn(store.clone(), full.to_owned()));
+                ui.close();
+            }
+            if ui.button("New subfolder").clicked() {
+                *action = Some(TreeAction::NewFolderIn(store.clone(), full.to_owned()));
+                ui.close();
+            }
+            if ui.button("Rename folder").clicked() {
+                *action = Some(TreeAction::RenameFolder(store.clone(), full.to_owned()));
+                ui.close();
+            }
+            if ui.button("Delete folder").clicked() {
+                *action = Some(TreeAction::DeleteFolder(store.clone(), full.to_owned()));
+                ui.close();
             }
         });
-        if editable {
-            resp.header_response.context_menu(|ui| {
-                if ui.button("New session here").clicked() {
-                    *action = Some(TreeAction::NewSessionIn(store.clone(), folder.clone()));
-                    ui.close();
-                }
-                if ui.button("Rename folder").clicked() {
-                    *action = Some(TreeAction::RenameFolder(store.clone(), folder.clone()));
-                    ui.close();
-                }
-                if ui.button("Delete folder").clicked() {
-                    *action = Some(TreeAction::DeleteFolder(store.clone(), folder.clone()));
-                    ui.close();
-                }
-            });
-        }
     }
 }
 

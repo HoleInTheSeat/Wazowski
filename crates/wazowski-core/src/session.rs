@@ -178,35 +178,43 @@ impl SessionStore {
         Ok(true)
     }
 
-    /// Removes a folder, moving any sessions in it back to the root.
+    /// Removes a folder and all its subfolders, moving affected sessions to root.
     pub fn remove_folder(&mut self, name: &str) -> Result<()> {
-        self.folders.retain(|f| f != name);
+        let prefix = format!("{name}/");
+        self.folders.retain(|f| f != name && !f.starts_with(&prefix));
         for session in &mut self.sessions {
-            if session.folder == name {
+            if session.folder == name || session.folder.starts_with(&prefix) {
                 session.folder.clear();
             }
         }
         self.save()
     }
 
-    /// Renames a folder, updating the sessions it contains.
+    /// Renames a folder (and re-paths its subfolders and the sessions within).
     pub fn rename_folder(&mut self, old: &str, new: &str) -> Result<()> {
         let new = new.trim();
-        if new.is_empty() {
+        if new.is_empty() || new == old {
             return Ok(());
         }
+        let prefix = format!("{old}/");
+        let repath = |f: &str| -> Option<String> {
+            if f == old {
+                Some(new.to_owned())
+            } else {
+                f.strip_prefix(&prefix).map(|rest| format!("{new}/{rest}"))
+            }
+        };
         for folder in &mut self.folders {
-            if folder == old {
-                *folder = new.to_owned();
+            if let Some(updated) = repath(folder) {
+                *folder = updated;
             }
         }
         if !self.folders.iter().any(|f| f == new) {
             self.folders.push(new.to_owned());
         }
-        self.folders.retain(|f| f != old);
         for session in &mut self.sessions {
-            if session.folder == old {
-                session.folder = new.to_owned();
+            if let Some(updated) = repath(&session.folder) {
+                session.folder = updated;
             }
         }
         self.save()
@@ -353,6 +361,27 @@ mod tests {
         // Folders persist across reload.
         let reloaded = SessionStore::load(path).unwrap();
         assert!(reloaded.folders().contains(&"prod".to_string()));
+    }
+
+    #[test]
+    fn nested_folder_rename_and_remove() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::load(dir.path().join("s.toml")).unwrap();
+        store.add_folder("work/prod").unwrap();
+        let mut s = Session::new("db", "h", "u");
+        s.folder = "work/prod".into();
+        let id = s.id.clone();
+        store.upsert(s).unwrap();
+
+        // Renaming a parent re-paths its descendants.
+        store.rename_folder("work", "ops").unwrap();
+        assert_eq!(store.get(&id).unwrap().folder, "ops/prod");
+        assert!(store.folders().contains(&"ops/prod".to_string()));
+
+        // Removing a parent clears sessions in its subtree.
+        store.remove_folder("ops").unwrap();
+        assert_eq!(store.get(&id).unwrap().folder, "");
+        assert!(store.folders().is_empty());
     }
 
     #[test]
