@@ -2369,7 +2369,9 @@ fn connecting_view(ui: &mut egui::Ui, c: &Connecting, tab_id: u64) -> Option<u64
 /// works on first open without stealing focus every frame (which would break
 /// Enter-to-submit, since the field would never register as losing focus).
 fn autofocus(ui: &egui::Ui, resp: &egui::Response) {
-    if ui.memory(|m| m.focused().is_none()) {
+    // Don't re-grab on the frame the field surrendered focus (Enter): doing so
+    // would clear `lost_focus`, which is how we detect the Enter submit.
+    if !resp.lost_focus() && ui.memory(|m| m.focused().is_none()) {
         resp.request_focus();
     }
 }
