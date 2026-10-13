@@ -36,3 +36,7 @@ wazowski-ssh = { path = "crates/wazowski-ssh" }
 rfd = "0.15"
 wazowski-core = { path = "crates/wazowski-core" }
 wazowski-term = { path = "crates/wazowski-term" }
+
+[profile.release]
+strip = true
+lto = "thin"
