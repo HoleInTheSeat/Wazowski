@@ -652,7 +652,10 @@ impl App {
             StartupTab::None => {}
             StartupTab::LocalShell => self.open_local_shell(ctx),
             StartupTab::Session(id) => match self.sessions.get(&id).cloned() {
-                Some(session) => self.start_connect(&session, ctx),
+                Some(session) => {
+                    self.remember_recent(&id);
+                    self.start_connect(&session, ctx);
+                }
                 None => self.open_local_shell(ctx),
             },
         }
@@ -1567,6 +1570,7 @@ impl App {
         let result = match action {
             TreeAction::Connect(store, id) => {
                 if let Some(session) = self.session_in(&store, &id) {
+                    self.remember_recent(&id);
                     self.start_connect(&session, ctx);
                 }
                 Ok(())
@@ -1762,6 +1766,36 @@ impl App {
         Ok(())
     }
 
+    /// Records a recently connected session and persists the change.
+    fn remember_recent(&mut self, id: &str) {
+        self.settings.remember_recent(id);
+        let _ = self.settings.save();
+    }
+
+    /// Finds a session by id in the local store or any shared source.
+    fn find_session_anywhere(&self, id: &str) -> Option<(StoreId, Session)> {
+        if let Some(s) = self.sessions.get(id) {
+            return Some((StoreId::Local, s.clone()));
+        }
+        for source in &self.shared {
+            if let Some(s) = source.store().get(id) {
+                return Some((StoreId::Shared(source.id().to_owned()), s.clone()));
+            }
+        }
+        None
+    }
+
+    /// The recent sessions that still exist, as (store, id, name), newest first.
+    fn recent_sessions(&self) -> Vec<(StoreId, String, String)> {
+        self.settings
+            .recent
+            .iter()
+            .filter_map(|id| {
+                self.find_session_anywhere(id).map(|(store, s)| (store, id.clone(), s.name))
+            })
+            .collect()
+    }
+
     /// A cloned session from the given store.
     fn session_in(&self, store: &StoreId, id: &str) -> Option<Session> {
         match store {
@@ -1931,6 +1965,8 @@ impl App {
         let active = self.active;
         let broadcast = self.broadcast;
         let mut broadcast_src: Option<(u64, Vec<u8>)> = None;
+        let mut connect_recent: Option<(StoreId, String)> = None;
+        let recents = self.recent_sessions();
         match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
                 TabContent::Terminal(panes) => {
@@ -1945,7 +1981,7 @@ impl App {
             },
             None => {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() / 3.0);
+                    ui.add_space(ui.available_height() / 4.0);
                     ui.heading("Wazowski");
                     ui.add_space(8.0);
                     ui.label(RichText::new("Double-click a session, or open a local shell.").weak());
@@ -1953,8 +1989,25 @@ impl App {
                     if ui.button("New local shell").clicked() {
                         self.open_local_shell(ui.ctx());
                     }
+                    if !recents.is_empty() {
+                        ui.add_space(16.0);
+                        ui.label(RichText::new("Resume a recent session").strong());
+                        ui.add_space(4.0);
+                        for (store, id, name) in &recents {
+                            if ui.button(format!("🖥 {name}")).clicked() {
+                                connect_recent = Some((store.clone(), id.clone()));
+                            }
+                        }
+                    }
                 });
             }
+        }
+        if let Some((store, id)) = connect_recent
+            && let Some(session) = self.session_in(&store, &id)
+        {
+            let ctx = ui.ctx().clone();
+            self.remember_recent(&id);
+            self.start_connect(&session, &ctx);
         }
         if let Some(tab_id) = retry {
             let ctx = ui.ctx().clone();

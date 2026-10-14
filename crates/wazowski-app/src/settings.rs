@@ -59,8 +59,20 @@ pub struct Settings {
     pub startup_tab: StartupTab,
     pub new_tab_placement: NewTabPlacement,
     pub vault_backup: VaultBackup,
+    /// Ids of recently connected sessions, most recent first (for the launcher).
+    #[serde(default)]
+    pub recent: Vec<String>,
     #[serde(skip)]
     path: Option<PathBuf>,
+}
+
+impl Settings {
+    /// Records a session id as most-recently used, keeping at most ten.
+    pub fn remember_recent(&mut self, id: &str) {
+        self.recent.retain(|r| r != id);
+        self.recent.insert(0, id.to_owned());
+        self.recent.truncate(10);
+    }
 }
 
 impl Settings {
