@@ -1323,6 +1323,12 @@ impl App {
                     self.settings.vault_backup.dir = Some(dir);
                     changed = true;
                 }
+                if ui.button("Open directory").clicked() {
+                    let dir = self.settings.backup_dir();
+                    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| open::that(&dir)) {
+                        self.error = Some(format!("Could not open the backup folder: {e}"));
+                    }
+                }
             });
             if let Some(when) = self.settings.vault_backup.last_backup {
                 ui.label(RichText::new(format!("Last backup: {}", time_ago(when))).weak());
