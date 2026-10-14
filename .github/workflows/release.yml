@@ -12,21 +12,24 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.name }}
+    name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            name: wazowski-linux-x86_64
+            platform: linux-x86_64
             bin: wazowski
+            ext: ""
           - os: macos-latest
-            name: wazowski-macos-aarch64
+            platform: macos-aarch64
             bin: wazowski
+            ext: ""
           - os: windows-latest
-            name: wazowski-windows-x86_64.exe
+            platform: windows-x86_64
             bin: wazowski.exe
+            ext: ".exe"
     steps:
       - uses: actions/checkout@v4
 
@@ -47,14 +50,18 @@ jobs:
       - name: Stage artifact
         shell: bash
         run: |
+          # Put the release tag (e.g. v0.1.0-beta.3) into the asset filename so
+          # a downloaded binary announces its own version.
+          asset="wazowski-${GITHUB_REF_NAME}-${{ matrix.platform }}${{ matrix.ext }}"
           mkdir -p dist
-          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.name }}"
+          cp "target/release/${{ matrix.bin }}" "dist/$asset"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: dist/${{ matrix.name }}
+          name: ${{ env.ASSET }}
+          path: dist/${{ env.ASSET }}
 
   release:
     name: Publish release
