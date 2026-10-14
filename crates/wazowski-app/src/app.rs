@@ -1457,6 +1457,7 @@ impl App {
                 }
                 render_store(ui, &store, source.store(), editable, &destinations, &mut action);
             });
+            delayed_tooltip(ui, &resp.header_response, &source_hint(source.def()));
             // Dropping onto the source header targets that store's root.
             if editable
                 && let Some(payload) = resp.header_response.dnd_release_payload::<DragPayload>()
@@ -4757,7 +4758,8 @@ enum TreeAction {
 #[derive(Default)]
 struct FolderNode {
     children: BTreeMap<String, FolderNode>,
-    sessions: Vec<(String, String)>,
+    /// (id, name, hover-hint) for each session directly in this folder.
+    sessions: Vec<(String, String, String)>,
 }
 
 impl FolderNode {
@@ -4795,14 +4797,16 @@ fn render_store(
         root.at(folder);
     }
     for session in sessions.all() {
-        root.at(&session.folder)
-            .sessions
-            .push((session.id.clone(), session.name.clone()));
+        root.at(&session.folder).sessions.push((
+            session.id.clone(),
+            session.name.clone(),
+            session_hint(session),
+        ));
     }
 
     // Root-level sessions, then each top-level folder recursively.
-    for (id, name) in &root.sessions {
-        session_row(ui, store, id, name, destinations, editable, action);
+    for (id, name, hint) in &root.sessions {
+        session_row(ui, store, id, name, hint, destinations, editable, action);
     }
     let children: Vec<_> = root.children.iter().collect();
     for (segment, node) in children {
@@ -4837,8 +4841,8 @@ fn render_folder(
             )
         })
         .body(|ui| {
-            for (id, name) in &node.sessions {
-                session_row(ui, store, id, name, destinations, editable, action);
+            for (id, name, hint) in &node.sessions {
+                session_row(ui, store, id, name, hint, destinations, editable, action);
             }
             for (child_segment, child) in &node.children {
                 let child_full = format!("{full}/{child_segment}");
@@ -4927,6 +4931,53 @@ fn is_noop_drop(payload: &DragPayload, to: &StoreId, folder: &str) -> bool {
     }
 }
 
+/// A brief description of a shared source, for its left-pane hover tooltip.
+fn source_hint(def: &SourceDef) -> String {
+    match def.kind {
+        SourceKind::Folder => format!("Shared folder\nfile: {}", def.path.display()),
+        SourceKind::Git => {
+            let branch = if def.branch.is_empty() { "(default)" } else { &def.branch };
+            let repo = def.url.rsplit('/').next().unwrap_or(&def.url).trim_end_matches(".git");
+            format!("Git repo: {repo}\nurl: {}\nbranch: {branch}\nfile: {}", def.url, def.file)
+        }
+    }
+}
+
+/// A brief description of a session, for its left-pane hover tooltip.
+fn session_hint(s: &Session) -> String {
+    let auth = match &s.auth {
+        Auth::Agent => "SSH agent",
+        Auth::Password { .. } => "password",
+        Auth::Key { .. } => "key",
+    };
+    let mut hint = format!("SSH · {}\nauth: {auth}", s.address());
+    if s.legacy {
+        hint.push_str("\nlegacy algorithms");
+    }
+    hint
+}
+
+/// Shows a tooltip on `response`, but only once the pointer has rested on the
+/// widget for a few seconds, so hovering the left pane isn't noisy.
+fn delayed_tooltip(ui: &egui::Ui, response: &egui::Response, text: &str) {
+    const DELAY: f64 = 3.0;
+    if text.is_empty() {
+        return;
+    }
+    let id = response.id.with("wz-hover-since");
+    if response.hovered() {
+        let now = ui.input(|i| i.time);
+        let since: f64 = ui.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || now));
+        if now - since >= DELAY {
+            response.clone().on_hover_text(text);
+        } else {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    } else {
+        ui.data_mut(|d| d.remove::<f64>(id));
+    }
+}
+
 /// A stable salt per store so folder headers in different stores don't collide.
 fn store_salt(store: &StoreId) -> String {
     match store {
@@ -4936,11 +4987,13 @@ fn store_salt(store: &StoreId) -> String {
 }
 
 /// Renders one session row: double-click connects, right-click opens its menu.
+#[allow(clippy::too_many_arguments)]
 fn session_row(
     ui: &mut egui::Ui,
     store: &StoreId,
     id: &str,
     name: &str,
+    hint: &str,
     destinations: &[Destination],
     editable: bool,
     action: &mut Option<TreeAction>,
@@ -4951,6 +5004,7 @@ fn session_row(
         format!("🖥 {name}"),
         DragPayload::Session { store: store.clone(), id: id.to_owned() },
     );
+    delayed_tooltip(ui, &resp, hint);
     if resp.double_clicked() {
         *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
     }
