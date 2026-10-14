@@ -56,7 +56,10 @@ implements a `Backend` trait and is plugged into a `Terminal`.
    per-terminal exclude), recursively splittable panes, configurable
    keybindings, and user macros (text / key / expect / delay steps).
    (SSH tunnels/port-forwarding deferred to a later "hopeful future" phase.)
-6. **UX & management** (next) — see the backlog below.
+6. **UX & management** ✅ — settings tab, single-instance, startup/new-tab/vault
+   backup options, About, edit-shared-sources, left-pane Sessions/Macros switcher,
+   delayed hover tooltips, find-in-terminals, keep-ended-tabs-open, recent-sessions
+   launcher, versioned release filenames, and session-aware split panes.
 7. **Extras and packaging** — RDP/VNC, RPM + Flatpak, Windows installer, macOS app bundle.
 
 Each phase ends with something runnable.
@@ -66,11 +69,11 @@ Each phase ends with something runnable.
 Agreed "do next" items (rough order TBD with the user):
 
 - **Release filenames carry the version** ✅ (tag is embedded in each asset name).
-- **Session-aware split panes** (TODO — only remaining Phase 6 "now" item):
-  splitting a pane shows a MobaXterm-style title bar per split area; clicking it
-  picks which currently-open session that split displays. Agreed behavior: the
-  session *moves* into the pane (one terminal, one place) and *moves back to its
-  own tab* when the split view is closed.
+- **Session-aware split panes** ✅ — each split pane has a title-bar menu to show
+  New shell / another single-terminal tab's session / return-to-its-tab. Picking
+  a session moves it into the pane; its origin tab shows a placeholder with a
+  bring-back button, and it returns to its original tab position on close.
+  (Known limitation: a moved SSH session loses its SFTP panel.)
 - **Left-pane view switcher** ✅ — Sessions/Macros tabs at the top of the left
   pane; Macros view: double-click runs (confirm dialog), right-click for run
   targets / edit / duplicate / delete; Ctrl+Shift+M switches to it.
