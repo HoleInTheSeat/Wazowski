@@ -18,7 +18,7 @@ use wazowski_term::{
 use crate::connect::{Connected, PendingConnect, Progress};
 use crate::keybinds::{Action, Keymap};
 use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
-use crate::panes::{Panes, SplitDir};
+use crate::panes::{Home, PaneAction, Panes, SplitDir, SwapTarget};
 use crate::settings::{NewTabPlacement, Settings, StartupTab};
 use crate::sftp_ui::FileBrowser;
 use crate::servers_ui::{ServerEntry, ServerForm, ServersStore};
@@ -70,10 +70,12 @@ enum TabContent {
     Servers,
     /// The global settings page (singleton).
     Settings,
+    /// This tab's session has been moved into a split pane on another tab.
+    Detached { host_tab: u64 },
 }
 
 /// A split-pane action requested from the tab strip, applied after the UI pass.
-enum PaneAction {
+enum SplitButton {
     Split(SplitDir),
     Close,
 }
@@ -97,7 +99,10 @@ impl Tab {
     fn is_dead(&self) -> bool {
         match &self.content {
             TabContent::Terminal(p) => p.all_exited(),
-            TabContent::Connecting(_) | TabContent::Servers | TabContent::Settings => false,
+            TabContent::Connecting(_)
+            | TabContent::Servers
+            | TabContent::Settings
+            | TabContent::Detached { .. } => false,
         }
     }
 }
@@ -658,12 +663,94 @@ impl App {
         }
     }
 
-    /// Closes the active tab's focused pane (no effect if it's the only one).
+    /// Closes the active tab's focused pane (no effect if it's the only one). A
+    /// moved-in session is returned to its home tab rather than dropped.
     fn close_active_pane(&mut self) {
-        if let Some(tab) = self.tabs.get_mut(self.active)
+        let taken = if let Some(tab) = self.tabs.get_mut(self.active)
             && let TabContent::Terminal(panes) = &mut tab.content
         {
-            panes.close_focused();
+            panes.close_focused()
+        } else {
+            None
+        };
+        if let Some((term, Some(home))) = taken {
+            self.return_home(home, term);
+        }
+    }
+
+    /// Returns a moved-in terminal to its home tab, restoring it as that tab's
+    /// session. If the home tab is gone, the terminal is simply dropped.
+    fn return_home(&mut self, home: Home, term: Box<Terminal>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == home.tab_id) {
+            tab.content = TabContent::Terminal(Box::new(Panes::new(term)));
+        }
+    }
+
+    /// Applies a split-pane title-bar request on the active tab.
+    fn handle_pane_action(&mut self, action: PaneAction, ctx: &egui::Context) {
+        match action {
+            PaneAction::NewShell(leaf) => {
+                let size = TermSize::default();
+                let repaint = ctx.clone();
+                let term = match LocalPty::spawn(size, move || repaint.request_repaint()) {
+                    Ok((pty, output)) => Terminal::new(Box::new(pty), output, size),
+                    Err(e) => {
+                        self.error = Some(format!("Could not start a shell: {e:#}"));
+                        return;
+                    }
+                };
+                let old = self.active_panes_mut().and_then(|p| {
+                    p.replace_leaf(leaf, Box::new(term), None)
+                });
+                if let Some((old_term, Some(home))) = old {
+                    self.return_home(home, old_term);
+                }
+            }
+            PaneAction::Return(leaf) => {
+                let taken =
+                    self.active_panes_mut().and_then(|p| p.remove_leaf(leaf));
+                if let Some((term, Some(home))) = taken {
+                    self.return_home(home, term);
+                }
+            }
+            PaneAction::Swap { leaf, from_tab } => self.swap_into_pane(leaf, from_tab),
+        }
+    }
+
+    /// The active tab's panes, if it is a terminal tab.
+    fn active_panes_mut(&mut self) -> Option<&mut Panes> {
+        match self.tabs.get_mut(self.active).map(|t| &mut t.content) {
+            Some(TabContent::Terminal(panes)) => Some(panes),
+            _ => None,
+        }
+    }
+
+    /// Moves `from_tab`'s session into the active tab's `leaf` pane. The old pane
+    /// occupant is returned home (if moved-in) or dropped (an owned shell).
+    fn swap_into_pane(&mut self, leaf: u64, from_tab: u64) {
+        let host_id = match self.tabs.get(self.active) {
+            Some(t) => t.id,
+            None => return,
+        };
+        let Some(from_idx) = self.tabs.iter().position(|t| t.id == from_tab) else { return };
+        if self.tabs[from_idx].id == host_id {
+            return;
+        }
+        let label = self.tabs[from_idx].label.clone();
+        let term = match &mut self.tabs[from_idx].content {
+            TabContent::Terminal(panes) => panes.take_single(),
+            _ => None,
+        };
+        let Some(term) = term else { return };
+        // The source tab becomes a placeholder pointing at its new host.
+        self.tabs[from_idx].content = TabContent::Detached { host_tab: host_id };
+        self.tabs[from_idx].files = None;
+        self.tabs[from_idx].show_files = false;
+
+        let home = Home { tab_id: from_tab, label };
+        let old = self.active_panes_mut().and_then(|p| p.replace_leaf(leaf, term, Some(home)));
+        if let Some((old_term, Some(old_home))) = old {
+            self.return_home(old_home, old_term);
         }
     }
 
@@ -719,9 +806,31 @@ impl App {
     }
 
     fn close_tab(&mut self, index: usize) {
-        if index < self.tabs.len() {
-            self.tabs.remove(index);
+        if index >= self.tabs.len() {
+            return;
         }
+        match &mut self.tabs[index].content {
+            // Send any moved-in sessions back to their home tabs first.
+            TabContent::Terminal(panes) => {
+                let moved = panes.drain_moved();
+                for (term, home) in moved {
+                    self.return_home(home, term);
+                }
+            }
+            // Closing a detached placeholder: keep its session alive in the host
+            // by making that pane the host's own.
+            TabContent::Detached { host_tab } => {
+                let host = *host_tab;
+                let my_id = self.tabs[index].id;
+                if let Some(host_tab) = self.tabs.iter_mut().find(|t| t.id == host)
+                    && let TabContent::Terminal(panes) = &mut host_tab.content
+                {
+                    panes.clear_home(my_id);
+                }
+            }
+            _ => {}
+        }
+        self.tabs.remove(index);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         }
@@ -1979,7 +2088,7 @@ impl App {
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         let mut close = None;
         let mut toggle_files = None;
-        let mut pane_action: Option<PaneAction> = None;
+        let mut pane_action: Option<SplitButton> = None;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, tab) in self.tabs.iter().enumerate() {
@@ -1990,6 +2099,7 @@ impl App {
                         TabContent::Terminal(_) => name,
                         TabContent::Servers => format!("🖧 {name}"),
                         TabContent::Settings => format!("⚙ {name}"),
+                        TabContent::Detached { .. } => format!("⇄ {name}"),
                     };
                     if ui.selectable_label(i == self.active, label).clicked() {
                         self.active = i;
@@ -2010,15 +2120,15 @@ impl App {
                 {
                     ui.separator();
                     if ui.button("⇥").on_hover_text("Split pane right").clicked() {
-                        pane_action = Some(PaneAction::Split(SplitDir::Horizontal));
+                        pane_action = Some(SplitButton::Split(SplitDir::Horizontal));
                     }
                     if ui.button("⤓").on_hover_text("Split pane down").clicked() {
-                        pane_action = Some(PaneAction::Split(SplitDir::Vertical));
+                        pane_action = Some(SplitButton::Split(SplitDir::Vertical));
                     }
                     if panes.count() > 1
                         && ui.button("⊟").on_hover_text("Close focused pane").clicked()
                     {
-                        pane_action = Some(PaneAction::Close);
+                        pane_action = Some(SplitButton::Close);
                     }
                 }
                 // A toggle for the SFTP panel, for the active SSH tab.
@@ -2040,8 +2150,8 @@ impl App {
             tab.show_files = show;
         }
         match pane_action {
-            Some(PaneAction::Split(dir)) => self.split_active_pane(dir, ui.ctx()),
-            Some(PaneAction::Close) => self.close_active_pane(),
+            Some(SplitButton::Split(dir)) => self.split_active_pane(dir, ui.ctx()),
+            Some(SplitButton::Close) => self.close_active_pane(),
             None => {}
         }
         if let Some(i) = close {
@@ -2063,6 +2173,11 @@ impl App {
             }
             Some(TabContent::Terminal(panes)) if panes.all_exited() => {
                 self.render_ended_tab(ui);
+                return;
+            }
+            Some(TabContent::Detached { host_tab }) => {
+                let host = *host_tab;
+                self.render_detached_tab(ui, host);
                 return;
             }
             _ => {}
@@ -2087,17 +2202,36 @@ impl App {
         let mut broadcast_src: Option<(u64, Vec<u8>)> = None;
         let mut connect_recent: Option<(StoreId, String)> = None;
         let recents = self.recent_sessions();
+        // Sessions that can be moved into a split pane: other single-terminal tabs.
+        let targets: Vec<SwapTarget> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| {
+                *i != active
+                    && matches!(&t.content, TabContent::Terminal(p) if p.count() == 1 && !p.all_exited())
+            })
+            .map(|(_, t)| SwapTarget { tab_id: t.id, label: t.label.clone() })
+            .collect();
+        let mut pane_action: Option<PaneAction> = None;
         match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
                 TabContent::Terminal(panes) => {
-                    broadcast_src = panes.show(ui, interactive, broadcast, search.as_ref());
+                    broadcast_src = panes.show(
+                        ui,
+                        interactive,
+                        broadcast,
+                        search.as_ref(),
+                        &targets,
+                        &mut pane_action,
+                    );
                 }
                 TabContent::Connecting(c) => {
                     if let Some(action) = connecting_view(ui, c, tab.id) {
                         retry = Some(action);
                     }
                 }
-                TabContent::Servers | TabContent::Settings => {}
+                TabContent::Servers | TabContent::Settings | TabContent::Detached { .. } => {}
             },
             None => {
                 ui.vertical_centered(|ui| {
@@ -2132,6 +2266,10 @@ impl App {
         if let Some(tab_id) = retry {
             let ctx = ui.ctx().clone();
             self.retry_tab(tab_id, &ctx);
+        }
+        if let Some(action) = pane_action {
+            let ctx = ui.ctx().clone();
+            self.handle_pane_action(action, &ctx);
         }
         // Multi-exec: mirror the focused pane's input to every other terminal
         // that isn't the source and hasn't been excluded from broadcast.
@@ -2215,6 +2353,48 @@ impl App {
             .sum()
     }
 
+    /// Shows the placeholder for a tab whose session is displayed in a split pane
+    /// on another tab, with a button to bring it back here.
+    fn render_detached_tab(&mut self, ui: &mut egui::Ui, host_tab: u64) {
+        let host_label = self
+            .tabs
+            .iter()
+            .find(|t| t.id == host_tab)
+            .map(|t| t.label.clone())
+            .unwrap_or_else(|| "another tab".to_owned());
+        let active = self.active;
+        let mut bring_back = false;
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() / 3.0);
+            ui.label(RichText::new("⇄ This session is shown in a split pane").heading());
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("on tab “{host_label}”.")).weak());
+            ui.add_space(12.0);
+            if ui.button("Bring back here").clicked() {
+                bring_back = true;
+            }
+        });
+        if bring_back {
+            self.bring_back(active);
+        }
+    }
+
+    /// Returns a detached tab's session from its host split pane back to this tab.
+    fn bring_back(&mut self, detached_index: usize) {
+        let my_id = self.tabs[detached_index].id;
+        let TabContent::Detached { host_tab } = self.tabs[detached_index].content else { return };
+        let Some(host_idx) = self.tabs.iter().position(|t| t.id == host_tab) else { return };
+        let term = if let TabContent::Terminal(panes) = &mut self.tabs[host_idx].content {
+            panes.moved_from(my_id).and_then(|tid| panes.remove_leaf(tid)).map(|(t, _)| t)
+        } else {
+            None
+        };
+        if let Some(term) = term {
+            self.tabs[detached_index].content = TabContent::Terminal(Box::new(Panes::new(term)));
+            self.active = detached_index;
+        }
+    }
+
     /// Shows the "session ended" banner for a terminal tab whose session closed,
     /// with its frozen output below and Restart / Save / Close actions.
     fn render_ended_tab(&mut self, ui: &mut egui::Ui) {
@@ -2254,7 +2434,7 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(active)
             && let TabContent::Terminal(panes) = &mut tab.content
         {
-            panes.show(ui, false, false, None);
+            panes.show(ui, false, false, None, &[], &mut None);
         }
         match act {
             Some(EndAct::Restart) => {
@@ -4859,11 +5039,16 @@ impl eframe::App for App {
                 panes.prune();
             }
         }
-        let before = self.tabs.len();
-        self.tabs
-            .retain(|t| !t.is_dead() || t.restart.as_ref().is_some_and(RestartKind::keep_open));
-        if self.tabs.len() != before {
-            self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        // Close dead tabs via close_tab so any moved-in sessions return home.
+        let mut i = 0;
+        while i < self.tabs.len() {
+            let t = &self.tabs[i];
+            let dead = t.is_dead() && !t.restart.as_ref().is_some_and(RestartKind::keep_open);
+            if dead {
+                self.close_tab(i);
+            } else {
+                i += 1;
+            }
         }
 
         self.poll_connections(&ctx);
