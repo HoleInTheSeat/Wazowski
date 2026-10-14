@@ -14,9 +14,11 @@ use wazowski_term::{LocalPty, TermSize, Terminal, TerminalView};
 
 use crate::connect::{Connected, PendingConnect, Progress};
 use crate::sftp_ui::FileBrowser;
+use crate::servers_ui::{ServerEntry, ServerForm, ServersStore};
 use crate::sources::{
     self, GitAuthKind, SharedSource, SourceDef, SourceKind, SourcesConfig,
 };
+use wazowski_servers::{ServerConfig, ServerKind};
 
 const NEW_TAB: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::T);
@@ -43,6 +45,8 @@ enum TabContent {
     Connecting(Box<Connecting>),
     /// A working terminal.
     Terminal(Box<Terminal>),
+    /// The quick-servers manager (singleton).
+    Servers,
 }
 
 /// State of a connecting tab.
@@ -64,7 +68,7 @@ impl Tab {
     fn is_dead(&self) -> bool {
         match &self.content {
             TabContent::Terminal(t) => t.has_exited(),
-            TabContent::Connecting(_) => false,
+            TabContent::Connecting(_) | TabContent::Servers => false,
         }
     }
 }
@@ -110,6 +114,7 @@ enum Dialog {
     ConfirmDeleteVault,
     ConfirmQuit,
     ConfirmImportVault { src: PathBuf },
+    EditServer(ServerForm),
     AskUsername(UsernamePrompt),
     AddSource(AddSourceForm),
     MissingShare { id: String },
@@ -331,6 +336,9 @@ pub struct App {
     shared: Vec<SharedSource>,
     /// When shared sources were last auto-synced.
     last_sync: std::time::Instant,
+    /// Quick-server configs plus their running state.
+    servers_store: ServersStore,
+    servers: Vec<ServerEntry>,
 }
 
 /// Which session store an action targets.
@@ -368,6 +376,12 @@ impl App {
             .map(|def| SharedSource::open(def.clone(), &cache))
             .collect();
 
+        let servers_store = ServersStore::default_path()
+            .and_then(ServersStore::load)
+            .or_else(|_| ServersStore::load("servers.toml".into()))
+            .expect("loading a missing servers file yields an empty store");
+        let servers = servers_store.configs.iter().cloned().map(ServerEntry::new).collect();
+
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -382,6 +396,8 @@ impl App {
             sources_config,
             shared,
             last_sync: std::time::Instant::now(),
+            servers_store,
+            servers,
         };
         app.open_local_shell(ctx);
         app
@@ -627,6 +643,54 @@ impl App {
         c.pending = Some(PendingConnect::spawn(c.params.clone(), ctx));
     }
 
+    // --- Quick servers ------------------------------------------------------
+
+    /// Opens (or focuses) the singleton Servers tab.
+    fn open_servers_tab(&mut self) {
+        if let Some(i) = self.tabs.iter().position(|t| matches!(t.content, TabContent::Servers)) {
+            self.active = i;
+        } else {
+            self.push_tab("Servers", TabContent::Servers, None);
+        }
+    }
+
+    /// Drains logs from running servers; returns whether any are running.
+    fn poll_servers(&mut self) -> bool {
+        let mut any = false;
+        for entry in &mut self.servers {
+            if let Some(running) = &entry.running {
+                running.drain_log(&mut entry.log);
+                any = true;
+            }
+        }
+        any
+    }
+
+    fn start_server(&mut self, id: &str, ctx: &egui::Context) {
+        let Some(entry) = self.servers.iter_mut().find(|e| e.config.id == id) else { return };
+        if entry.is_running() {
+            return;
+        }
+        entry.log.clear();
+        let ctx = ctx.clone();
+        match wazowski_servers::start(&entry.config, move || ctx.request_repaint()) {
+            Ok(running) => entry.running = Some(running),
+            Err(e) => {
+                entry.log.push(format!("Failed to start: {e:#}"));
+                self.error = Some(format!("Could not start the server: {e:#}"));
+            }
+        }
+    }
+
+    fn stop_server(&mut self, id: &str) {
+        if let Some(entry) = self.servers.iter_mut().find(|e| e.config.id == id)
+            && let Some(running) = entry.running.take()
+        {
+            running.stop();
+            entry.log.push("Stopped.".into());
+        }
+    }
+
     // --- Rendering ----------------------------------------------------------
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -676,6 +740,11 @@ impl App {
                 ui.separator();
                 if ui.button("Add shared source…").clicked() {
                     self.dialog = Dialog::AddSource(AddSourceForm::default());
+                }
+            });
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Quick servers").clicked() {
+                    self.open_servers_tab();
                 }
             });
             ui.menu_button("Vault", |ui| {
@@ -1171,6 +1240,7 @@ impl App {
                         TabContent::Connecting(c) if c.error.is_some() => format!("⚠ {name}"),
                         TabContent::Connecting(_) => format!("⏳ {name}"),
                         TabContent::Terminal(_) => name,
+                        TabContent::Servers => format!("🖧 {name}"),
                     };
                     if ui.selectable_label(i == self.active, label).clicked() {
                         self.active = i;
@@ -1207,6 +1277,13 @@ impl App {
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
+        // The servers manager needs &mut self.servers, so handle it before the
+        // &mut self.tabs borrow below.
+        if matches!(self.tabs.get(self.active).map(|t| &t.content), Some(TabContent::Servers)) {
+            self.render_servers(ui);
+            return;
+        }
+
         // A terminal shouldn't take keystrokes while a modal dialog is open.
         let interactive = matches!(self.dialog, Dialog::None);
         // Collect retry/copy actions to apply after the borrow ends.
@@ -1221,6 +1298,7 @@ impl App {
                         retry = Some(action);
                     }
                 }
+                TabContent::Servers => {}
             },
             None => {
                 ui.vertical_centered(|ui| {
@@ -1238,6 +1316,101 @@ impl App {
         if let Some(tab_id) = retry {
             let ctx = ui.ctx().clone();
             self.retry_tab(tab_id, &ctx);
+        }
+    }
+
+    fn render_servers(&mut self, ui: &mut egui::Ui) {
+        enum Act {
+            Start(String),
+            Stop(String),
+            Edit(String),
+            Remove(String),
+        }
+        let mut act: Option<Act> = None;
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.heading("Quick servers");
+            if ui.button("➕ Add server…").clicked() {
+                self.dialog = Dialog::EditServer(ServerForm::new());
+            }
+        });
+        ui.label(
+            RichText::new("Serve a folder over HTTP/TFTP/SFTP, or run an iperf3 server.").weak(),
+        );
+        ui.separator();
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if self.servers.is_empty() {
+                ui.label(RichText::new("No servers configured. Add one to get started.").weak());
+            }
+            for entry in &self.servers {
+                let id = entry.config.id.clone();
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(&entry.config.name);
+                        ui.label(RichText::new(entry.config.kind.label()).weak());
+                        match &entry.running {
+                            Some(r) => ui.colored_label(Color32::GREEN, format!("● {}", r.addr())),
+                            None => ui.label(
+                                RichText::new(format!("○ {}:{}", entry.config.bind, entry.config.port))
+                                    .weak(),
+                            ),
+                        };
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                act = Some(Act::Remove(id.clone()));
+                            }
+                            ui.add_enabled_ui(!entry.is_running(), |ui| {
+                                if ui.small_button("Edit").clicked() {
+                                    act = Some(Act::Edit(id.clone()));
+                                }
+                            });
+                            if entry.is_running() {
+                                if ui.button("Stop").clicked() {
+                                    act = Some(Act::Stop(id.clone()));
+                                }
+                            } else if ui.button("Start").clicked() {
+                                act = Some(Act::Start(id.clone()));
+                            }
+                        });
+                    });
+                    if !entry.log.is_empty() {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("server-log", &id))
+                            .max_height(140.0)
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                for line in entry.log.iter().rev().take(200).rev() {
+                                    ui.label(RichText::new(line).monospace().size(11.0));
+                                }
+                            });
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        });
+
+        match act {
+            Some(Act::Start(id)) => {
+                let ctx = ui.ctx().clone();
+                self.start_server(&id, &ctx);
+            }
+            Some(Act::Stop(id)) => self.stop_server(&id),
+            Some(Act::Edit(id)) => {
+                if let Some(entry) = self.servers.iter().find(|e| e.config.id == id) {
+                    self.dialog = Dialog::EditServer(ServerForm::from_config(&entry.config));
+                }
+            }
+            Some(Act::Remove(id)) => {
+                self.stop_server(&id);
+                self.servers.retain(|e| e.config.id != id);
+                if let Err(e) = self.servers_store.remove(&id) {
+                    self.error = Some(format!("{e:#}"));
+                }
+            }
+            None => {}
         }
     }
 
@@ -1260,6 +1433,7 @@ impl App {
             Dialog::ConfirmImportVault { .. } => self.show_confirm_import_vault(ctx),
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
             Dialog::AddSource(_) => self.show_add_source(ctx),
+            Dialog::EditServer(_) => self.show_edit_server(ctx),
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
             Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
         }
@@ -1306,6 +1480,148 @@ impl App {
             self.apply_tree_action(Some(act), ctx);
         } else if cancel {
             self.dialog = Dialog::None;
+        }
+    }
+
+    fn show_edit_server(&mut self, ctx: &egui::Context) {
+        let mut save = false;
+        let mut cancel = false;
+        let mut browse = false;
+        let bind_options = wazowski_servers::bind_options();
+        if let Dialog::EditServer(f) = &mut self.dialog {
+            let title = if f.id.is_some() { "Edit server" } else { "New server" };
+            egui::Modal::new(egui::Id::new("edit-server")).show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.heading(title);
+                ui.add_space(6.0);
+                egui::Grid::new("server-fields").num_columns(2).show(ui, |ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut f.name);
+                    ui.end_row();
+                    ui.label("Type");
+                    egui::ComboBox::from_id_salt("server-kind")
+                        .selected_text(f.kind.label())
+                        .show_ui(ui, |ui| {
+                            for kind in
+                                [ServerKind::Http, ServerKind::Tftp, ServerKind::Sftp, ServerKind::Iperf]
+                            {
+                                if ui.selectable_value(&mut f.kind, kind, kind.label()).clicked() {
+                                    // Suggest the type's default port when switching.
+                                    f.port = kind.default_port().to_string();
+                                }
+                            }
+                        });
+                    ui.end_row();
+                    if f.kind.uses_root() {
+                        ui.label("Folder");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.root)
+                                    .hint_text("folder to serve")
+                                    .desired_width(240.0),
+                            );
+                            browse |= ui.button("Browse…").clicked();
+                        });
+                        ui.end_row();
+                    }
+                    ui.label("Bind");
+                    egui::ComboBox::from_id_salt("server-bind")
+                        .selected_text(
+                            bind_options
+                                .iter()
+                                .find(|(_, ip)| *ip == f.bind)
+                                .map(|(l, _)| l.clone())
+                                .unwrap_or_else(|| f.bind.to_string()),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (label, ip) in &bind_options {
+                                ui.selectable_value(&mut f.bind, *ip, label);
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Port");
+                    ui.text_edit_singleline(&mut f.port);
+                    ui.end_row();
+                    if matches!(f.kind, ServerKind::Tftp | ServerKind::Sftp) {
+                        ui.label("Allow uploads");
+                        ui.checkbox(&mut f.writable, "writable");
+                        ui.end_row();
+                    }
+                    if f.kind == ServerKind::Sftp {
+                        ui.label("Username");
+                        ui.add(egui::TextEdit::singleline(&mut f.username).hint_text("(any if blank)"));
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut f.password)
+                                .password(true)
+                                .hint_text("(any if blank)"),
+                        );
+                        ui.end_row();
+                    }
+                });
+                if f.kind == ServerKind::Iperf {
+                    ui.label(RichText::new("Requires the iperf3 binary on your PATH.").weak());
+                }
+                if let Some(error) = &f.error {
+                    ui.colored_label(Color32::LIGHT_RED, error.as_str());
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    save |= ui.button("Save").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if browse
+            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            && let Dialog::EditServer(f) = &mut self.dialog
+        {
+            f.root = dir.to_string_lossy().into_owned();
+        }
+        if save {
+            self.try_save_server();
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn try_save_server(&mut self) {
+        let Dialog::EditServer(f) = &self.dialog else { return };
+        let port: u16 = match f.port.trim().parse() {
+            Ok(p) if p > 0 => p,
+            _ => return self.set_server_error("Port must be a number from 1–65535."),
+        };
+        let name = if f.name.trim().is_empty() { f.kind.label().to_owned() } else { f.name.trim().to_owned() };
+        if f.kind.uses_root() && f.root.trim().is_empty() {
+            return self.set_server_error("Choose a folder to serve.");
+        }
+        let id = f.id.clone().unwrap_or_else(|| Session::new("", "", "").id);
+        let config = ServerConfig {
+            id: id.clone(),
+            name,
+            kind: f.kind,
+            root: PathBuf::from(f.root.trim()),
+            bind: f.bind,
+            port,
+            writable: f.writable,
+            username: f.username.trim().to_owned(),
+            password: f.password.clone(),
+        };
+        if let Err(e) = self.servers_store.upsert(config.clone()) {
+            return self.set_server_error(&format!("{e:#}"));
+        }
+        match self.servers.iter_mut().find(|e| e.config.id == id) {
+            Some(entry) => entry.config = config,
+            None => self.servers.push(ServerEntry::new(config)),
+        }
+        self.dialog = Dialog::None;
+    }
+
+    fn set_server_error(&mut self, message: &str) {
+        if let Dialog::EditServer(f) = &mut self.dialog {
+            f.error = Some(message.to_owned());
         }
     }
 
@@ -2830,6 +3146,10 @@ impl eframe::App for App {
         }
 
         self.poll_connections(&ctx);
+        // Keep server logs flowing and repaint while any server runs.
+        if self.poll_servers() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
         // Suppress tab shortcuts while a modal is open so typing a password
         // doesn't also switch tabs.
         if matches!(self.dialog, Dialog::None) {

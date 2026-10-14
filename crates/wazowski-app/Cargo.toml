@@ -14,6 +14,7 @@ egui.workspace = true
 wazowski-term.workspace = true
 wazowski-core.workspace = true
 wazowski-ssh.workspace = true
+wazowski-servers.workspace = true
 rfd.workspace = true
 directories.workspace = true
 toml.workspace = true

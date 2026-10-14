@@ -6,6 +6,7 @@ mod connect;
 mod git;
 mod sftp_ui;
 mod sources;
+mod servers_ui;
 
 use app::App;
 

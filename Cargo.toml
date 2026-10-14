@@ -30,10 +30,16 @@ open = "5"
 thiserror = "2"
 russh = { version = "0.64", features = ["des"] }
 russh-sftp = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "macros", "time", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "macros", "time", "fs", "process", "io-std"] }
 futures = "0.3"
 dirs = "6"
 wazowski-ssh = { path = "crates/wazowski-ssh" }
+axum = "0.8"
+tower-http = { version = "0.7", features = ["fs", "trace"] }
+async-tftp = "0.4"
+if-addrs = "0.13"
+wazowski-servers = { path = "crates/wazowski-servers" }
+
 rfd = "0.15"
 wazowski-core = { path = "crates/wazowski-core" }
 wazowski-term = { path = "crates/wazowski-term" }
