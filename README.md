@@ -23,6 +23,11 @@ Primary target is Fedora Linux; it also builds for Windows and macOS.
   generate Ed25519 key pairs.
 - **Session manager** with nested folders, right-click menus, drag-and-drop, and
   move/copy of sessions and whole folders.
+- **Quick servers** (Tools → Quick servers): serve a folder over **HTTP**,
+  **TFTP** (read or writable), or **SFTP** (password auth, confined to the
+  folder), or run an **iperf3** server. Choose the bind interface and port;
+  configs persist and each server has a live log. (iperf3 uses the system
+  `iperf3` binary.)
 - **Session sharing** via a shared file/folder (network mount, NAS, synced
   folder) or a **git repo** (GitHub, GitLab, Forgejo, …) with optional
   per-repo auth (HTTPS token in the OS keyring, or an SSH key). Shared sessions

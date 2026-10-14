@@ -48,8 +48,10 @@ implements a `Backend` trait and is plugged into a `Terminal`.
    connection), navigate directories, upload/download via native dialogs,
    new folder, delete. Operations run off the UI thread. (Drag-and-drop and
    following the terminal's working directory: future polish.)
-4. **Quick servers** — panel to start/stop HTTP, TFTP, FTP, SFTP servers on a
-   chosen folder and port, with live logs.
+4. **Quick servers** ✅ — a Servers tab to start/stop HTTP, TFTP, SFTP, and
+   iperf3 servers on a chosen folder, interface and port, with live logs.
+   Configs persist; bind address is selectable. (iperf drives the system
+   `iperf3` binary.)
 5. **Power features** — SSH tunnels, split panes, multi-exec, serial, Telnet,
    themes, fonts, keybinding settings.
 6. **Extras and packaging** — RDP/VNC, RPM + Flatpak, Windows installer, macOS app bundle.
