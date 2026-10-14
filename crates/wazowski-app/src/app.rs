@@ -19,6 +19,7 @@ use crate::connect::{Connected, PendingConnect, Progress};
 use crate::keybinds::{Action, Keymap};
 use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
 use crate::panes::{Panes, SplitDir};
+use crate::settings::{NewTabPlacement, Settings, StartupTab};
 use crate::sftp_ui::FileBrowser;
 use crate::servers_ui::{ServerEntry, ServerForm, ServersStore};
 use crate::sources::{
@@ -47,6 +48,8 @@ enum TabContent {
     Terminal(Box<Panes>),
     /// The quick-servers manager (singleton).
     Servers,
+    /// The global settings page (singleton).
+    Settings,
 }
 
 /// A split-pane action requested from the tab strip, applied after the UI pass.
@@ -74,7 +77,7 @@ impl Tab {
     fn is_dead(&self) -> bool {
         match &self.content {
             TabContent::Terminal(p) => p.all_exited(),
-            TabContent::Connecting(_) | TabContent::Servers => false,
+            TabContent::Connecting(_) | TabContent::Servers | TabContent::Settings => false,
         }
     }
 }
@@ -143,6 +146,8 @@ enum Dialog {
     MacroEdit(MacroForm),
     /// Confirm running a macro, showing its steps and where they go.
     ConfirmMacro { index: usize, target: MacroTarget },
+    /// Program info and links.
+    About,
 }
 
 /// Fields for the macro editor dialog.
@@ -411,6 +416,11 @@ pub struct App {
     macros: MacroStore,
     /// The macro currently playing, if any.
     macro_run: Option<MacroRun>,
+    /// Global, persisted settings.
+    settings: Settings,
+    /// Held for the process lifetime to enforce single-instance; `None` when
+    /// multiple instances are allowed.
+    _instance_lock: Option<std::fs::File>,
 }
 
 /// Where a macro's steps are sent.
@@ -484,7 +494,7 @@ enum DragPayload {
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context) -> Self {
+    pub fn new(ctx: &egui::Context, instance_lock: Option<std::fs::File>) -> Self {
         let sessions_path = SessionStore::default_path().unwrap_or_else(|_| "sessions.toml".into());
         let sessions = SessionStore::load(sessions_path).unwrap_or_default();
         let vault_path = Vault::default_path().unwrap_or_else(|_| "vault.enc".into());
@@ -513,6 +523,7 @@ impl App {
             .unwrap_or_else(|_| Keymap::defaults());
         let macros =
             MacroStore::default_path().and_then(MacroStore::load).unwrap_or_else(|_| MacroStore::empty());
+        let settings = Settings::load_or_default();
 
         let mut app = Self {
             tabs: Vec::new(),
@@ -535,8 +546,10 @@ impl App {
             keymap,
             macros,
             macro_run: None,
+            settings,
+            _instance_lock: instance_lock,
         };
-        app.open_local_shell(ctx);
+        app.open_startup_tab(ctx);
         app
     }
 
@@ -588,16 +601,51 @@ impl App {
         }
     }
 
+    /// Opens the first tab at startup per the user's setting.
+    fn open_startup_tab(&mut self, ctx: &egui::Context) {
+        match self.settings.startup_tab.clone() {
+            StartupTab::None => {}
+            StartupTab::LocalShell => self.open_local_shell(ctx),
+            StartupTab::Session(id) => match self.sessions.get(&id).cloned() {
+                Some(session) => self.start_connect(&session, ctx),
+                None => self.open_local_shell(ctx),
+            },
+        }
+    }
+
+    /// Opens (or focuses) the singleton Settings tab.
+    fn open_settings_tab(&mut self) {
+        if let Some(i) = self.tabs.iter().position(|t| matches!(t.content, TabContent::Settings)) {
+            self.active = i;
+        } else {
+            self.push_tab("Settings", TabContent::Settings, None);
+        }
+    }
+
     fn push_tab(&mut self, label: impl Into<String>, content: TabContent, files: Option<FileBrowser>) {
+        self.push_tab_at(label, content, files, false);
+    }
+
+    /// Inserts a tab and focuses it. With `force_adjacent` (a duplicate) or the
+    /// "Always" placement setting, it opens right after the current tab;
+    /// otherwise it appends at the end.
+    fn push_tab_at(
+        &mut self,
+        label: impl Into<String>,
+        content: TabContent,
+        files: Option<FileBrowser>,
+        force_adjacent: bool,
+    ) {
         let id = self.new_tab_id();
-        self.tabs.push(Tab {
-            id,
-            label: label.into(),
-            content,
-            show_files: files.is_some(),
-            files,
-        });
-        self.active = self.tabs.len() - 1;
+        let tab = Tab { id, label: label.into(), content, show_files: files.is_some(), files };
+        let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
+        let index = if adjacent && !self.tabs.is_empty() {
+            (self.active + 1).min(self.tabs.len())
+        } else {
+            self.tabs.len()
+        };
+        self.tabs.insert(index, tab);
+        self.active = index;
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -1040,6 +1088,13 @@ impl App {
                     self.close_tab(self.active);
                 }
                 ui.separator();
+                if ui.button("Settings").clicked() {
+                    self.open_settings_tab();
+                }
+                if ui.button("About Wazowski").clicked() {
+                    self.dialog = Dialog::About;
+                }
+                ui.separator();
                 if ui.button("Quit").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1137,6 +1192,151 @@ impl App {
         };
         if let Err(e) = std::fs::copy(&self.vault_path, &dest) {
             self.error = Some(format!("Backup failed: {e}"));
+        }
+    }
+
+    /// Copies the vault into the backup folder with a timestamped name. Updates
+    /// `last_backup` up front so an auto-backup won't retry every frame on error.
+    fn run_vault_backup(&mut self, manual: bool) {
+        if !Vault::exists(&self.vault_path) {
+            if manual {
+                self.error = Some("There is no vault to back up.".into());
+            }
+            return;
+        }
+        let dir = self.settings.backup_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.error = Some(format!("Could not create backup folder: {e}"));
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.settings.vault_backup.last_backup = Some(std::time::SystemTime::now());
+        let _ = self.settings.save();
+        let dest = dir.join(format!("vault-{stamp}.enc"));
+        if let Err(e) = std::fs::copy(&self.vault_path, &dest) {
+            self.error = Some(format!("Backup failed: {e}"));
+        }
+    }
+
+    /// Renders the global settings page.
+    fn render_settings(&mut self, ui: &mut egui::Ui) {
+        let sessions: Vec<(String, String)> =
+            self.sessions.all().iter().map(|s| (s.id.clone(), s.name.clone())).collect();
+        let vault_exists = Vault::exists(&self.vault_path);
+        let mut changed = false;
+        let mut backup_now = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(8.0);
+            ui.heading("Settings");
+            ui.separator();
+
+            ui.label(RichText::new("General").strong());
+            if ui
+                .checkbox(&mut self.settings.allow_multiple_instances, "Allow multiple instances")
+                .on_hover_text("Takes effect at the next launch")
+                .changed()
+            {
+                changed = true;
+            }
+
+            ui.add_space(10.0);
+            ui.label(RichText::new("Startup").strong());
+            let current = match &self.settings.startup_tab {
+                StartupTab::None => "Nothing".to_owned(),
+                StartupTab::LocalShell => "New local shell".to_owned(),
+                StartupTab::Session(id) => sessions
+                    .iter()
+                    .find(|(sid, _)| sid == id)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| "(missing session)".to_owned()),
+            };
+            egui::ComboBox::from_label("Open at startup").selected_text(current).show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(matches!(self.settings.startup_tab, StartupTab::None), "Nothing")
+                    .clicked()
+                {
+                    self.settings.startup_tab = StartupTab::None;
+                    changed = true;
+                }
+                if ui
+                    .selectable_label(
+                        matches!(self.settings.startup_tab, StartupTab::LocalShell),
+                        "New local shell",
+                    )
+                    .clicked()
+                {
+                    self.settings.startup_tab = StartupTab::LocalShell;
+                    changed = true;
+                }
+                for (id, name) in &sessions {
+                    let selected =
+                        matches!(&self.settings.startup_tab, StartupTab::Session(s) if s == id);
+                    if ui.selectable_label(selected, name).clicked() {
+                        self.settings.startup_tab = StartupTab::Session(id.clone());
+                        changed = true;
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.label(RichText::new("New tab placement").strong());
+            for (value, label) in [
+                (NewTabPlacement::Never, "Never — open at the far right"),
+                (NewTabPlacement::WhenDuplicating, "Only when duplicating a tab"),
+                (NewTabPlacement::Always, "Always next to the current tab"),
+            ] {
+                if ui.radio_value(&mut self.settings.new_tab_placement, value, label).changed() {
+                    changed = true;
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.label(RichText::new("Automatic vault backup").strong());
+            if !vault_exists {
+                ui.label(RichText::new("No vault exists yet.").weak());
+            }
+            if ui
+                .checkbox(&mut self.settings.vault_backup.enabled, "Back up the vault automatically")
+                .changed()
+            {
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Every");
+                if ui
+                    .add(egui::DragValue::new(&mut self.settings.vault_backup.every_days).range(1..=365))
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.label("day(s)");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Folder:");
+                ui.label(self.settings.backup_dir().display().to_string());
+                if ui.button("Choose…").clicked()
+                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.settings.vault_backup.dir = Some(dir);
+                    changed = true;
+                }
+            });
+            if let Some(when) = self.settings.vault_backup.last_backup {
+                ui.label(RichText::new(format!("Last backup: {}", time_ago(when))).weak());
+            }
+            if ui.add_enabled(vault_exists, egui::Button::new("Back up now")).clicked() {
+                backup_now = true;
+            }
+        });
+
+        if changed && let Err(e) = self.settings.save() {
+            self.error = Some(format!("Could not save settings: {e:#}"));
+        }
+        if backup_now {
+            self.run_vault_backup(true);
         }
     }
 
@@ -1574,6 +1774,7 @@ impl App {
                         TabContent::Connecting(_) => format!("⏳ {name}"),
                         TabContent::Terminal(_) => name,
                         TabContent::Servers => format!("🖧 {name}"),
+                        TabContent::Settings => format!("⚙ {name}"),
                     };
                     if ui.selectable_label(i == self.active, label).clicked() {
                         self.active = i;
@@ -1634,11 +1835,18 @@ impl App {
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
-        // The servers manager needs &mut self.servers, so handle it before the
-        // &mut self.tabs borrow below.
-        if matches!(self.tabs.get(self.active).map(|t| &t.content), Some(TabContent::Servers)) {
-            self.render_servers(ui);
-            return;
+        // The servers manager and settings page need other &mut self fields, so
+        // handle them before the &mut self.tabs borrow below.
+        match self.tabs.get(self.active).map(|t| &t.content) {
+            Some(TabContent::Servers) => {
+                self.render_servers(ui);
+                return;
+            }
+            Some(TabContent::Settings) => {
+                self.render_settings(ui);
+                return;
+            }
+            _ => {}
         }
 
         // A terminal shouldn't take keystrokes while a modal dialog is open.
@@ -1658,7 +1866,7 @@ impl App {
                         retry = Some(action);
                     }
                 }
-                TabContent::Servers => {}
+                TabContent::Servers | TabContent::Settings => {}
             },
             None => {
                 ui.vertical_centered(|ui| {
@@ -1833,6 +2041,38 @@ impl App {
             Dialog::MacroManager => self.show_macro_manager(ctx),
             Dialog::MacroEdit(_) => self.show_macro_edit(ctx),
             Dialog::ConfirmMacro { .. } => self.show_confirm_macro(ctx),
+            Dialog::About => self.show_about(ctx),
+        }
+    }
+
+    /// Program info: version and links.
+    fn show_about(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("About Wazowski")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.heading("Wazowski");
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.label("A MobaXterm-style terminal & remote-session toolbox, in Rust.");
+                ui.add_space(6.0);
+                ui.hyperlink_to("GitHub repository", "https://github.com/HoleInTheSeat/Wazowski");
+                ui.hyperlink_to(
+                    "Releases & changelog",
+                    "https://github.com/HoleInTheSeat/Wazowski/releases",
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("Licensed under GPL-3.0.").weak());
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        if close || !open {
+            self.dialog = Dialog::None;
         }
     }
 
@@ -4264,6 +4504,9 @@ impl eframe::App for App {
 
         self.poll_connections(&ctx);
         self.poll_admin(&ctx);
+        if self.settings.auto_backup_due() && Vault::exists(&self.vault_path) {
+            self.run_vault_backup(false);
+        }
         // Keep server logs flowing and repaint while any server runs.
         if self.poll_servers() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
@@ -4805,6 +5048,21 @@ fn entered(ui: &egui::Ui, resp: &egui::Response) -> bool {
 /// cancels capture instead of becoming a binding).
 fn is_modifier_key(key: Key) -> bool {
     matches!(key, Key::Escape)
+}
+
+/// A coarse "N units ago" description of a past time, dependency-free.
+fn time_ago(when: std::time::SystemTime) -> String {
+    let Ok(elapsed) = when.elapsed() else { return "just now".to_owned() };
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        "moments ago".to_owned()
+    } else if secs < 3_600 {
+        format!("{} minute(s) ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{} hour(s) ago", secs / 3_600)
+    } else {
+        format!("{} day(s) ago", secs / 86_400)
+    }
 }
 
 /// One row of the macro editor: a kind picker plus that kind's fields.
