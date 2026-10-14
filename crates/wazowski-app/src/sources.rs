@@ -198,6 +198,15 @@ impl SourcesConfig {
         self.save()
     }
 
+    /// Replaces an existing source definition (matched by id), or appends it.
+    pub fn update(&mut self, def: SourceDef) -> Result<()> {
+        match self.defs.iter_mut().find(|d| d.id == def.id) {
+            Some(existing) => *existing = def,
+            None => self.defs.push(def),
+        }
+        self.save()
+    }
+
     pub fn remove(&mut self, id: &str) -> Result<()> {
         self.defs.retain(|d| d.id != id);
         self.save()

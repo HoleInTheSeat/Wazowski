@@ -159,8 +159,10 @@ struct MacroForm {
     error: Option<String>,
 }
 
-/// Fields for the "Add shared source" dialog (folder or git).
+/// Fields for the "Add/Edit shared source" dialog (folder or git).
 struct AddSourceForm {
+    /// `Some` when editing an existing source (keeps its id); `None` to add.
+    edit_id: Option<String>,
     name: String,
     kind: SourceKind,
     // Folder:
@@ -178,6 +180,7 @@ struct AddSourceForm {
 impl Default for AddSourceForm {
     fn default() -> Self {
         Self {
+            edit_id: None,
             name: String::new(),
             kind: SourceKind::Folder,
             path: String::new(),
@@ -188,6 +191,25 @@ impl Default for AddSourceForm {
             username: String::new(),
             token: String::new(),
             key_path: String::new(),
+        }
+    }
+}
+
+impl AddSourceForm {
+    /// Prefills the form from an existing source (and its stored HTTPS token).
+    fn from_def(def: &SourceDef, token: Option<String>) -> Self {
+        Self {
+            edit_id: Some(def.id.clone()),
+            name: def.name.clone(),
+            kind: def.kind,
+            path: def.path.to_string_lossy().into_owned(),
+            url: def.url.clone(),
+            branch: def.branch.clone(),
+            file: def.file.clone(),
+            auth: def.auth,
+            username: def.username.clone(),
+            token: token.unwrap_or_default(),
+            key_path: def.key_path.clone(),
         }
     }
 }
@@ -1469,6 +1491,10 @@ impl App {
                     }
                 }
                 ui.separator();
+                if ui.button("Edit source…").clicked() {
+                    action = Some(TreeAction::EditSource(source.id().to_owned()));
+                    ui.close();
+                }
                 if ui.button("Remove source").clicked() {
                     action = Some(TreeAction::RemoveSource(source.id().to_owned()));
                     ui.close();
@@ -1595,6 +1621,18 @@ impl App {
                 } else {
                     Ok(())
                 }
+            }
+            TreeAction::EditSource(id) => {
+                if let Some(source) = self.shared.iter().find(|s| s.id() == id) {
+                    let def = source.def().clone();
+                    let token = if def.auth == GitAuthKind::Https {
+                        sources::load_git_token(&def.id)
+                    } else {
+                        None
+                    };
+                    self.dialog = Dialog::AddSource(AddSourceForm::from_def(&def, token));
+                }
+                Ok(())
             }
             TreeAction::RemoveSource(id) => self.remove_source(&id),
             TreeAction::Dropped { payload, to, folder } => {
@@ -3040,9 +3078,10 @@ impl App {
         let mut browse_folder = false;
         let mut browse_key = false;
         if let Dialog::AddSource(f) = &mut self.dialog {
+            let editing = f.edit_id.is_some();
             egui::Modal::new(egui::Id::new("add-source")).show(ctx, |ui| {
                 ui.set_width(460.0);
-                ui.heading("Add shared source");
+                ui.heading(if editing { "Edit shared source" } else { "Add shared source" });
                 ui.label(
                     RichText::new(
                         "Shared sessions are cached locally (available offline) and never \
@@ -3136,7 +3175,7 @@ impl App {
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    add |= ui.button("Add").clicked();
+                    add |= ui.button(if editing { "Save" } else { "Add" }).clicked();
                     cancel |= ui.button("Cancel").clicked();
                 });
             });
@@ -3158,9 +3197,14 @@ impl App {
         if add
             && let Dialog::AddSource(f) = &self.dialog
         {
+            let editing = f.edit_id.is_some();
             match self.build_source_def(f) {
                 Ok((def, token)) => {
-                    self.add_source(def, token);
+                    if editing {
+                        self.update_source(def, token);
+                    } else {
+                        self.add_source(def, token);
+                    }
                     self.dialog = Dialog::None;
                 }
                 Err(e) => self.error = Some(e),
@@ -3177,7 +3221,7 @@ impl App {
         if name.is_empty() {
             return Err("Give the source a name.".into());
         }
-        let id = Session::new("", "", "").id;
+        let id = f.edit_id.clone().unwrap_or_else(|| Session::new("", "", "").id);
         let mut def = SourceDef {
             id,
             name,
@@ -3240,6 +3284,31 @@ impl App {
             self.error = Some(format!("Added, but could not create the shared file: {e:#}"));
         }
         self.shared.push(source);
+    }
+
+    /// Applies edits to an existing shared source: updates its token, config
+    /// entry, and live state (re-opening from the new definition).
+    fn update_source(&mut self, def: SourceDef, token: Option<String>) {
+        if def.auth == GitAuthKind::Https {
+            if let Some(token) = token
+                && let Err(e) = sources::store_git_token(&def.id, &token)
+            {
+                self.error = Some(format!("Could not store the token: {e:#}"));
+                return;
+            }
+        } else {
+            sources::delete_git_token(&def.id);
+        }
+        if let Err(e) = self.sources_config.update(def.clone()) {
+            self.error = Some(format!("{e:#}"));
+            return;
+        }
+        let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
+        let source = SharedSource::open(def.clone(), &cache);
+        match self.shared.iter_mut().find(|s| s.id() == def.id) {
+            Some(slot) => *slot = source,
+            None => self.shared.push(source),
+        }
     }
 
     fn show_confirm_quit(&mut self, ctx: &egui::Context) {
@@ -4676,6 +4745,7 @@ enum TreeAction {
     DeleteFolder(StoreId, String),
     SyncSource(String),
     OpenSource(String),
+    EditSource(String),
     RemoveSource(String),
     /// A drag-and-drop release onto a folder (or root) of a destination store.
     Dropped { payload: DragPayload, to: StoreId, folder: String },
