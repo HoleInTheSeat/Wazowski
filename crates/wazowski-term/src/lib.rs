@@ -20,4 +20,4 @@ pub use serial::{
     COMMON_BAUDS, SerialBackend, SerialConfig, SerialFlow, SerialParity, available_ports,
 };
 pub use terminal::Terminal;
-pub use view::TerminalView;
+pub use view::{SearchQuery, TerminalView};

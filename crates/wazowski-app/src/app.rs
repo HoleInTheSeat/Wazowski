@@ -11,8 +11,8 @@ use wazowski_ssh::{
     AuthMaterial, ConnectParams, HostKeyPolicy, UnknownHostKey, trust_host,
 };
 use wazowski_term::{
-    COMMON_BAUDS, LocalPty, SerialBackend, SerialConfig, SerialFlow, SerialParity, TermSize,
-    Terminal, available_ports,
+    COMMON_BAUDS, LocalPty, SearchQuery, SerialBackend, SerialConfig, SerialFlow, SerialParity,
+    TermSize, Terminal, available_ports,
 };
 
 use crate::connect::{Connected, PendingConnect, Progress};
@@ -463,6 +463,17 @@ pub struct App {
     /// Held for the process lifetime to enforce single-instance; `None` when
     /// multiple instances are allowed.
     _instance_lock: Option<std::fs::File>,
+    /// The find-in-terminals bar, when open.
+    find: Option<FindState>,
+}
+
+/// State of the find-in-terminals bar.
+#[derive(Default)]
+struct FindState {
+    query: String,
+    case_sensitive: bool,
+    /// Set to focus the input on the frame the bar opens.
+    just_opened: bool,
 }
 
 /// Where a macro's steps are sent.
@@ -590,6 +601,7 @@ impl App {
             macro_run: None,
             settings,
             _instance_lock: instance_lock,
+            find: None,
         };
         app.open_startup_tab(ctx);
         app
@@ -1112,6 +1124,12 @@ impl App {
         }
         if triggered(Action::ToggleBroadcast, ctx, &self.keymap) {
             self.broadcast = !self.broadcast;
+        }
+        if triggered(Action::Find, ctx, &self.keymap) {
+            match &self.find {
+                Some(_) => self.find = None,
+                None => self.find = Some(FindState { just_opened: true, ..Default::default() }),
+            }
         }
         // Action::RunMacro is handled (and consumed) by the macros feature.
         self.macro_shortcut(ctx);
@@ -1958,19 +1976,29 @@ impl App {
             _ => {}
         }
 
+        // The find-in-terminals bar sits above the terminal area.
+        if self.find.is_some() {
+            self.render_find_bar(ui);
+        }
+
         // A terminal shouldn't take keystrokes while a modal dialog is open.
         let interactive = matches!(self.dialog, Dialog::None);
         // Collect retry/copy actions to apply after the borrow ends.
         let mut retry = None;
         let active = self.active;
         let broadcast = self.broadcast;
+        let search = self
+            .find
+            .as_ref()
+            .filter(|f| !f.query.is_empty())
+            .map(|f| SearchQuery { needle: f.query.clone(), case_sensitive: f.case_sensitive });
         let mut broadcast_src: Option<(u64, Vec<u8>)> = None;
         let mut connect_recent: Option<(StoreId, String)> = None;
         let recents = self.recent_sessions();
         match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
                 TabContent::Terminal(panes) => {
-                    broadcast_src = panes.show(ui, interactive, broadcast);
+                    broadcast_src = panes.show(ui, interactive, broadcast, search.as_ref());
                 }
                 TabContent::Connecting(c) => {
                     if let Some(action) = connecting_view(ui, c, tab.id) {
@@ -2031,6 +2059,70 @@ impl App {
         }
     }
 
+    /// The find bar: a query field, case toggle, live match count, and close.
+    fn render_find_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(mut find) = self.find.take() else { return };
+        let count = self.count_matches(&find);
+        let mut close = false;
+        egui::Panel::top("find-bar").show(ui, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label("🔍 Find:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut find.query)
+                        .desired_width(240.0)
+                        .hint_text("text in the visible terminals"),
+                );
+                if find.just_opened {
+                    resp.request_focus();
+                    find.just_opened = false;
+                }
+                ui.checkbox(&mut find.case_sensitive, "Case sensitive");
+                let label = if find.query.is_empty() {
+                    String::new()
+                } else {
+                    format!("{count} match(es)")
+                };
+                ui.label(RichText::new(label).weak());
+                if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
+                    close = true;
+                }
+            });
+            ui.add_space(3.0);
+        });
+        if close || ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.find = None;
+        } else {
+            self.find = Some(find);
+        }
+    }
+
+    /// Total occurrences of the find query across the active tab's visible panes.
+    fn count_matches(&self, find: &FindState) -> usize {
+        if find.query.is_empty() {
+            return 0;
+        }
+        let Some(TabContent::Terminal(panes)) = self.tabs.get(self.active).map(|t| &t.content)
+        else {
+            return 0;
+        };
+        let needle =
+            if find.case_sensitive { find.query.clone() } else { find.query.to_lowercase() };
+        panes
+            .ids()
+            .iter()
+            .filter_map(|id| panes.get(*id))
+            .map(|t| {
+                let hay = if find.case_sensitive {
+                    t.screen_text()
+                } else {
+                    t.screen_text().to_lowercase()
+                };
+                count_occurrences(&hay, &needle)
+            })
+            .sum()
+    }
+
     /// Shows the "session ended" banner for a terminal tab whose session closed,
     /// with its frozen output below and Restart / Save / Close actions.
     fn render_ended_tab(&mut self, ui: &mut egui::Ui) {
@@ -2070,7 +2162,7 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(active)
             && let TabContent::Terminal(panes) = &mut tab.content
         {
-            panes.show(ui, false, false);
+            panes.show(ui, false, false, None);
         }
         match act {
             Some(EndAct::Restart) => {
@@ -5394,6 +5486,20 @@ fn entered(ui: &egui::Ui, resp: &egui::Response) -> bool {
 /// cancels capture instead of becoming a binding).
 fn is_modifier_key(key: Key) -> bool {
     matches!(key, Key::Escape)
+}
+
+/// Counts non-overlapping occurrences of `needle` in `hay`.
+fn count_occurrences(hay: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut rest = hay;
+    while let Some(pos) = rest.find(needle) {
+        count += 1;
+        rest = &rest[pos + needle.len()..];
+    }
+    count
 }
 
 /// A coarse "N units ago" description of a past time, dependency-free.

@@ -25,10 +25,11 @@ pub enum Action {
     ClosePane,
     ToggleBroadcast,
     RunMacro,
+    Find,
 }
 
 impl Action {
-    pub const ALL: [Action; 9] = [
+    pub const ALL: [Action; 10] = [
         Action::NewShell,
         Action::CloseTab,
         Action::NextTab,
@@ -38,6 +39,7 @@ impl Action {
         Action::ClosePane,
         Action::ToggleBroadcast,
         Action::RunMacro,
+        Action::Find,
     ];
 
     /// Human-readable name shown in the Settings dialog and menus.
@@ -52,6 +54,7 @@ impl Action {
             Action::ClosePane => "Close focused pane",
             Action::ToggleBroadcast => "Toggle broadcast",
             Action::RunMacro => "Run macro…",
+            Action::Find => "Find in terminals",
         }
     }
 
@@ -70,6 +73,7 @@ impl Action {
             Action::ClosePane => KeyboardShortcut::new(ctrl_shift, Key::X),
             Action::ToggleBroadcast => KeyboardShortcut::new(ctrl_shift, Key::B),
             Action::RunMacro => KeyboardShortcut::new(ctrl_shift, Key::M),
+            Action::Find => KeyboardShortcut::new(ctrl_shift, Key::F),
         }
     }
 }

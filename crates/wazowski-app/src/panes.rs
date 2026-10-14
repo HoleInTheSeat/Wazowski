@@ -8,7 +8,7 @@
 use eframe::egui::{
     self, Color32, CursorIcon, Id, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2,
 };
-use wazowski_term::{Terminal, TerminalView};
+use wazowski_term::{SearchQuery, Terminal, TerminalView};
 
 /// Which way a split arranges its two children.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -224,6 +224,7 @@ impl Panes {
         ui: &mut Ui,
         interactive: bool,
         broadcast_active: bool,
+        search: Option<&SearchQuery>,
     ) -> Option<(u64, Vec<u8>)> {
         let area = ui.available_rect_before_wrap();
         let multi = self.count() > 1;
@@ -236,6 +237,7 @@ impl Panes {
                 broadcast_active,
                 multi,
                 focused,
+                search,
                 new_focus: &mut new_focus,
                 source: &mut source,
             }, ui, root, area);
@@ -251,6 +253,7 @@ struct Ctx<'a> {
     broadcast_active: bool,
     multi: bool,
     focused: u64,
+    search: Option<&'a SearchQuery>,
     new_focus: &'a mut u64,
     source: &'a mut Option<(u64, Vec<u8>)>,
 }
@@ -261,7 +264,10 @@ fn show_pane(mut cx: Ctx, ui: &mut Ui, pane: &mut Pane, area: Rect) {
             let id = t.id();
             let response = ui
                 .scope_builder(UiBuilder::new().max_rect(area), |ui| {
-                    TerminalView::new(t).interactive(cx.interactive).show(ui)
+                    TerminalView::new(t)
+                        .interactive(cx.interactive)
+                        .search(cx.search.cloned())
+                        .show(ui)
                 })
                 .inner;
 
@@ -333,6 +339,7 @@ impl Ctx<'_> {
             broadcast_active: self.broadcast_active,
             multi: self.multi,
             focused: self.focused,
+            search: self.search,
             new_focus: self.new_focus,
             source: self.source,
         }

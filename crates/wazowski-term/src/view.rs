@@ -26,7 +26,18 @@ pub struct TerminalView<'a> {
     terminal: &'a mut Terminal,
     font: FontId,
     interactive: bool,
+    search: Option<SearchQuery>,
 }
+
+/// A find query to highlight on the terminal's visible screen.
+#[derive(Clone)]
+pub struct SearchQuery {
+    pub needle: String,
+    pub case_sensitive: bool,
+}
+
+/// Translucent marker drawn over search matches.
+const SEARCH_HIGHLIGHT: Color32 = Color32::from_rgba_premultiplied(120, 110, 0, 110);
 
 /// Maps between screen positions and terminal cells.
 struct Grid {
@@ -54,11 +65,17 @@ impl Grid {
 
 impl<'a> TerminalView<'a> {
     pub fn new(terminal: &'a mut Terminal) -> Self {
-        Self { terminal, font: FontId::monospace(14.0), interactive: true }
+        Self { terminal, font: FontId::monospace(14.0), interactive: true, search: None }
     }
 
     pub fn font_size(mut self, size: f32) -> Self {
         self.font.size = size;
+        self
+    }
+
+    /// Highlights occurrences of a find query on the visible screen.
+    pub fn search(mut self, search: Option<SearchQuery>) -> Self {
+        self.search = search;
         self
     }
 
@@ -70,7 +87,7 @@ impl<'a> TerminalView<'a> {
     }
 
     pub fn show(self, ui: &mut Ui) -> Response {
-        let Self { terminal: t, font, interactive } = self;
+        let Self { terminal: t, font, interactive, search } = self;
         t.process(ui.ctx());
 
         let rect = ui.available_rect_before_wrap();
@@ -97,7 +114,7 @@ impl<'a> TerminalView<'a> {
             if response.has_focus() {
                 response.surrender_focus();
             }
-            paint(ui, t, rect, &grid, &font, false);
+            paint(ui, t, rect, &grid, &font, false, search.as_ref());
             return response;
         }
 
@@ -119,7 +136,7 @@ impl<'a> TerminalView<'a> {
             ui.ctx().set_cursor_icon(CursorIcon::Text);
         }
 
-        paint(ui, t, rect, &grid, &font, focused);
+        paint(ui, t, rect, &grid, &font, focused, search.as_ref());
         response
     }
 }
@@ -278,10 +295,27 @@ struct TextRun {
     text: String,
 }
 
-fn paint(ui: &Ui, t: &Terminal, rect: Rect, grid: &Grid, font: &FontId, focused: bool) {
+fn paint(
+    ui: &Ui,
+    t: &Terminal,
+    rect: Rect,
+    grid: &Grid,
+    font: &FontId,
+    focused: bool,
+    search: Option<&SearchQuery>,
+) {
     let painter = ui.painter_at(rect);
     let palette = &t.palette;
     painter.rect_filled(rect, 0.0, palette.background);
+
+    // Per visible row, the (column, char) of each cell, to map find matches to
+    // screen positions after the cell loop.
+    let searching = search.is_some_and(|q| !q.needle.is_empty());
+    let mut row_chars: Vec<Vec<(usize, char)>> = if searching {
+        vec![Vec::new(); grid.rows]
+    } else {
+        Vec::new()
+    };
 
     let content = t.term.renderable_content();
     let colors = content.colors;
@@ -304,6 +338,13 @@ fn paint(ui: &Ui, t: &Terminal, rect: Rect, grid: &Grid, font: &FontId, focused:
         }
         let row = indexed.point.line.0 + offset;
         let col = indexed.point.column.0;
+
+        if searching
+            && row >= 0
+            && let Some(cells) = row_chars.get_mut(row as usize)
+        {
+            cells.push((col, cell.c));
+        }
 
         let mut fg = foreground(cell, palette, colors);
         let mut bg = palette.resolve(cell.bg, colors);
@@ -368,6 +409,10 @@ fn paint(ui: &Ui, t: &Terminal, rect: Rect, grid: &Grid, font: &FontId, focused:
         painter.line_segment(points, Stroke::new(1.0, color));
     }
 
+    if let Some(query) = search.filter(|_| searching) {
+        paint_search(&painter, grid, &row_chars, query);
+    }
+
     if cursor.shape != CursorShape::Hidden && (0..grid.rows as i32).contains(&cursor_row) {
         let rect = grid.cell_rect(cursor_row, cursor_col, 1);
         match cursor.shape {
@@ -381,6 +426,40 @@ fn paint(ui: &Ui, t: &Terminal, rect: Rect, grid: &Grid, font: &FontId, focused:
             }
             _ => {
                 painter.rect_stroke(rect, 0.0, Stroke::new(1.0, cursor_color), StrokeKind::Inside);
+            }
+        }
+    }
+}
+
+/// Draws a highlight over every occurrence of the find query on each visible row.
+fn paint_search(
+    painter: &egui::Painter,
+    grid: &Grid,
+    row_chars: &[Vec<(usize, char)>],
+    query: &SearchQuery,
+) {
+    let needle = if query.case_sensitive { query.needle.clone() } else { query.needle.to_lowercase() };
+    for (row, cells) in row_chars.iter().enumerate() {
+        let text: String = cells.iter().map(|(_, c)| *c).collect();
+        let hay = if query.case_sensitive { text.clone() } else { text.to_lowercase() };
+        let chars: Vec<char> = hay.chars().collect();
+        let needle_chars: Vec<char> = needle.chars().collect();
+        // Skip rows where lowercasing changed the char count (column mapping
+        // would be off); matching stays correct for the common ASCII case.
+        if needle_chars.is_empty() || chars.len() != cells.len() || chars.len() < needle_chars.len()
+        {
+            continue;
+        }
+        let mut i = 0;
+        while i + needle_chars.len() <= chars.len() {
+            if chars[i..i + needle_chars.len()] == needle_chars[..] {
+                let start_col = cells[i].0;
+                let end_col = cells[i + needle_chars.len() - 1].0;
+                let rect = grid.cell_rect(row as i32, start_col, end_col - start_col + 1);
+                painter.rect_filled(rect, 2.0, SEARCH_HIGHLIGHT);
+                i += needle_chars.len();
+            } else {
+                i += 1;
             }
         }
     }
