@@ -200,11 +200,23 @@ impl Terminal {
 
     /// The visible screen as plain text, one line per row, trailing spaces trimmed.
     pub fn screen_text(&self) -> String {
+        self.text_range(0)
+    }
+
+    /// The scrollback history plus the visible screen, as plain text.
+    pub fn full_text(&self) -> String {
+        let history = self.term.grid().history_size() as i32;
+        self.text_range(history)
+    }
+
+    /// Grid rows from `history` lines above the screen top through the last
+    /// visible row, as plain text (trailing spaces trimmed per line).
+    fn text_range(&self, history: i32) -> String {
         let grid = self.term.grid();
-        let lines: Vec<String> = (0..grid.screen_lines())
+        let lines: Vec<String> = (-history..grid.screen_lines() as i32)
             .map(|row| {
                 let line: String = (0..grid.columns())
-                    .map(|col| &grid[Line(row as i32)][Column(col)])
+                    .map(|col| &grid[Line(row)][Column(col)])
                     .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
                     .map(|cell| cell.c)
                     .collect();

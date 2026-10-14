@@ -39,6 +39,26 @@ struct Tab {
     files: Option<FileBrowser>,
     /// Whether the file panel is shown.
     show_files: bool,
+    /// How to restart this tab's session once it ends. SSH/serial tabs stay open
+    /// when their session closes; local shells auto-close.
+    restart: Option<RestartKind>,
+}
+
+/// How a terminal tab's session can be restarted after it ends.
+enum RestartKind {
+    /// A local shell — auto-closes rather than lingering.
+    Shell,
+    /// An SSH session; reconnect with these parameters.
+    Ssh(Box<ConnectParams>),
+    /// A serial connection; reopen this port.
+    Serial(Box<SerialConfig>),
+}
+
+impl RestartKind {
+    /// Whether an ended tab of this kind should stay open (vs. auto-close).
+    fn keep_open(&self) -> bool {
+        !matches!(self, RestartKind::Shell)
+    }
 }
 
 enum TabContent {
@@ -591,6 +611,9 @@ impl App {
                 let terminal = Terminal::new(Box::new(pty), output, size);
                 let panes = Panes::new(Box::new(terminal));
                 self.push_tab("Shell", TabContent::Terminal(Box::new(panes)), None);
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.restart = Some(RestartKind::Shell);
+                }
             }
             Err(e) => self.error = Some(format!("Could not start a shell: {e:#}")),
         }
@@ -659,7 +682,8 @@ impl App {
         force_adjacent: bool,
     ) {
         let id = self.new_tab_id();
-        let tab = Tab { id, label: label.into(), content, show_files: files.is_some(), files };
+        let tab =
+            Tab { id, label: label.into(), content, show_files: files.is_some(), files, restart: None };
         let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
         let index = if adjacent && !self.tabs.is_empty() {
             (self.active + 1).min(self.tabs.len())
@@ -832,11 +856,13 @@ impl App {
                 Progress::Ready(Connected { backend, output }) => {
                     // Grab an SFTP handle before the backend is boxed into the terminal.
                     let files = FileBrowser::new(backend.sftp());
+                    let params = c.params.clone();
                     let term = Terminal::new(Box::new(backend), output, TermSize::default());
                     let tab = &mut self.tabs[index];
                     tab.content = TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
                     tab.show_files = false;
                     tab.files = Some(files);
+                    tab.restart = Some(RestartKind::Ssh(Box::new(params)));
                 }
                 Progress::Failed(message) => {
                     c.pending = None;
@@ -1891,6 +1917,10 @@ impl App {
                 self.render_settings(ui);
                 return;
             }
+            Some(TabContent::Terminal(panes)) if panes.all_exited() => {
+                self.render_ended_tab(ui);
+                return;
+            }
             _ => {}
         }
 
@@ -1945,6 +1975,132 @@ impl App {
                     });
                 }
             }
+        }
+    }
+
+    /// Shows the "session ended" banner for a terminal tab whose session closed,
+    /// with its frozen output below and Restart / Save / Close actions.
+    fn render_ended_tab(&mut self, ui: &mut egui::Ui) {
+        enum EndAct {
+            Restart,
+            Save,
+            Close,
+        }
+        let active = self.active;
+        let label = self.tabs.get(active).map(|t| t.label.clone()).unwrap_or_default();
+        let can_restart = self.tabs.get(active).and_then(|t| t.restart.as_ref()).is_some();
+        let mut act = None;
+        egui::Panel::top("ended-banner").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("● {label} — session ended"))
+                        .color(ui.visuals().warn_fg_color),
+                );
+                if ui
+                    .add_enabled(can_restart, egui::Button::new("Restart"))
+                    .on_hover_text("Reconnect / reopen this session")
+                    .clicked()
+                {
+                    act = Some(EndAct::Restart);
+                }
+                if ui.button("Save output…").clicked() {
+                    act = Some(EndAct::Save);
+                }
+                if ui.button("Close").clicked() {
+                    act = Some(EndAct::Close);
+                }
+            });
+            ui.add_space(4.0);
+        });
+        // The frozen terminal, read-only.
+        if let Some(tab) = self.tabs.get_mut(active)
+            && let TabContent::Terminal(panes) = &mut tab.content
+        {
+            panes.show(ui, false, false);
+        }
+        match act {
+            Some(EndAct::Restart) => {
+                let ctx = ui.ctx().clone();
+                self.restart_tab(active, &ctx);
+            }
+            Some(EndAct::Save) => self.save_tab_output(active),
+            Some(EndAct::Close) => self.close_tab(active),
+            None => {}
+        }
+    }
+
+    /// Restarts an ended tab's session in place, from its recorded origin.
+    fn restart_tab(&mut self, index: usize, ctx: &egui::Context) {
+        enum What {
+            Shell,
+            Ssh(Box<ConnectParams>),
+            Serial(Box<SerialConfig>),
+        }
+        let what = match self.tabs.get(index).and_then(|t| t.restart.as_ref()) {
+            Some(RestartKind::Shell) => What::Shell,
+            Some(RestartKind::Ssh(p)) => What::Ssh(p.clone()),
+            Some(RestartKind::Serial(c)) => What::Serial(c.clone()),
+            None => return,
+        };
+        let size = TermSize::default();
+        match what {
+            What::Shell => {
+                let repaint = ctx.clone();
+                match LocalPty::spawn(size, move || repaint.request_repaint()) {
+                    Ok((pty, output)) => {
+                        let term = Terminal::new(Box::new(pty), output, size);
+                        self.tabs[index].content =
+                            TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
+                    }
+                    Err(e) => self.error = Some(format!("Could not start a shell: {e:#}")),
+                }
+            }
+            What::Serial(config) => {
+                let repaint = ctx.clone();
+                match SerialBackend::open(&config, move || repaint.request_repaint()) {
+                    Ok((backend, output)) => {
+                        let term = Terminal::new(Box::new(backend), output, size);
+                        self.tabs[index].content =
+                            TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
+                    }
+                    Err(e) => self.error = Some(format!("Could not reopen the serial port: {e:#}")),
+                }
+            }
+            What::Ssh(params) => {
+                // Turn the tab back into a connecting tab; poll_connections will
+                // re-establish the terminal (and re-arm restart) on success.
+                let title = self.tabs[index].label.clone();
+                let pending = PendingConnect::spawn((*params).clone(), ctx);
+                let tab = &mut self.tabs[index];
+                tab.content = TabContent::Connecting(Box::new(Connecting {
+                    params: *params,
+                    title,
+                    pending: Some(pending),
+                    log: Vec::new(),
+                    status: "Reconnecting…".into(),
+                    error: None,
+                }));
+                tab.files = None;
+                tab.show_files = false;
+            }
+        }
+    }
+
+    /// Saves the focused terminal's scrollback + screen to a chosen file.
+    fn save_tab_output(&mut self, index: usize) {
+        let text = match self.tabs.get(index).map(|t| &t.content) {
+            Some(TabContent::Terminal(panes)) => {
+                panes.get(panes.focused_id()).map(|t| t.full_text())
+            }
+            _ => None,
+        };
+        let Some(text) = text else { return };
+        if let Some(path) =
+            rfd::FileDialog::new().set_file_name("terminal-output.txt").save_file()
+            && let Err(e) = std::fs::write(&path, text)
+        {
+            self.error = Some(format!("Could not save output: {e}"));
         }
     }
 
@@ -2918,6 +3074,9 @@ impl App {
                 self.dialog = Dialog::None;
                 let panes = Panes::new(Box::new(term));
                 self.push_tab(label, TabContent::Terminal(Box::new(panes)), None);
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.restart = Some(RestartKind::Serial(Box::new(config)));
+                }
             }
             Err(e) => self.set_serial_error(&format!("{e:#}")),
         }
@@ -4565,15 +4724,19 @@ impl eframe::App for App {
             ctx.request_repaint_after(SYNC_EVERY);
         }
 
-        // Drop individual panes whose shell exited, then tabs that emptied out
-        // (connecting tabs stay).
+        // Drop individual panes whose shell exited. Leave a fully-exited tab's
+        // panes in place so an SSH/serial tab can show its "ended" banner and
+        // still save its buffer; local shells are auto-closed below.
         for tab in &mut self.tabs {
-            if let TabContent::Terminal(panes) = &mut tab.content {
+            if let TabContent::Terminal(panes) = &mut tab.content
+                && !panes.all_exited()
+            {
                 panes.prune();
             }
         }
         let before = self.tabs.len();
-        self.tabs.retain(|t| !t.is_dead());
+        self.tabs
+            .retain(|t| !t.is_dead() || t.restart.as_ref().is_some_and(RestartKind::keep_open));
         if self.tabs.len() != before {
             self.active = self.active.min(self.tabs.len().saturating_sub(1));
         }
