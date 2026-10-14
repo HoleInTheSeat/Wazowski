@@ -18,6 +18,7 @@ use wazowski_term::{
 use crate::connect::{Connected, PendingConnect, Progress};
 use crate::keybinds::{Action, Keymap};
 use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
+use crate::network::{self, HostHit, LocalPort, PortHit, ScanHandle};
 use crate::panes::{Home, PaneAction, Panes, SplitDir, SwapTarget};
 use crate::settings::{NewTabPlacement, Settings, StartupTab};
 use crate::sftp_ui::FileBrowser;
@@ -73,8 +74,54 @@ enum TabContent {
     Servers,
     /// The global settings page (singleton).
     Settings,
+    /// The network toolbox (singleton).
+    Network,
     /// This tab's session has been moved into a split pane on another tab.
     Detached { host_tab: u64 },
+}
+
+/// Mode for the port scanner: curated common ports or a user spec.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PortMode {
+    Common,
+    Custom,
+}
+
+/// State for the network toolbox tab.
+struct NetworkState {
+    port_target: String,
+    port_mode: PortMode,
+    port_spec: String,
+    port_scan: Option<ScanHandle<PortHit>>,
+    port_open: Vec<(u16, &'static str)>,
+    port_error: Option<String>,
+    subnet_cidr: String,
+    subnet_scan: Option<ScanHandle<HostHit>>,
+    subnet_hosts: Vec<HostHit>,
+    subnet_error: Option<String>,
+    local_ports: Option<Vec<LocalPort>>,
+    wol_mac: String,
+    wol_status: Option<String>,
+}
+
+impl Default for NetworkState {
+    fn default() -> Self {
+        Self {
+            port_target: String::new(),
+            port_mode: PortMode::Common,
+            port_spec: "1-1024".into(),
+            port_scan: None,
+            port_open: Vec::new(),
+            port_error: None,
+            subnet_cidr: String::new(),
+            subnet_scan: None,
+            subnet_hosts: Vec::new(),
+            subnet_error: None,
+            local_ports: None,
+            wol_mac: String::new(),
+            wol_status: None,
+        }
+    }
 }
 
 /// A split-pane action requested from the tab strip, applied after the UI pass.
@@ -105,6 +152,7 @@ impl Tab {
             TabContent::Connecting(_)
             | TabContent::Servers
             | TabContent::Settings
+            | TabContent::Network
             | TabContent::Detached { .. } => false,
         }
     }
@@ -473,6 +521,8 @@ pub struct App {
     find: Option<FindState>,
     /// Which list the left pane is showing.
     sidebar_view: SidebarView,
+    /// The network toolbox state.
+    network: NetworkState,
 }
 
 /// The left-pane view selector.
@@ -619,6 +669,7 @@ impl App {
             _instance_lock: instance_lock,
             find: None,
             sidebar_view: SidebarView::Sessions,
+            network: NetworkState::default(),
         };
         app.open_startup_tab(ctx);
         app
@@ -779,6 +830,15 @@ impl App {
             self.active = i;
         } else {
             self.push_tab("Settings", TabContent::Settings, None);
+        }
+    }
+
+    /// Opens (or focuses) the singleton Network toolbox tab.
+    fn open_network_tab(&mut self) {
+        if let Some(i) = self.tabs.iter().position(|t| matches!(t.content, TabContent::Network)) {
+            self.active = i;
+        } else {
+            self.push_tab("Network", TabContent::Network, None);
         }
     }
 
@@ -1314,6 +1374,9 @@ impl App {
             ui.menu_button("Tools", |ui| {
                 if ui.button("Quick servers").clicked() {
                     self.open_servers_tab();
+                }
+                if ui.button("Network scanner").clicked() {
+                    self.open_network_tab();
                 }
                 ui.separator();
                 if ui.button("Keybindings…").clicked() {
@@ -2116,6 +2179,7 @@ impl App {
                         TabContent::Terminal(_) => name,
                         TabContent::Servers => format!("🖧 {name}"),
                         TabContent::Settings => format!("⚙ {name}"),
+                        TabContent::Network => format!("🖧 {name}"),
                         TabContent::Detached { .. } => format!("⇄ {name}"),
                     };
                     if ui.selectable_label(i == self.active, label).clicked() {
@@ -2191,6 +2255,10 @@ impl App {
                 self.render_settings(ui);
                 return;
             }
+            Some(TabContent::Network) => {
+                self.render_network(ui);
+                return;
+            }
             Some(TabContent::Terminal(panes)) if panes.all_exited() => {
                 self.render_ended_tab(ui);
                 return;
@@ -2251,7 +2319,10 @@ impl App {
                         retry = Some(action);
                     }
                 }
-                TabContent::Servers | TabContent::Settings | TabContent::Detached { .. } => {}
+                TabContent::Servers
+                | TabContent::Settings
+                | TabContent::Network
+                | TabContent::Detached { .. } => {}
             },
             None => {
                 ui.vertical_centered(|ui| {
@@ -2545,6 +2616,251 @@ impl App {
             && let Err(e) = std::fs::write(&path, text)
         {
             self.error = Some(format!("Could not save output: {e}"));
+        }
+    }
+
+    fn start_port_scan(&mut self) {
+        let n = &mut self.network;
+        n.port_open.clear();
+        n.port_error = None;
+        let Some(ip) = network::resolve(n.port_target.trim()) else {
+            n.port_error = Some("Enter a valid IP address or hostname.".into());
+            return;
+        };
+        let ports: Vec<u16> = match n.port_mode {
+            PortMode::Common => network::COMMON_PORTS.iter().map(|(p, _)| *p).collect(),
+            PortMode::Custom => network::parse_ports(&n.port_spec),
+        };
+        if ports.is_empty() {
+            n.port_error = Some("No ports to scan — check the list/range.".into());
+            return;
+        }
+        n.port_scan = Some(network::scan_ports(ip, ports, std::time::Duration::from_millis(400)));
+    }
+
+    fn start_subnet_scan(&mut self) {
+        let n = &mut self.network;
+        n.subnet_hosts.clear();
+        n.subnet_error = None;
+        let Some(hosts) = network::parse_cidr(n.subnet_cidr.trim()) else {
+            n.subnet_error = Some("Enter a CIDR like 10.0.0.0/24 (≤ /16).".into());
+            return;
+        };
+        n.subnet_scan = Some(network::scan_subnet(hosts, std::time::Duration::from_millis(300)));
+    }
+
+    /// The network toolbox: port scan, subnet scan, local ports, Wake-on-LAN.
+    fn render_network(&mut self, ui: &mut egui::Ui) {
+        // Drain streaming scan results (take the handle out to avoid a borrow clash).
+        if let Some(h) = self.network.port_scan.take() {
+            for hit in h.drain() {
+                self.network.port_open.push((hit.port, hit.service));
+            }
+            if h.running() {
+                self.network.port_scan = Some(h);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+            } else {
+                self.network.port_open.sort_unstable();
+                self.network.port_open.dedup();
+            }
+        }
+        if let Some(h) = self.network.subnet_scan.take() {
+            for hit in h.drain() {
+                self.network.subnet_hosts.push(hit);
+            }
+            if h.running() {
+                self.network.subnet_scan = Some(h);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            } else {
+                self.network.subnet_hosts.sort_by_key(|h| u32::from(h.ip));
+            }
+        }
+
+        let mut start_port = false;
+        let mut start_subnet = false;
+        let mut scan_host: Option<String> = None;
+        let mut refresh_local = false;
+        let mut send_wol = false;
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.heading("Network toolbox");
+            ui.separator();
+
+            // --- Port scanner ---
+            ui.strong("Port scan");
+            ui.horizontal(|ui| {
+                ui.label("Host:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.network.port_target)
+                        .hint_text("IP or hostname")
+                        .desired_width(180.0),
+                );
+                ui.radio_value(&mut self.network.port_mode, PortMode::Common, "Common");
+                ui.radio_value(&mut self.network.port_mode, PortMode::Custom, "Ports:");
+                ui.add_enabled(
+                    self.network.port_mode == PortMode::Custom,
+                    egui::TextEdit::singleline(&mut self.network.port_spec)
+                        .hint_text("22,80,443 or 1-1024")
+                        .desired_width(140.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                let scanning = self.network.port_scan.is_some();
+                if ui.add_enabled(!scanning, egui::Button::new("Scan")).clicked() {
+                    start_port = true;
+                }
+                if scanning {
+                    ui.spinner();
+                    if ui.button("Stop").clicked()
+                        && let Some(h) = &self.network.port_scan
+                    {
+                        h.cancel();
+                    }
+                }
+                if let Some(e) = &self.network.port_error {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
+            });
+            if !self.network.port_open.is_empty() {
+                let list = self
+                    .network
+                    .port_open
+                    .iter()
+                    .map(|(p, s)| if s.is_empty() { p.to_string() } else { format!("{p} ({s})") })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.label(format!("Open: {list}"));
+            } else if self.network.port_scan.is_none() && !self.network.port_target.is_empty() {
+                ui.label(RichText::new("No open ports found (or not scanned yet).").weak());
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+
+            // --- Subnet scanner ---
+            ui.strong("Subnet scan");
+            ui.horizontal(|ui| {
+                ui.label("Subnet:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.network.subnet_cidr)
+                        .hint_text("10.0.0.0/24")
+                        .desired_width(180.0),
+                );
+                let scanning = self.network.subnet_scan.is_some();
+                if ui.add_enabled(!scanning, egui::Button::new("Ping sweep")).clicked() {
+                    start_subnet = true;
+                }
+                if scanning {
+                    ui.spinner();
+                    if ui.button("Stop").clicked()
+                        && let Some(h) = &self.network.subnet_scan
+                    {
+                        h.cancel();
+                    }
+                }
+            });
+            if let Some(e) = &self.network.subnet_error {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            for host in &self.network.subnet_hosts {
+                ui.horizontal(|ui| {
+                    let dot = if host.pingable { "🟢" } else { "⚪" };
+                    ui.label(format!("{dot} {}", host.ip));
+                    let svc = host
+                        .services
+                        .iter()
+                        .map(|(_, s)| *s)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if !svc.is_empty() {
+                        ui.label(RichText::new(svc).weak());
+                    }
+                    if ui.small_button("Port scan").clicked() {
+                        scan_host = Some(host.ip.to_string());
+                    }
+                });
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+
+            // --- Local listening ports ---
+            ui.horizontal(|ui| {
+                ui.strong("Local listening ports");
+                if ui.button("Refresh").clicked() {
+                    refresh_local = true;
+                }
+            });
+            match &self.network.local_ports {
+                None => {
+                    ui.label(RichText::new("Click Refresh to list this host's open ports.").weak());
+                }
+                Some(ports) if ports.is_empty() => {
+                    ui.label(RichText::new("No listening ports found.").weak());
+                }
+                Some(ports) => {
+                    egui::Grid::new("local-ports").num_columns(3).striped(true).show(ui, |ui| {
+                        ui.label(RichText::new("Proto").strong());
+                        ui.label(RichText::new("Address").strong());
+                        ui.label(RichText::new("Process").strong());
+                        ui.end_row();
+                        for p in ports {
+                            ui.label(&p.proto);
+                            ui.label(&p.address);
+                            ui.label(&p.process);
+                            ui.end_row();
+                        }
+                    });
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+
+            // --- Wake-on-LAN ---
+            ui.strong("Wake-on-LAN");
+            ui.horizontal(|ui| {
+                ui.label("MAC:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.network.wol_mac)
+                        .hint_text("AA:BB:CC:DD:EE:FF")
+                        .desired_width(180.0),
+                );
+                if ui.button("Send magic packet").clicked() {
+                    send_wol = true;
+                }
+            });
+            if let Some(s) = &self.network.wol_status {
+                ui.label(RichText::new(s).weak());
+            }
+        });
+
+        if start_port {
+            self.start_port_scan();
+        }
+        if start_subnet {
+            self.start_subnet_scan();
+        }
+        if let Some(ip) = scan_host {
+            self.network.port_target = ip;
+            self.network.port_mode = PortMode::Common;
+            self.start_port_scan();
+        }
+        if refresh_local {
+            match network::local_listening_ports() {
+                Ok(ports) => self.network.local_ports = Some(ports),
+                Err(e) => self.error = Some(e),
+            }
+        }
+        if send_wol {
+            self.network.wol_status = Some(match network::parse_mac(&self.network.wol_mac) {
+                Some(mac) => match network::send_wol(mac) {
+                    Ok(()) => "Magic packet sent.".into(),
+                    Err(e) => format!("Failed: {e}"),
+                },
+                None => "Enter a valid MAC address.".into(),
+            });
         }
     }
 

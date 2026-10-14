@@ -6,6 +6,7 @@ mod connect;
 mod git;
 mod keybinds;
 mod macros;
+mod network;
 mod panes;
 mod settings;
 mod sftp_ui;
