@@ -12,10 +12,11 @@ use wazowski_ssh::{
 };
 use wazowski_term::{
     COMMON_BAUDS, LocalPty, SerialBackend, SerialConfig, SerialFlow, SerialParity, TermSize,
-    Terminal, TerminalView, available_ports,
+    Terminal, available_ports,
 };
 
 use crate::connect::{Connected, PendingConnect, Progress};
+use crate::panes::{Panes, SplitDir};
 use crate::sftp_ui::FileBrowser;
 use crate::servers_ui::{ServerEntry, ServerForm, ServersStore};
 use crate::sources::{
@@ -46,10 +47,16 @@ struct Tab {
 enum TabContent {
     /// A connection is being established; shows a live, copyable log.
     Connecting(Box<Connecting>),
-    /// A working terminal.
-    Terminal(Box<Terminal>),
+    /// One or more working terminals, arranged as a splittable layout.
+    Terminal(Box<Panes>),
     /// The quick-servers manager (singleton).
     Servers,
+}
+
+/// A split-pane action requested from the tab strip, applied after the UI pass.
+enum PaneAction {
+    Split(SplitDir),
+    Close,
 }
 
 /// State of a connecting tab.
@@ -70,7 +77,7 @@ impl Tab {
     /// Whether this tab should be dropped automatically (its terminal ended).
     fn is_dead(&self) -> bool {
         match &self.content {
-            TabContent::Terminal(t) => t.has_exited(),
+            TabContent::Terminal(p) => p.all_exited(),
             TabContent::Connecting(_) | TabContent::Servers => false,
         }
     }
@@ -475,9 +482,37 @@ impl App {
         match LocalPty::spawn(size, move || ctx.request_repaint()) {
             Ok((pty, output)) => {
                 let terminal = Terminal::new(Box::new(pty), output, size);
-                self.push_tab("Shell", TabContent::Terminal(Box::new(terminal)), None);
+                let panes = Panes::new(Box::new(terminal));
+                self.push_tab("Shell", TabContent::Terminal(Box::new(panes)), None);
             }
             Err(e) => self.error = Some(format!("Could not start a shell: {e:#}")),
+        }
+    }
+
+    /// Splits the active tab's focused pane, opening a local shell beside it.
+    fn split_active_pane(&mut self, dir: SplitDir, ctx: &egui::Context) {
+        let size = TermSize::default();
+        let ctx = ctx.clone();
+        let term = match LocalPty::spawn(size, move || ctx.request_repaint()) {
+            Ok((pty, output)) => Terminal::new(Box::new(pty), output, size),
+            Err(e) => {
+                self.error = Some(format!("Could not start a shell: {e:#}"));
+                return;
+            }
+        };
+        if let Some(tab) = self.tabs.get_mut(self.active)
+            && let TabContent::Terminal(panes) = &mut tab.content
+        {
+            panes.split(dir, Box::new(term));
+        }
+    }
+
+    /// Closes the active tab's focused pane (no effect if it's the only one).
+    fn close_active_pane(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active)
+            && let TabContent::Terminal(panes) = &mut tab.content
+        {
+            panes.close_focused();
         }
     }
 
@@ -657,7 +692,7 @@ impl App {
                     let files = FileBrowser::new(backend.sftp());
                     let term = Terminal::new(Box::new(backend), output, TermSize::default());
                     let tab = &mut self.tabs[index];
-                    tab.content = TabContent::Terminal(Box::new(term));
+                    tab.content = TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
                     tab.show_files = false;
                     tab.files = Some(files);
                 }
@@ -1417,6 +1452,7 @@ impl App {
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         let mut close = None;
         let mut toggle_files = None;
+        let mut pane_action: Option<PaneAction> = None;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, tab) in self.tabs.iter().enumerate() {
@@ -1440,6 +1476,23 @@ impl App {
                 }
                 ui.toggle_value(&mut self.broadcast, "⇉ Broadcast")
                     .on_hover_text("Multi-exec: send typing to every terminal at once");
+                // Split-pane controls, for the active terminal tab.
+                if let Some(tab) = self.tabs.get(self.active)
+                    && let TabContent::Terminal(panes) = &tab.content
+                {
+                    ui.separator();
+                    if ui.button("⇥").on_hover_text("Split pane right").clicked() {
+                        pane_action = Some(PaneAction::Split(SplitDir::Horizontal));
+                    }
+                    if ui.button("⤓").on_hover_text("Split pane down").clicked() {
+                        pane_action = Some(PaneAction::Split(SplitDir::Vertical));
+                    }
+                    if panes.count() > 1
+                        && ui.button("⊟").on_hover_text("Close focused pane").clicked()
+                    {
+                        pane_action = Some(PaneAction::Close);
+                    }
+                }
                 // A toggle for the SFTP panel, for the active SSH tab.
                 if let Some(tab) = self.tabs.get(self.active)
                     && tab.files.is_some()
@@ -1458,6 +1511,11 @@ impl App {
         {
             tab.show_files = show;
         }
+        match pane_action {
+            Some(PaneAction::Split(dir)) => self.split_active_pane(dir, ui.ctx()),
+            Some(PaneAction::Close) => self.close_active_pane(),
+            None => {}
+        }
         if let Some(i) = close {
             self.close_tab(i);
         }
@@ -1475,18 +1533,13 @@ impl App {
         let interactive = matches!(self.dialog, Dialog::None);
         // Collect retry/copy actions to apply after the borrow ends.
         let mut retry = None;
-        // Multi-exec: bytes typed into the active terminal, to mirror elsewhere.
-        let mut broadcast_bytes: Vec<u8> = Vec::new();
         let active = self.active;
         let broadcast = self.broadcast;
+        let mut broadcast_src: Option<(u64, Vec<u8>)> = None;
         match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
-                TabContent::Terminal(terminal) => {
-                    TerminalView::new(terminal).interactive(interactive).show(ui);
-                    let typed = terminal.take_broadcast();
-                    if broadcast {
-                        broadcast_bytes = typed;
-                    }
+                TabContent::Terminal(panes) => {
+                    broadcast_src = panes.show(ui, interactive, broadcast);
                 }
                 TabContent::Connecting(c) => {
                     if let Some(action) = connecting_view(ui, c, tab.id) {
@@ -1512,13 +1565,19 @@ impl App {
             let ctx = ui.ctx().clone();
             self.retry_tab(tab_id, &ctx);
         }
-        // Mirror the active terminal's input to every other terminal.
-        if !broadcast_bytes.is_empty() {
-            for (i, tab) in self.tabs.iter_mut().enumerate() {
-                if i != active
-                    && let TabContent::Terminal(t) = &mut tab.content
-                {
-                    t.write(&broadcast_bytes);
+        // Multi-exec: mirror the focused pane's input to every other terminal
+        // that isn't the source and hasn't been excluded from broadcast.
+        if broadcast
+            && let Some((src_id, bytes)) = broadcast_src
+            && !bytes.is_empty()
+        {
+            for tab in self.tabs.iter_mut() {
+                if let TabContent::Terminal(panes) = &mut tab.content {
+                    panes.for_each(|t| {
+                        if t.id() != src_id && !t.broadcast_excluded() {
+                            t.write(&bytes);
+                        }
+                    });
                 }
             }
         }
@@ -1968,7 +2027,8 @@ impl App {
             Ok((backend, output)) => {
                 let term = Terminal::new(Box::new(backend), output, size);
                 self.dialog = Dialog::None;
-                self.push_tab(label, TabContent::Terminal(Box::new(term)), None);
+                let panes = Panes::new(Box::new(term));
+                self.push_tab(label, TabContent::Terminal(Box::new(panes)), None);
             }
             Err(e) => self.set_serial_error(&format!("{e:#}")),
         }
@@ -3585,7 +3645,13 @@ impl eframe::App for App {
             ctx.request_repaint_after(SYNC_EVERY);
         }
 
-        // Drop tabs whose shells/sessions have ended (connecting tabs stay).
+        // Drop individual panes whose shell exited, then tabs that emptied out
+        // (connecting tabs stay).
+        for tab in &mut self.tabs {
+            if let TabContent::Terminal(panes) = &mut tab.content {
+                panes.prune();
+            }
+        }
         let before = self.tabs.len();
         self.tabs.retain(|t| !t.is_dead());
         if self.tabs.len() != before {

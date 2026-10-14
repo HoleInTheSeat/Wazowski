@@ -4,6 +4,7 @@ mod app;
 mod conn_log;
 mod connect;
 mod git;
+mod panes;
 mod sftp_ui;
 mod sources;
 mod servers_ui;

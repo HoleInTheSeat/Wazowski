@@ -32,6 +32,8 @@ pub struct Terminal {
     pub(crate) paste_requested: bool,
     /// User input recorded since the last drain, for multi-exec broadcast.
     broadcast_buf: Vec<u8>,
+    /// When set, this terminal is skipped while multi-exec broadcast is on.
+    exclude_broadcast: bool,
 }
 
 #[derive(Clone)]
@@ -77,12 +79,22 @@ impl Terminal {
             exited: false,
             scroll_remainder: 0.0,
             broadcast_buf: Vec::new(),
+            exclude_broadcast: false,
             paste_requested: false,
         }
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Whether this terminal is currently excluded from multi-exec broadcast.
+    pub fn broadcast_excluded(&self) -> bool {
+        self.exclude_broadcast
+    }
+
+    pub fn set_broadcast_excluded(&mut self, excluded: bool) {
+        self.exclude_broadcast = excluded;
     }
 
     /// Window title set by the running program, e.g. `user@host:~`.
