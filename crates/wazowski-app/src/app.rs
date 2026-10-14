@@ -17,6 +17,7 @@ use wazowski_term::{
 
 use crate::connect::{Connected, PendingConnect, Progress};
 use crate::keybinds::{Action, Keymap};
+use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
 use crate::panes::{Panes, SplitDir};
 use crate::sftp_ui::FileBrowser;
 use crate::servers_ui::{ServerEntry, ServerForm, ServersStore};
@@ -136,6 +137,21 @@ enum Dialog {
     DropMenu { payload: DragPayload, to: StoreId, folder: String },
     /// The keybindings editor. `capturing` is the action awaiting a new key.
     Keybindings { capturing: Option<Action> },
+    /// The list of macros, with per-macro run/edit/delete.
+    MacroManager,
+    /// The macro editor (new or existing).
+    MacroEdit(MacroForm),
+    /// Confirm running a macro, showing its steps and where they go.
+    ConfirmMacro { index: usize, target: MacroTarget },
+}
+
+/// Fields for the macro editor dialog.
+struct MacroForm {
+    /// Index in the store if editing an existing macro; `None` for a new one.
+    index: Option<usize>,
+    name: String,
+    steps: Vec<Step>,
+    error: Option<String>,
 }
 
 /// Fields for the "Add shared source" dialog (folder or git).
@@ -391,6 +407,54 @@ pub struct App {
     broadcast: bool,
     /// Configurable keyboard shortcuts.
     keymap: Keymap,
+    /// User-defined macros.
+    macros: MacroStore,
+    /// The macro currently playing, if any.
+    macro_run: Option<MacroRun>,
+}
+
+/// Where a macro's steps are sent.
+#[derive(Clone, Copy, PartialEq)]
+enum MacroTarget {
+    /// The focused pane of the active tab.
+    ActivePane,
+    /// Every pane in the active tab.
+    TabPanes,
+    /// Every open terminal.
+    AllTerminals,
+}
+
+impl MacroTarget {
+    fn describe(self, count: usize) -> String {
+        match self {
+            MacroTarget::ActivePane => "the active terminal".to_owned(),
+            MacroTarget::TabPanes => format!("all panes in this tab ({count})"),
+            MacroTarget::AllTerminals => format!("all open terminals ({count})"),
+        }
+    }
+}
+
+/// A macro being played, advanced one phase at a time from `update`.
+struct MacroRun {
+    name: String,
+    steps: Vec<Step>,
+    index: usize,
+    /// Terminals the steps are sent to.
+    target_ids: Vec<u64>,
+    /// Terminal watched by `Expect` steps.
+    primary: u64,
+    phase: RunPhase,
+}
+
+/// What a running macro is doing between steps.
+#[derive(Clone)]
+enum RunPhase {
+    /// Ready to run `steps[index]`.
+    Send,
+    /// Pausing until this instant (a Delay step).
+    Waiting { until: std::time::Instant },
+    /// Waiting for `text` to appear, or the deadline to pass (an Expect step).
+    Expecting { text: String, deadline: std::time::Instant },
 }
 
 /// A privileged helper command running via a worker thread.
@@ -447,6 +511,8 @@ impl App {
         let keymap = Keymap::default_path()
             .and_then(Keymap::load)
             .unwrap_or_else(|_| Keymap::defaults());
+        let macros =
+            MacroStore::default_path().and_then(MacroStore::load).unwrap_or_else(|_| MacroStore::empty());
 
         let mut app = Self {
             tabs: Vec::new(),
@@ -467,6 +533,8 @@ impl App {
             admin_task: None,
             broadcast: false,
             keymap,
+            macros,
+            macro_run: None,
         };
         app.open_local_shell(ctx);
         app
@@ -950,14 +1018,16 @@ impl App {
         self.macro_shortcut(ctx);
     }
 
-    /// Consumes the Run-macro shortcut. Filled in by the macros feature; for now
-    /// it just swallows the key so it doesn't reach the focused terminal.
+    /// Opens the macro manager when the Run-macro shortcut is pressed.
     fn macro_shortcut(&mut self, ctx: &egui::Context) {
         let sc = self.keymap.get(Action::RunMacro);
-        let _ = ctx.input_mut(|i| i.consume_shortcut(&sc));
+        if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
+            self.dialog = Dialog::MacroManager;
+        }
     }
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        let mut run_macro = None;
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Terminal", |ui| {
                 if shortcut_button(ui, "New local shell", &self.keymap.get(Action::NewShell)) {
@@ -981,6 +1051,20 @@ impl App {
                 ui.separator();
                 if ui.button("Add shared source…").clicked() {
                     self.dialog = Dialog::AddSource(AddSourceForm::default());
+                }
+            });
+            ui.menu_button("Macros", |ui| {
+                if self.macros.macros.is_empty() {
+                    ui.label(RichText::new("No macros yet").weak());
+                }
+                for (i, m) in self.macros.macros.iter().enumerate() {
+                    if ui.button(&m.name).on_hover_text("Run on the active terminal").clicked() {
+                        run_macro = Some(i);
+                    }
+                }
+                ui.separator();
+                if shortcut_button(ui, "Manage macros…", &self.keymap.get(Action::RunMacro)) {
+                    self.dialog = Dialog::MacroManager;
                 }
             });
             ui.menu_button("Tools", |ui| {
@@ -1034,6 +1118,9 @@ impl App {
                 }
             });
         });
+        if let Some(i) = run_macro {
+            self.dialog = Dialog::ConfirmMacro { index: i, target: MacroTarget::ActivePane };
+        }
     }
 
     /// Copies the vault file to a user-chosen location.
@@ -1743,6 +1830,9 @@ impl App {
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
             Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
             Dialog::Keybindings { .. } => self.show_keybindings(ctx),
+            Dialog::MacroManager => self.show_macro_manager(ctx),
+            Dialog::MacroEdit(_) => self.show_macro_edit(ctx),
+            Dialog::ConfirmMacro { .. } => self.show_confirm_macro(ctx),
         }
     }
 
@@ -1830,6 +1920,407 @@ impl App {
             self.dialog = Dialog::None;
         } else if let Dialog::Keybindings { capturing: c } = &mut self.dialog {
             *c = capturing;
+        }
+    }
+
+    // --- Macros -------------------------------------------------------------
+
+    /// The list of macros: click one to run it on the active terminal, or
+    /// right-click for other targets and editing.
+    fn show_macro_manager(&mut self, ctx: &egui::Context) {
+        enum Act {
+            Run(usize, MacroTarget),
+            Edit(usize),
+            Duplicate(usize),
+            Delete(usize),
+            New,
+        }
+        let mut act = None;
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Macros")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if self.macros.macros.is_empty() {
+                    ui.label(RichText::new("No macros yet.").weak());
+                }
+                for (i, m) in self.macros.macros.iter().enumerate() {
+                    let resp = ui.selectable_label(
+                        false,
+                        format!("{}  ({} steps)", m.name, m.steps.len()),
+                    );
+                    if resp.clicked() {
+                        act = Some(Act::Run(i, MacroTarget::ActivePane));
+                    }
+                    resp.on_hover_text("Click to run on the active terminal; right-click for more")
+                        .context_menu(|ui| {
+                            if ui.button("Run on active terminal").clicked() {
+                                act = Some(Act::Run(i, MacroTarget::ActivePane));
+                                ui.close();
+                            }
+                            if ui.button("Run on this tab's panes").clicked() {
+                                act = Some(Act::Run(i, MacroTarget::TabPanes));
+                                ui.close();
+                            }
+                            if ui.button("Run on all terminals").clicked() {
+                                act = Some(Act::Run(i, MacroTarget::AllTerminals));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Edit…").clicked() {
+                                act = Some(Act::Edit(i));
+                                ui.close();
+                            }
+                            if ui.button("Duplicate").clicked() {
+                                act = Some(Act::Duplicate(i));
+                                ui.close();
+                            }
+                            if ui.button("Delete").clicked() {
+                                act = Some(Act::Delete(i));
+                                ui.close();
+                            }
+                        });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("New macro…").clicked() {
+                        act = Some(Act::New);
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        match act {
+            Some(Act::Run(i, target)) => {
+                self.dialog = Dialog::ConfirmMacro { index: i, target };
+                return;
+            }
+            Some(Act::Edit(i)) => {
+                let m = &self.macros.macros[i];
+                self.dialog = Dialog::MacroEdit(MacroForm {
+                    index: Some(i),
+                    name: m.name.clone(),
+                    steps: m.steps.clone(),
+                    error: None,
+                });
+                return;
+            }
+            Some(Act::Duplicate(i)) => {
+                let mut copy = self.macros.macros[i].clone();
+                copy.name = format!("{} copy", copy.name);
+                self.macros.macros.push(copy);
+                self.save_macros();
+            }
+            Some(Act::Delete(i)) => {
+                self.macros.macros.remove(i);
+                self.save_macros();
+            }
+            Some(Act::New) => {
+                self.dialog = Dialog::MacroEdit(MacroForm {
+                    index: None,
+                    name: String::new(),
+                    steps: Vec::new(),
+                    error: None,
+                });
+                return;
+            }
+            None => {}
+        }
+        if close || !open {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// The macro editor: name plus an ordered, editable list of steps.
+    fn show_macro_edit(&mut self, ctx: &egui::Context) {
+        let Dialog::MacroEdit(form) = &mut self.dialog else { return };
+        let mut save = false;
+        let mut cancel = false;
+        let mut open = true;
+        egui::Window::new(if form.index.is_some() { "Edit macro" } else { "New macro" })
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut form.name);
+                });
+                ui.separator();
+                ui.label("Steps:");
+                let mut remove = None;
+                let mut move_up = None;
+                let len = form.steps.len();
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (i, step) in form.steps.iter_mut().enumerate() {
+                        ui.push_id(i, |ui| {
+                            ui.horizontal(|ui| {
+                                step_editor(ui, step);
+                                if ui.add_enabled(i > 0, egui::Button::new("↑").small()).clicked() {
+                                    move_up = Some(i);
+                                }
+                                if ui.small_button("✕").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                        });
+                    }
+                });
+                let _ = len;
+                if let Some(i) = move_up {
+                    form.steps.swap(i - 1, i);
+                }
+                if let Some(i) = remove {
+                    form.steps.remove(i);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("+ Type text").clicked() {
+                        form.steps.push(Step::Text { text: String::new(), enter: true });
+                    }
+                    if ui.button("+ Press key").clicked() {
+                        form.steps.push(Step::Key { chord: "Enter".to_owned() });
+                    }
+                    if ui.button("+ Wait for…").clicked() {
+                        form.steps.push(Step::Expect { text: String::new(), timeout_ms: 10_000 });
+                    }
+                    if ui.button("+ Delay").clicked() {
+                        form.steps.push(Step::Delay { ms: 500 });
+                    }
+                });
+                if let Some(err) = &form.error {
+                    ui.colored_label(ui.visuals().error_fg_color, err);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if save {
+            let Dialog::MacroEdit(form) = &mut self.dialog else { return };
+            if form.name.trim().is_empty() {
+                form.error = Some("Give the macro a name.".to_owned());
+                return;
+            }
+            let m = Macro { name: form.name.trim().to_owned(), steps: form.steps.clone() };
+            match form.index {
+                Some(i) if i < self.macros.macros.len() => self.macros.macros[i] = m,
+                _ => self.macros.macros.push(m),
+            }
+            self.save_macros();
+            self.dialog = Dialog::MacroManager;
+        } else if cancel || !open {
+            self.dialog = Dialog::MacroManager;
+        }
+    }
+
+    /// Confirms a macro run, listing its steps and the target, before playing it.
+    fn show_confirm_macro(&mut self, ctx: &egui::Context) {
+        let Dialog::ConfirmMacro { index, target } = &self.dialog else { return };
+        let (index, target) = (*index, *target);
+        let Some(m) = self.macros.macros.get(index) else {
+            self.dialog = Dialog::None;
+            return;
+        };
+        let (target_ids, _) = self.macro_targets(target);
+        let where_to = target.describe(target_ids.len());
+        let name = m.name.clone();
+        let summaries: Vec<String> = m.steps.iter().map(Step::summary).collect();
+
+        let mut run = false;
+        let mut cancel = false;
+        let mut open = true;
+        egui::Window::new("Run macro?")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Run \"{name}\" on {where_to}:"));
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    if summaries.is_empty() {
+                        ui.label(RichText::new("(this macro has no steps)").weak());
+                    }
+                    for (i, s) in summaries.iter().enumerate() {
+                        ui.label(format!("{}. {s}", i + 1));
+                    }
+                });
+                ui.add_space(6.0);
+                if target_ids.is_empty() {
+                    ui.colored_label(ui.visuals().warn_fg_color, "No matching terminal to send to.");
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !target_ids.is_empty() && !summaries.is_empty(),
+                            egui::Button::new("Run"),
+                        )
+                        .clicked()
+                    {
+                        run = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if run {
+            self.start_macro(index, target);
+            self.dialog = Dialog::None;
+        } else if cancel || !open {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn save_macros(&mut self) {
+        if let Err(e) = self.macros.save() {
+            self.error = Some(format!("Could not save macros: {e:#}"));
+        }
+    }
+
+    /// Resolves a target to the terminal ids to send to and the primary one to
+    /// watch for `Expect` steps.
+    fn macro_targets(&self, target: MacroTarget) -> (Vec<u64>, u64) {
+        let active_panes = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| match &t.content {
+                TabContent::Terminal(p) => Some(p),
+                _ => None,
+            });
+        match target {
+            MacroTarget::ActivePane => match active_panes {
+                Some(p) => (vec![p.focused_id()], p.focused_id()),
+                None => (Vec::new(), 0),
+            },
+            MacroTarget::TabPanes => match active_panes {
+                Some(p) => (p.ids(), p.focused_id()),
+                None => (Vec::new(), 0),
+            },
+            MacroTarget::AllTerminals => {
+                let mut ids = Vec::new();
+                for tab in &self.tabs {
+                    if let TabContent::Terminal(p) = &tab.content {
+                        ids.extend(p.ids());
+                    }
+                }
+                let primary = active_panes.map(|p| p.focused_id()).or_else(|| ids.first().copied());
+                (ids.clone(), primary.unwrap_or(0))
+            }
+        }
+    }
+
+    fn start_macro(&mut self, index: usize, target: MacroTarget) {
+        let Some(m) = self.macros.macros.get(index) else { return };
+        let (target_ids, primary) = self.macro_targets(target);
+        if target_ids.is_empty() {
+            return;
+        }
+        self.macro_run = Some(MacroRun {
+            name: m.name.clone(),
+            steps: m.steps.clone(),
+            index: 0,
+            target_ids,
+            primary,
+            phase: RunPhase::Send,
+        });
+    }
+
+    /// Sends `bytes` to each target terminal that still exists.
+    fn macro_send(&mut self, ids: &[u64], bytes: &[u8]) {
+        for tab in &mut self.tabs {
+            if let TabContent::Terminal(panes) = &mut tab.content {
+                panes.for_each(|t| {
+                    if ids.contains(&t.id()) {
+                        t.write(bytes);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Whether the terminal `id`'s visible screen currently contains `needle`.
+    fn terminal_shows(&self, id: u64, needle: &str) -> bool {
+        self.tabs.iter().any(|tab| {
+            matches!(&tab.content, TabContent::Terminal(p)
+                if p.get(id).is_some_and(|t| t.screen_text().contains(needle)))
+        })
+    }
+
+    /// Advances the running macro, sending ready steps and honouring waits.
+    fn advance_macro(&mut self, ctx: &egui::Context) {
+        let Some(mut run) = self.macro_run.take() else { return };
+        let now = std::time::Instant::now();
+        let mut pending = false;
+        while run.index < run.steps.len() {
+            match run.phase.clone() {
+                RunPhase::Send => match run.steps[run.index].clone() {
+                    Step::Text { text, enter } => {
+                        let mut bytes = text.into_bytes();
+                        if enter {
+                            bytes.push(b'\r');
+                        }
+                        self.macro_send(&run.target_ids, &bytes);
+                        run.index += 1;
+                    }
+                    Step::Key { chord } => {
+                        if let Some(bytes) = chord_to_bytes(&chord) {
+                            self.macro_send(&run.target_ids, &bytes);
+                        }
+                        run.index += 1;
+                    }
+                    Step::Delay { ms } => {
+                        run.phase =
+                            RunPhase::Waiting { until: now + std::time::Duration::from_millis(ms) };
+                        pending = true;
+                        break;
+                    }
+                    Step::Expect { text, timeout_ms } => {
+                        run.phase = RunPhase::Expecting {
+                            text,
+                            deadline: now + std::time::Duration::from_millis(timeout_ms),
+                        };
+                    }
+                },
+                RunPhase::Waiting { until } => {
+                    if now >= until {
+                        run.index += 1;
+                        run.phase = RunPhase::Send;
+                    } else {
+                        pending = true;
+                        break;
+                    }
+                }
+                RunPhase::Expecting { text, deadline } => {
+                    if self.terminal_shows(run.primary, &text) || now >= deadline {
+                        run.index += 1;
+                        run.phase = RunPhase::Send;
+                    } else {
+                        pending = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if run.index < run.steps.len() {
+            self.macro_run = Some(run);
+            if pending {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
         }
     }
 
@@ -3782,6 +4273,14 @@ impl eframe::App for App {
         if matches!(self.dialog, Dialog::None) {
             self.shortcuts(&ctx);
         }
+        // Drive any running macro, and let Esc cancel it.
+        if self.macro_run.is_some() {
+            if matches!(self.dialog, Dialog::None) && ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.macro_run = None;
+            } else {
+                self.advance_macro(&ctx);
+            }
+        }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::left("sessions")
@@ -3799,6 +4298,27 @@ impl eframe::App for App {
                     }
                 });
             });
+        }
+        if let Some(run) = &self.macro_run {
+            let status = format!(
+                "▶ Running macro \"{}\" — step {}/{}",
+                run.name,
+                (run.index + 1).min(run.steps.len()),
+                run.steps.len()
+            );
+            let mut cancel = false;
+            egui::Panel::bottom("macro-status").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(status);
+                    if ui.small_button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    ui.label(RichText::new("(Esc to cancel)").weak());
+                });
+            });
+            if cancel {
+                self.macro_run = None;
+            }
         }
         // SFTP file browser for the active SSH tab, when shown.
         if let Some(tab) = self.tabs.get_mut(self.active)
@@ -4285,6 +4805,53 @@ fn entered(ui: &egui::Ui, resp: &egui::Response) -> bool {
 /// cancels capture instead of becoming a binding).
 fn is_modifier_key(key: Key) -> bool {
     matches!(key, Key::Escape)
+}
+
+/// One row of the macro editor: a kind picker plus that kind's fields.
+fn step_editor(ui: &mut egui::Ui, step: &mut Step) {
+    let labels = ["Type text", "Press key", "Wait for", "Delay"];
+    let mut kind = match step {
+        Step::Text { .. } => 0,
+        Step::Key { .. } => 1,
+        Step::Expect { .. } => 2,
+        Step::Delay { .. } => 3,
+    };
+    let before = kind;
+    egui::ComboBox::from_id_salt("step-kind").width(96.0).selected_text(labels[kind]).show_ui(
+        ui,
+        |ui| {
+            for (i, label) in labels.iter().enumerate() {
+                ui.selectable_value(&mut kind, i, *label);
+            }
+        },
+    );
+    if kind != before {
+        *step = match kind {
+            0 => Step::Text { text: String::new(), enter: true },
+            1 => Step::Key { chord: "Enter".to_owned() },
+            2 => Step::Expect { text: String::new(), timeout_ms: 10_000 },
+            _ => Step::Delay { ms: 500 },
+        };
+    }
+    match step {
+        Step::Text { text, enter } => {
+            ui.text_edit_singleline(text);
+            ui.checkbox(enter, "⏎").on_hover_text("Append Enter");
+        }
+        Step::Key { chord } => {
+            ui.text_edit_singleline(chord)
+                .on_hover_text("e.g. Enter, Tab, Ctrl+C, Up, Esc");
+        }
+        Step::Expect { text, timeout_ms } => {
+            ui.text_edit_singleline(text);
+            let mut secs = (*timeout_ms / 1000).max(1);
+            ui.add(egui::DragValue::new(&mut secs).range(1..=600).suffix(" s"));
+            *timeout_ms = secs * 1000;
+        }
+        Step::Delay { ms } => {
+            ui.add(egui::DragValue::new(ms).range(0..=600_000).suffix(" ms"));
+        }
+    }
 }
 
 fn shortcut_button(ui: &mut egui::Ui, text: &str, shortcut: &KeyboardShortcut) -> bool {

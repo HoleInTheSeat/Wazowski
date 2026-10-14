@@ -5,6 +5,7 @@ mod conn_log;
 mod connect;
 mod git;
 mod keybinds;
+mod macros;
 mod panes;
 mod sftp_ui;
 mod sources;

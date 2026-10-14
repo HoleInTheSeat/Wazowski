@@ -64,6 +64,23 @@ impl Pane {
         }
     }
 
+    fn get(&self, id: u64) -> Option<&Terminal> {
+        match self {
+            Pane::Leaf(t) => (t.id() == id).then_some(t.as_ref()),
+            Pane::Split { a, b, .. } => a.get(id).or_else(|| b.get(id)),
+        }
+    }
+
+    fn collect_ids(&self, out: &mut Vec<u64>) {
+        match self {
+            Pane::Leaf(t) => out.push(t.id()),
+            Pane::Split { a, b, .. } => {
+                a.collect_ids(out);
+                b.collect_ids(out);
+            }
+        }
+    }
+
     /// Replaces the leaf with id `target` by a split of it and `new`. Returns
     /// `new` unconsumed if the target was not found in this subtree.
     fn split_leaf(self, target: u64, dir: SplitDir, new: Pane) -> (Pane, Option<Pane>) {
@@ -135,6 +152,25 @@ impl Panes {
 
     pub fn count(&self) -> usize {
         self.root.as_ref().map_or(0, Pane::count)
+    }
+
+    /// The id of the focused leaf (where splits land and input is read).
+    pub fn focused_id(&self) -> u64 {
+        self.focused
+    }
+
+    /// The ids of every terminal in the tree, in layout order.
+    pub fn ids(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        if let Some(root) = &self.root {
+            root.collect_ids(&mut out);
+        }
+        out
+    }
+
+    /// The terminal with the given id, if present.
+    pub fn get(&self, id: u64) -> Option<&Terminal> {
+        self.root.as_ref().and_then(|r| r.get(id))
     }
 
     /// Whether every pane's terminal has ended (so the tab can be dropped).
