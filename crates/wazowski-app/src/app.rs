@@ -879,6 +879,7 @@ impl App {
                 folder: String::new(),
             });
         }
+        let mut add_source = false;
         bg.context_menu(|ui| {
             if ui.button("New session").clicked() {
                 action = Some(TreeAction::NewSessionIn(StoreId::Local, String::new()));
@@ -888,7 +889,15 @@ impl App {
                 action = Some(TreeAction::NewFolderIn(StoreId::Local, String::new()));
                 ui.close();
             }
+            ui.separator();
+            if ui.button("Add shared source…").clicked() {
+                add_source = true;
+                ui.close();
+            }
         });
+        if add_source {
+            self.dialog = Dialog::AddSource(AddSourceForm::default());
+        }
 
         self.apply_tree_action(action, ctx);
     }
