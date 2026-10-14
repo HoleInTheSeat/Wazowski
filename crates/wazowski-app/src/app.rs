@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, RichText};
 use wazowski_core::session::Auth;
-use wazowski_core::{Secret, Session, SessionStore, Vault, VaultError};
+use wazowski_core::{FolderStyle, Secret, Session, SessionStore, Vault, VaultError};
 use wazowski_ssh::{
     AuthMaterial, ConnectParams, HostKeyPolicy, UnknownHostKey, trust_host,
 };
@@ -144,20 +144,6 @@ struct Connecting {
     error: Option<String>,
 }
 
-impl Tab {
-    /// Whether this tab should be dropped automatically (its terminal ended).
-    fn is_dead(&self) -> bool {
-        match &self.content {
-            TabContent::Terminal(p) => p.all_exited(),
-            TabContent::Connecting(_)
-            | TabContent::Servers
-            | TabContent::Settings
-            | TabContent::Network
-            | TabContent::Detached { .. } => false,
-        }
-    }
-}
-
 /// Where the encrypted vault stands this session.
 enum VaultState {
     /// No vault file exists yet.
@@ -196,6 +182,7 @@ enum Dialog {
     CreateCredential(CredentialPrompt),
     NewFolder { target: StoreId, parent: String, name: String },
     RenameFolder { target: StoreId, old: String, name: String },
+    FolderAppearance { target: StoreId, folder: String, icon: String, color: Option<[u8; 3]> },
     ConfirmDeleteVault,
     ConfirmQuit,
     ConfirmImportVault { src: PathBuf },
@@ -438,6 +425,9 @@ struct SessionForm {
     secret_input: String,
     key_passphrase: String,
     legacy: bool,
+    /// Custom icon (emoji) and label color for the sidebar.
+    icon: String,
+    color: Option<[u8; 3]>,
     error: Option<String>,
     /// Which store to save into.
     target: StoreId,
@@ -612,8 +602,25 @@ enum DragPayload {
     Folder { store: StoreId, path: String },
 }
 
+/// Adds a broad-coverage fallback font so UI symbol glyphs (arrows, split and
+/// broadcast icons, …) render instead of showing missing-glyph boxes.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "dejavu-sans".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/DejaVuSans.ttf"
+        ))),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push("dejavu-sans".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 impl App {
     pub fn new(ctx: &egui::Context, instance_lock: Option<std::fs::File>) -> Self {
+        install_fonts(ctx);
         let sessions_path = SessionStore::default_path().unwrap_or_else(|_| "sessions.toml".into());
         let sessions = SessionStore::load(sessions_path).unwrap_or_default();
         let vault_path = Vault::default_path().unwrap_or_else(|_| "vault.enc".into());
@@ -761,9 +768,8 @@ impl App {
                     self.return_home(home, old_term);
                 }
             }
-            PaneAction::Return(leaf) => {
-                let taken =
-                    self.active_panes_mut().and_then(|p| p.remove_leaf(leaf));
+            PaneAction::Return(leaf) | PaneAction::ClosePane(leaf) => {
+                let taken = self.active_panes_mut().and_then(|p| p.remove_leaf(leaf));
                 if let Some((term, Some(home))) = taken {
                     self.return_home(home, term);
                 }
@@ -797,10 +803,10 @@ impl App {
             _ => None,
         };
         let Some(term) = term else { return };
-        // The source tab becomes a placeholder pointing at its new host.
+        // The source tab becomes a placeholder pointing at its new host. Its SFTP
+        // browser (if any) is kept so the Files panel returns when the session
+        // comes back; it just isn't shown while the tab is a placeholder.
         self.tabs[from_idx].content = TabContent::Detached { host_tab: host_id };
-        self.tabs[from_idx].files = None;
-        self.tabs[from_idx].show_files = false;
 
         let home = Home { tab_id: from_tab, label };
         let old = self.active_panes_mut().and_then(|p| p.replace_leaf(leaf, term, Some(home)));
@@ -1935,6 +1941,16 @@ impl App {
                     Dialog::RenameFolder { target: store, old: name.clone(), name };
                 Ok(())
             }
+            TreeAction::FolderAppearance(store, folder) => {
+                let style = self.store_folder_style(&store, &folder);
+                self.dialog = Dialog::FolderAppearance {
+                    target: store,
+                    folder,
+                    icon: style.as_ref().map(|s| s.icon.clone()).unwrap_or_default(),
+                    color: style.and_then(|s| s.color),
+                };
+                Ok(())
+            }
             TreeAction::DeleteFolder(store, name) => self.store_remove_folder(&store, &name),
             TreeAction::SyncSource(id) => {
                 if let Some(source) = self.shared.iter_mut().find(|s| s.id() == id) {
@@ -2147,6 +2163,27 @@ impl App {
         }
     }
 
+    fn store_folder_style(&self, store: &StoreId, folder: &str) -> Option<FolderStyle> {
+        match store {
+            StoreId::Local => self.sessions.folder_style(folder).cloned(),
+            StoreId::Shared(sid) => {
+                self.shared.iter().find(|s| s.id() == sid)?.store().folder_style(folder).cloned()
+            }
+        }
+    }
+
+    fn store_set_folder_style(
+        &mut self,
+        store: &StoreId,
+        folder: &str,
+        style: FolderStyle,
+    ) -> anyhow::Result<()> {
+        match store {
+            StoreId::Local => self.sessions.set_folder_style(folder, style),
+            StoreId::Shared(sid) => self.offline_guard(sid)?.set_folder_style(folder, style),
+        }
+    }
+
     /// Returns the shared source for writing, or an error if it is offline.
     fn offline_guard(&mut self, id: &str) -> anyhow::Result<&mut SharedSource> {
         let source = self
@@ -2203,7 +2240,7 @@ impl App {
                     if ui.button("⇥").on_hover_text("Split pane right").clicked() {
                         pane_action = Some(SplitButton::Split(SplitDir::Horizontal));
                     }
-                    if ui.button("⤓").on_hover_text("Split pane down").clicked() {
+                    if ui.button("⇩").on_hover_text("Split pane down").clicked() {
                         pane_action = Some(SplitButton::Split(SplitDir::Vertical));
                     }
                     if panes.count() > 1
@@ -2987,6 +3024,7 @@ impl App {
             Dialog::CreateCredential(_) => self.show_create_credential(ctx),
             Dialog::NewFolder { .. } => self.show_new_folder(ctx),
             Dialog::RenameFolder { .. } => self.show_rename_folder(ctx),
+            Dialog::FolderAppearance { .. } => self.show_folder_appearance(ctx),
             Dialog::ConfirmDeleteVault => self.show_confirm_delete_vault(ctx),
             Dialog::ConfirmQuit => self.show_confirm_quit(ctx),
             Dialog::ConfirmImportVault { .. } => self.show_confirm_import_vault(ctx),
@@ -4351,6 +4389,40 @@ impl App {
         }
     }
 
+    /// Dialog to set a folder's custom icon and color.
+    fn show_folder_appearance(&mut self, ctx: &egui::Context) {
+        let mut save = false;
+        let mut cancel = false;
+        if let Dialog::FolderAppearance { folder, icon, color, .. } = &mut self.dialog {
+            let folder = folder.clone();
+            egui::Modal::new(egui::Id::new("folder-appearance")).show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.heading("Folder appearance");
+                ui.label(RichText::new(folder).weak());
+                ui.add_space(6.0);
+                appearance_picker(ui, icon, color, "📁");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    save |= ui.button("Save").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if save
+            && let Dialog::FolderAppearance { target, folder, icon, color } = &self.dialog
+        {
+            let (target, folder) = (target.clone(), folder.clone());
+            let style = FolderStyle { icon: icon.clone(), color: *color };
+            if let Err(e) = self.store_set_folder_style(&target, &folder, style) {
+                self.error = Some(format!("{e:#}"));
+            }
+            self.dialog = Dialog::None;
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
     /// First-use prompt to create a session's referenced-but-missing credential.
     fn show_create_credential(&mut self, ctx: &egui::Context) {
         let mut save = false;
@@ -4687,6 +4759,8 @@ impl App {
                         "Enables weak but widely compatible algorithms. Use only for old \
                          equipment such as HPE/ProCurve switches.",
                     );
+                ui.add_space(4.0);
+                appearance_picker(ui, &mut form.icon, &mut form.color, "🖥");
                 if form.method != AuthMethod::Agent && !vault_unlocked {
                     ui.colored_label(
                         Color32::LIGHT_YELLOW,
@@ -4729,6 +4803,7 @@ impl App {
             form.method,
             form.legacy,
         );
+        let (icon, color) = (form.icon.clone(), form.color);
         let (source, existing_name, new_name, secret_input, key_passphrase) = (
             form.source,
             form.existing_name.clone(),
@@ -4754,6 +4829,8 @@ impl App {
         session.folder = folder;
         session.port = port;
         session.legacy = legacy;
+        session.icon = icon;
+        session.color = color;
 
         // Resolve the vault entry name this session should reference.
         let secret_name = match source {
@@ -5372,6 +5449,31 @@ impl eframe::App for App {
             ctx.request_repaint_after(SYNC_EVERY);
         }
 
+        // If a split tab's own (origin) session has exited, collapse the split
+        // down to just that session (returning borrowed panes home), so the tab
+        // shows the "ended" banner and can still save the original's output.
+        for i in 0..self.tabs.len() {
+            let collapse = match (self.tabs[i].origin_term, &self.tabs[i].content) {
+                (Some(origin), TabContent::Terminal(panes)) => {
+                    panes.count() > 1 && panes.get(origin).is_some_and(|t| t.has_exited())
+                }
+                _ => false,
+            };
+            if collapse
+                && let Some(origin) = self.tabs[i].origin_term
+            {
+                let others = match &mut self.tabs[i].content {
+                    TabContent::Terminal(panes) => panes.keep_only(origin),
+                    _ => Vec::new(),
+                };
+                for (term, home) in others {
+                    if let Some(home) = home {
+                        self.return_home(home, term);
+                    }
+                }
+            }
+        }
+
         // Drop individual panes whose shell exited. Leave a fully-exited tab's
         // panes in place so an SSH/serial tab can show its "ended" banner and
         // still save its buffer; local shells are auto-closed below.
@@ -5382,7 +5484,7 @@ impl eframe::App for App {
                 panes.prune();
             }
         }
-        // If a tab's own (origin) session has ended or been closed, send any
+        // If a tab's own (origin) session has been closed/removed, send any
         // sessions it borrowed into split panes back to their home tabs.
         for i in 0..self.tabs.len() {
             let origin_gone = match (self.tabs[i].origin_term, &self.tabs[i].content) {
@@ -5400,11 +5502,19 @@ impl eframe::App for App {
             }
         }
 
-        // Close dead tabs via close_tab so any moved-in sessions return home.
+        // Close dead tabs via close_tab so any moved-in sessions return home. An
+        // emptied terminal tab (no panes left) is always closed; a tab whose
+        // terminal is present but exited stays for its "ended" banner.
         let mut i = 0;
         while i < self.tabs.len() {
-            let t = &self.tabs[i];
-            let dead = t.is_dead() && !t.restart.as_ref().is_some_and(RestartKind::keep_open);
+            let dead = match &self.tabs[i].content {
+                TabContent::Terminal(panes) => {
+                    panes.count() == 0
+                        || (panes.all_exited()
+                            && !self.tabs[i].restart.as_ref().is_some_and(RestartKind::keep_open))
+                }
+                _ => false,
+            };
             if dead {
                 self.close_tab(i);
             } else {
@@ -5524,6 +5634,8 @@ impl SessionForm {
             secret_input: String::new(),
             key_passphrase: String::new(),
             legacy: false,
+            icon: String::new(),
+            color: None,
             error: None,
             target: StoreId::Local,
         }
@@ -5551,6 +5663,8 @@ impl SessionForm {
             secret_input: String::new(),
             key_passphrase: String::new(),
             legacy: session.legacy,
+            icon: session.icon.clone(),
+            color: session.color,
             error: None,
             target: StoreId::Local,
         }
@@ -5582,6 +5696,7 @@ enum TreeAction {
     NewSessionIn(StoreId, String),
     NewFolderIn(StoreId, String),
     RenameFolder(StoreId, String),
+    FolderAppearance(StoreId, String),
     DeleteFolder(StoreId, String),
     SyncSource(String),
     OpenSource(String),
@@ -5597,8 +5712,17 @@ enum TreeAction {
 #[derive(Default)]
 struct FolderNode {
     children: BTreeMap<String, FolderNode>,
-    /// (id, name, hover-hint) for each session directly in this folder.
-    sessions: Vec<(String, String, String)>,
+    /// Each session directly in this folder.
+    sessions: Vec<SessionRow>,
+}
+
+/// A session's data needed to render its sidebar row.
+struct SessionRow {
+    id: String,
+    name: String,
+    hint: String,
+    icon: String,
+    color: Option<[u8; 3]>,
 }
 
 impl FolderNode {
@@ -5636,20 +5760,22 @@ fn render_store(
         root.at(folder);
     }
     for session in sessions.all() {
-        root.at(&session.folder).sessions.push((
-            session.id.clone(),
-            session.name.clone(),
-            session_hint(session),
-        ));
+        root.at(&session.folder).sessions.push(SessionRow {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            hint: session_hint(session),
+            icon: session.icon.clone(),
+            color: session.color,
+        });
     }
 
     // Root-level sessions, then each top-level folder recursively.
-    for (id, name, hint) in &root.sessions {
-        session_row(ui, store, id, name, hint, destinations, editable, action);
+    for row in &root.sessions {
+        session_row(ui, store, row, destinations, editable, action);
     }
     let children: Vec<_> = root.children.iter().collect();
     for (segment, node) in children {
-        render_folder(ui, store, segment, segment, node, destinations, editable, action);
+        render_folder(ui, store, sessions, segment, segment, node, destinations, editable, action);
     }
 }
 
@@ -5659,6 +5785,7 @@ fn render_store(
 fn render_folder(
     ui: &mut egui::Ui,
     store: &StoreId,
+    data: &SessionStore,
     segment: &str,
     full: &str,
     node: &FolderNode,
@@ -5670,22 +5797,34 @@ fn render_folder(
 
     let id = egui::Id::new((store_salt(store), "folder", full));
     let state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let style = data.folder_style(full);
+    let icon = style.map(|s| s.icon.as_str()).filter(|i| !i.is_empty()).unwrap_or("📁");
+    let text = {
+        let t = RichText::new(format!("{icon} {segment}"));
+        match style.and_then(|s| s.color) {
+            Some([r, g, b]) => t.color(Color32::from_rgb(r, g, b)),
+            None => t,
+        }
+    };
     // Header: a draggable folder label next to the collapse triangle.
     let (_toggle, header_inner, _body) = state
         .show_header(ui, |ui| {
             drag_label(
                 ui,
-                format!("📁 {segment}"),
+                text,
                 DragPayload::Folder { store: store.clone(), path: full.to_owned() },
             )
         })
         .body(|ui| {
-            for (id, name, hint) in &node.sessions {
-                session_row(ui, store, id, name, hint, destinations, editable, action);
+            for row in &node.sessions {
+                session_row(ui, store, row, destinations, editable, action);
             }
             for (child_segment, child) in &node.children {
                 let child_full = format!("{full}/{child_segment}");
-                render_folder(ui, store, child_segment, &child_full, child, destinations, editable, action);
+                render_folder(
+                    ui, store, data, child_segment, &child_full, child, destinations, editable,
+                    action,
+                );
             }
         });
 
@@ -5715,6 +5854,10 @@ fn render_folder(
             }
             if ui.button("Rename folder").clicked() {
                 *action = Some(TreeAction::RenameFolder(store.clone(), full.to_owned()));
+                ui.close();
+            }
+            if ui.button("Appearance…").clicked() {
+                *action = Some(TreeAction::FolderAppearance(store.clone(), full.to_owned()));
                 ui.close();
             }
             // Move/copy the whole folder (subfolders and sessions included).
@@ -5747,7 +5890,11 @@ fn render_folder(
 /// and right-clicks. Uses egui's `dnd_set_drag_payload`, which only begins a drag
 /// after the pointer moves — so a stationary right-click still opens the context
 /// menu. Returns the response for click/menu handling.
-fn drag_label(ui: &mut egui::Ui, text: String, payload: DragPayload) -> egui::Response {
+fn drag_label(
+    ui: &mut egui::Ui,
+    text: impl Into<egui::WidgetText>,
+    payload: DragPayload,
+) -> egui::Response {
     let resp = ui.add(egui::Button::new(text).frame(false).sense(egui::Sense::click_and_drag()));
     resp.dnd_set_drag_payload(payload);
     resp
@@ -5799,7 +5946,7 @@ fn session_hint(s: &Session) -> String {
 /// Shows a tooltip on `response`, but only once the pointer has rested on the
 /// widget for a few seconds, so hovering the left pane isn't noisy.
 fn delayed_tooltip(ui: &egui::Ui, response: &egui::Response, text: &str) {
-    const DELAY: f64 = 3.0;
+    const DELAY: f64 = 1.5;
     if text.is_empty() {
         return;
     }
@@ -5826,24 +5973,26 @@ fn store_salt(store: &StoreId) -> String {
 }
 
 /// Renders one session row: double-click connects, right-click opens its menu.
-#[allow(clippy::too_many_arguments)]
 fn session_row(
     ui: &mut egui::Ui,
     store: &StoreId,
-    id: &str,
-    name: &str,
-    hint: &str,
+    row: &SessionRow,
     destinations: &[Destination],
     editable: bool,
     action: &mut Option<TreeAction>,
 ) {
+    let (id, name) = (row.id.as_str(), row.name.as_str());
+    let icon = if row.icon.is_empty() { "🖥" } else { row.icon.as_str() };
+    let text = {
+        let t = RichText::new(format!("{icon} {name}"));
+        match row.color {
+            Some([r, g, b]) => t.color(Color32::from_rgb(r, g, b)),
+            None => t,
+        }
+    };
     // The row drags with the primary button; right-click still opens the menu.
-    let resp = drag_label(
-        ui,
-        format!("🖥 {name}"),
-        DragPayload::Session { store: store.clone(), id: id.to_owned() },
-    );
-    delayed_tooltip(ui, &resp, hint);
+    let resp = drag_label(ui, text, DragPayload::Session { store: store.clone(), id: id.to_owned() });
+    delayed_tooltip(ui, &resp, &row.hint);
     if resp.double_clicked() {
         *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
     }
@@ -6031,6 +6180,46 @@ fn count_occurrences(hay: &str, needle: &str) -> usize {
         rest = &rest[pos + needle.len()..];
     }
     count
+}
+
+/// Emoji icons offered for sessions and folders.
+const ICON_CHOICES: &[&str] = &[
+    "🖥", "💻", "🌐", "🔀", "🗄", "🔒", "🛡", "📡", "🖨", "☁", "⚡", "🔌", "📶", "🧱", "🐧", "🪟",
+    "🍎", "🔧", "🚦", "📦",
+];
+
+/// An icon (emoji) + optional color picker row, shared by sessions and folders.
+/// `default_icon` is shown as the "no custom icon" choice.
+fn appearance_picker(
+    ui: &mut egui::Ui,
+    icon: &mut String,
+    color: &mut Option<[u8; 3]>,
+    default_icon: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.label("Icon:");
+        egui::ComboBox::from_id_salt("icon-pick")
+            .selected_text(if icon.is_empty() { default_icon } else { icon.as_str() })
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(icon.is_empty(), format!("{default_icon} (default)")).clicked()
+                {
+                    icon.clear();
+                }
+                for choice in ICON_CHOICES {
+                    if ui.selectable_label(icon == choice, *choice).clicked() {
+                        *icon = (*choice).to_owned();
+                    }
+                }
+            });
+        ui.label("Color:");
+        let mut rgb = color.unwrap_or([200, 200, 200]);
+        if ui.color_edit_button_srgb(&mut rgb).changed() {
+            *color = Some(rgb);
+        }
+        if color.is_some() && ui.small_button("✕").on_hover_text("Clear color").clicked() {
+            *color = None;
+        }
+    });
 }
 
 /// A coarse "N units ago" description of a past time, dependency-free.

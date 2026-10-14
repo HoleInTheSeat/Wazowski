@@ -1,0 +1,6 @@
+DejaVuSans.ttf is part of the DejaVu Fonts, distributed under the DejaVu
+Fonts License (a permissive, free license derived from the Bitstream Vera
+Fonts License; public-domain for the DejaVu additions). It is bundled here
+solely to render UI symbol glyphs that the default fonts lack.
+
+Full license: https://dejavu-fonts.github.io/License.html

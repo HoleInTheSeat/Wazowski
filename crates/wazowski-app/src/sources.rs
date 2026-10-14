@@ -366,6 +366,14 @@ impl SharedSource {
     pub fn move_to_folder(&mut self, id: &str, folder: &str) -> Result<()> {
         self.mutate(|s| s.move_to_folder(id, folder))
     }
+
+    pub fn set_folder_style(
+        &mut self,
+        folder: &str,
+        style: wazowski_core::FolderStyle,
+    ) -> Result<()> {
+        self.mutate(|s| s.set_folder_style(folder, style))
+    }
 }
 
 /// Opens a source's location: the folder containing its file (folder kind) or

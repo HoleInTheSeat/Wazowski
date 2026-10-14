@@ -52,6 +52,8 @@ pub enum PaneAction {
     Swap { leaf: u64, from_tab: u64 },
     /// Return this leaf's moved-in session to its home tab (collapsing the pane).
     Return(u64),
+    /// Close this pane (collapsing the split); a moved-in session returns home.
+    ClosePane(u64),
 }
 
 /// One node of a tab's layout tree.
@@ -342,6 +344,12 @@ impl Panes {
         self.root.take().and_then(Pane::single_term)
     }
 
+    /// Removes every leaf except the one with `keep`, returning their contents.
+    pub fn keep_only(&mut self, keep: u64) -> Vec<LeafContents> {
+        let others: Vec<u64> = self.ids().into_iter().filter(|id| *id != keep).collect();
+        others.into_iter().filter_map(|id| self.remove_leaf(id)).collect()
+    }
+
     /// Removes every moved-in leaf, returning each with its home (e.g. on close).
     pub fn drain_moved(&mut self) -> Vec<(Box<Terminal>, Home)> {
         let mut ids = Vec::new();
@@ -552,6 +560,10 @@ fn title_bar(cx: &mut Ctx, ui: &mut Ui, bar: Rect, leaf: &Leaf, id: u64) {
                 }
                 if moved && ui.button("Return to its tab").clicked() {
                     *cx.action = Some(PaneAction::Return(id));
+                    ui.close();
+                }
+                if ui.button("Close this pane").clicked() {
+                    *cx.action = Some(PaneAction::ClosePane(id));
                     ui.close();
                 }
                 if !cx.targets.is_empty() {

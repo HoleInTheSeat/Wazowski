@@ -45,6 +45,12 @@ pub struct Session {
     /// Offer legacy SSH algorithms (SHA-1 KEX, CBC ciphers) for old equipment.
     #[serde(default)]
     pub legacy: bool,
+    /// Optional custom icon (an emoji); empty uses the default.
+    #[serde(default)]
+    pub icon: String,
+    /// Optional custom label color, as sRGB `[r, g, b]`.
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
 }
 
 fn default_port() -> u16 {
@@ -63,6 +69,8 @@ impl Session {
             username: username.into(),
             auth: Auth::default(),
             legacy: false,
+            icon: String::new(),
+            color: None,
         }
     }
 
@@ -76,6 +84,21 @@ impl Session {
     }
 }
 
+/// A folder's custom appearance (icon emoji and/or label color).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderStyle {
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+}
+
+impl FolderStyle {
+    pub fn is_empty(&self) -> bool {
+        self.icon.is_empty() && self.color.is_none()
+    }
+}
+
 /// An in-memory collection of sessions backed by a TOML file.
 #[derive(Debug, Default)]
 pub struct SessionStore {
@@ -83,6 +106,8 @@ pub struct SessionStore {
     sessions: Vec<Session>,
     /// Explicit folders, so empty ones persist (sessions also imply folders).
     folders: Vec<String>,
+    /// Per-folder custom icon/color, keyed by folder path.
+    folder_styles: BTreeMap<String, FolderStyle>,
 }
 
 /// The serialized file shape: `[[session]]` tables plus a `folders` list.
@@ -92,6 +117,8 @@ struct StoreFile {
     sessions: Vec<Session>,
     #[serde(default)]
     folders: Vec<String>,
+    #[serde(default)]
+    folder_styles: BTreeMap<String, FolderStyle>,
 }
 
 impl SessionStore {
@@ -104,16 +131,33 @@ impl SessionStore {
 
     /// Loads the store from `path`, returning an empty store if the file does not exist.
     pub fn load(path: PathBuf) -> Result<Self> {
-        let (sessions, folders) = match fs::read_to_string(&path) {
-            Ok(text) => {
-                let file: StoreFile = toml::from_str(&text)
-                    .with_context(|| format!("could not parse {}", path.display()))?;
-                (file.sessions, file.folders)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
+        let file = match fs::read_to_string(&path) {
+            Ok(text) => toml::from_str::<StoreFile>(&text)
+                .with_context(|| format!("could not parse {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StoreFile::default(),
             Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
         };
-        Ok(Self { path, sessions, folders })
+        Ok(Self {
+            path,
+            sessions: file.sessions,
+            folders: file.folders,
+            folder_styles: file.folder_styles,
+        })
+    }
+
+    /// The custom appearance for a folder, if any.
+    pub fn folder_style(&self, path: &str) -> Option<&FolderStyle> {
+        self.folder_styles.get(path).filter(|s| !s.is_empty())
+    }
+
+    /// Sets (or clears, when empty) a folder's custom appearance, and saves.
+    pub fn set_folder_style(&mut self, path: &str, style: FolderStyle) -> Result<()> {
+        if style.is_empty() {
+            self.folder_styles.remove(path);
+        } else {
+            self.folder_styles.insert(path.to_owned(), style);
+        }
+        self.save()
     }
 
     /// All sessions, in stored order.
@@ -182,6 +226,7 @@ impl SessionStore {
     pub fn remove_folder(&mut self, name: &str) -> Result<()> {
         let prefix = format!("{name}/");
         self.folders.retain(|f| f != name && !f.starts_with(&prefix));
+        self.folder_styles.retain(|f, _| f != name && !f.starts_with(&prefix));
         for session in &mut self.sessions {
             if session.folder == name || session.folder.starts_with(&prefix) {
                 session.folder.clear();
@@ -217,6 +262,11 @@ impl SessionStore {
                 session.folder = updated;
             }
         }
+        let styles = std::mem::take(&mut self.folder_styles);
+        self.folder_styles = styles
+            .into_iter()
+            .map(|(path, style)| (repath(&path).unwrap_or(path), style))
+            .collect();
         self.save()
     }
 
@@ -240,7 +290,11 @@ impl SessionStore {
             fs::create_dir_all(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
-        let file = StoreFile { sessions: self.sessions.clone(), folders: self.folders.clone() };
+        let file = StoreFile {
+            sessions: self.sessions.clone(),
+            folders: self.folders.clone(),
+            folder_styles: self.folder_styles.clone(),
+        };
         let text = toml::to_string_pretty(&file).context("could not serialize sessions")?;
         write_atomic(path, text.as_bytes())
             .with_context(|| format!("could not write {}", path.display()))
