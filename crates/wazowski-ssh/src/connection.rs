@@ -491,9 +491,13 @@ async fn ensure_sftp(
             .request_subsystem(true, "sftp")
             .await
             .map_err(|e| format!("the server refused SFTP: {e}"))?;
-        let session = SftpSession::new(channel.into_stream())
-            .await
-            .map_err(|e| format!("could not start SFTP: {e}"))?;
+        let session = SftpSession::new(channel.into_stream()).await.map_err(|e| {
+            log::warn!("SFTP subsystem init failed: {e}");
+            format!(
+                "the server closed the SFTP channel during setup ({e}). Its SSH \
+                 server may not have the SFTP subsystem enabled for this account."
+            )
+        })?;
         *slot = Some(StdArc::new(session));
     }
     Ok(StdArc::clone(slot.as_ref().expect("just set")))
