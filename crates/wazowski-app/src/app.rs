@@ -814,26 +814,6 @@ impl App {
         // Local sessions.
         render_store(ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action);
 
-        // Fill a bit of blank space: right-click menu + a drop zone for the local root.
-        let bg = ui.allocate_response(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
-        if let Some(payload) = bg.dnd_release_payload::<DragPayload>() {
-            action = Some(TreeAction::Dropped {
-                payload: (*payload).clone(),
-                to: StoreId::Local,
-                folder: String::new(),
-            });
-        }
-        bg.context_menu(|ui| {
-            if ui.button("New session").clicked() {
-                action = Some(TreeAction::NewSessionIn(StoreId::Local, String::new()));
-                ui.close();
-            }
-            if ui.button("New folder").clicked() {
-                action = Some(TreeAction::NewFolderIn(StoreId::Local, String::new()));
-                ui.close();
-            }
-        });
-
         // Each shared source as its own collapsible section.
         for source in &self.shared {
             let badge = if source.available() { "" } else { "  (offline)" };
@@ -858,9 +838,17 @@ impl App {
                     folder: String::new(),
                 });
             }
+            let open_label = match source.def().kind {
+                SourceKind::Folder => "Open file location",
+                SourceKind::Git => "Open repository in browser",
+            };
             resp.header_response.context_menu(|ui| {
                 if ui.button("Sync now").clicked() {
                     action = Some(TreeAction::SyncSource(source.id().to_owned()));
+                    ui.close();
+                }
+                if ui.button(open_label).clicked() {
+                    action = Some(TreeAction::OpenSource(source.id().to_owned()));
                     ui.close();
                 }
                 if editable {
@@ -880,6 +868,27 @@ impl App {
                 }
             });
         }
+
+        // Fill the remaining blank space as a drop zone + right-click menu for
+        // the local store, so the whole empty pane is usable.
+        let bg = ui.allocate_response(ui.available_size(), egui::Sense::click());
+        if let Some(payload) = bg.dnd_release_payload::<DragPayload>() {
+            action = Some(TreeAction::Dropped {
+                payload: (*payload).clone(),
+                to: StoreId::Local,
+                folder: String::new(),
+            });
+        }
+        bg.context_menu(|ui| {
+            if ui.button("New session").clicked() {
+                action = Some(TreeAction::NewSessionIn(StoreId::Local, String::new()));
+                ui.close();
+            }
+            if ui.button("New folder").clicked() {
+                action = Some(TreeAction::NewFolderIn(StoreId::Local, String::new()));
+                ui.close();
+            }
+        });
 
         self.apply_tree_action(action, ctx);
     }
@@ -963,6 +972,13 @@ impl App {
                     }
                 }
                 Ok(())
+            }
+            TreeAction::OpenSource(id) => {
+                if let Some(source) = self.shared.iter().find(|s| s.id() == id) {
+                    sources::open_source(source.def())
+                } else {
+                    Ok(())
+                }
             }
             TreeAction::RemoveSource(id) => self.remove_source(&id),
             TreeAction::Dropped { payload, to, folder } => {
@@ -2187,8 +2203,11 @@ impl App {
                 None => return self.set_form_error("Choose a vault entry, or switch to New."),
             },
             SecretSource::New => {
-                let secret_name =
-                    if new_name.is_empty() { format!("session/{}", session.id) } else { new_name };
+                let secret_name = if new_name.is_empty() {
+                    self.default_secret_name(&name, &host)
+                } else {
+                    new_name
+                };
                 // Store the typed value under that name (blank keeps any existing one).
                 if !secret_input.is_empty() {
                     // Store the session's username with the credential so it is self-contained.
@@ -2231,6 +2250,23 @@ impl App {
         if let Dialog::EditSession(form) = &mut self.dialog {
             form.error = Some(message.to_owned());
         }
+    }
+
+    /// A readable, unique vault-entry name derived from the session name (or
+    /// host), de-duplicated against existing entries (`prod`, `prod-2`, …).
+    fn default_secret_name(&self, session_name: &str, host: &str) -> String {
+        let mut base = slugify(session_name);
+        if base.is_empty() {
+            base = slugify(host);
+        }
+        if base.is_empty() {
+            base = "credential".into();
+        }
+        let existing: Vec<String> = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
+        if !existing.contains(&base) {
+            return base;
+        }
+        (2..).map(|n| format!("{base}-{n}")).find(|c| !existing.contains(c)).unwrap_or(base)
     }
 
     /// Stores a secret in the vault, requiring it to be unlocked.
@@ -2914,6 +2950,7 @@ enum TreeAction {
     RenameFolder(StoreId, String),
     DeleteFolder(StoreId, String),
     SyncSource(String),
+    OpenSource(String),
     RemoveSource(String),
     /// A drag-and-drop release onto a folder (or root) of a destination store.
     Dropped { payload: DragPayload, to: StoreId, folder: String },
@@ -3186,6 +3223,22 @@ fn destination_menu(
             });
         }
     });
+}
+
+/// Turns a display string into a lowercase `a-z0-9-` slug.
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in s.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_owned()
 }
 
 /// Converts a stored secret into connect-ready auth material.

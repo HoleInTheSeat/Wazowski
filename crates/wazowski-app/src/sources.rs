@@ -320,6 +320,10 @@ impl SharedSource {
         &self.store
     }
 
+    pub fn def(&self) -> &SourceDef {
+        &self.def
+    }
+
     pub fn available(&self) -> bool {
         self.available
     }
@@ -353,6 +357,48 @@ impl SharedSource {
     pub fn move_to_folder(&mut self, id: &str, folder: &str) -> Result<()> {
         self.mutate(|s| s.move_to_folder(id, folder))
     }
+}
+
+/// Opens a source's location: the folder containing its file (folder kind) or
+/// the repository in a web browser (git kind).
+pub fn open_source(def: &SourceDef) -> Result<()> {
+    match def.kind {
+        SourceKind::Folder => {
+            // Show the file's directory in the file manager.
+            let target = def.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(&def.path);
+            open::that_detached(target).context("could not open the file location")
+        }
+        SourceKind::Git => {
+            let url = git_web_url(&def.url)
+                .ok_or_else(|| anyhow::anyhow!("don't know how to open '{}' in a browser", def.url))?;
+            open::that_detached(url).context("could not open the browser")
+        }
+    }
+}
+
+/// Converts a git remote URL into a browsable web URL.
+/// Handles `git@host:group/repo(.git)`, `ssh://git@host/group/repo(.git)`, and
+/// `https://host/group/repo(.git)`.
+fn git_web_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    let strip_git = |s: &str| s.strip_suffix(".git").unwrap_or(s).to_owned();
+
+    if let Some(rest) = url.strip_prefix("git@") {
+        // git@host:group/repo.git -> https://host/group/repo
+        let (host, path) = rest.split_once(':')?;
+        return Some(format!("https://{host}/{}", strip_git(path)));
+    }
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        // ssh://git@host[:port]/group/repo.git
+        let rest = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        let host = host.split(':').next().unwrap_or(host); // drop any port
+        return Some(format!("https://{host}/{}", strip_git(path)));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(strip_git(url));
+    }
+    None
 }
 
 /// The local-data cache directory for shared sources.
@@ -438,6 +484,23 @@ mod tests {
             username: String::new(),
             key_path: String::new(),
         }
+    }
+
+    #[test]
+    fn git_web_url_conversion() {
+        assert_eq!(
+            git_web_url("git@github.com:HoleInTheSeat/sharesessiontest.git").as_deref(),
+            Some("https://github.com/HoleInTheSeat/sharesessiontest")
+        );
+        assert_eq!(
+            git_web_url("https://gitlab.com/group/repo.git").as_deref(),
+            Some("https://gitlab.com/group/repo")
+        );
+        assert_eq!(
+            git_web_url("ssh://git@forgejo.example.com:2222/team/sessions.git").as_deref(),
+            Some("https://forgejo.example.com/team/sessions")
+        );
+        assert_eq!(git_web_url("not a url"), None);
     }
 
     // Uses the real `git` binary against a local bare repo (no network/auth).
