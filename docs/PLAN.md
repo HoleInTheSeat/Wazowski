@@ -118,3 +118,6 @@ Agreed "do next" items (rough order TBD with the user):
 - **ARM / Raspberry Pi** — build and run on arm64 (and smaller SBCs if feasible).
 - **Android (and maybe iOS)** — at least carry sessions and connect from a phone;
   stripping features is acceptable. iOS is low priority.
+- **Web app via Docker** — run Wazowski as a browser-accessible web app served
+  from a Docker container (e.g. egui/eframe compiled to WASM, or a thin web
+  front-end), so it can be hosted and used without a local install.
