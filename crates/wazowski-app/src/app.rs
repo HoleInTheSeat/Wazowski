@@ -42,6 +42,9 @@ struct Tab {
     /// How to restart this tab's session once it ends. SSH/serial tabs stay open
     /// when their session closes; local shells auto-close.
     restart: Option<RestartKind>,
+    /// Terminal id of this tab's own (original) session, so that when it ends,
+    /// any sessions borrowed into split panes can be sent back to their tabs.
+    origin_term: Option<u64>,
 }
 
 /// How a terminal tab's session can be restarted after it ends.
@@ -682,6 +685,7 @@ impl App {
     /// session. If the home tab is gone, the terminal is simply dropped.
     fn return_home(&mut self, home: Home, term: Box<Terminal>) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == home.tab_id) {
+            tab.origin_term = Some(term.id());
             tab.content = TabContent::Terminal(Box::new(Panes::new(term)));
         }
     }
@@ -793,8 +797,19 @@ impl App {
         force_adjacent: bool,
     ) {
         let id = self.new_tab_id();
-        let tab =
-            Tab { id, label: label.into(), content, show_files: files.is_some(), files, restart: None };
+        let origin_term = match &content {
+            TabContent::Terminal(panes) => panes.ids().first().copied(),
+            _ => None,
+        };
+        let tab = Tab {
+            id,
+            label: label.into(),
+            content,
+            show_files: files.is_some(),
+            files,
+            restart: None,
+            origin_term,
+        };
         let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
         let index = if adjacent && !self.tabs.is_empty() {
             (self.active + 1).min(self.tabs.len())
@@ -991,11 +1006,13 @@ impl App {
                     let files = FileBrowser::new(backend.sftp());
                     let params = c.params.clone();
                     let term = Terminal::new(Box::new(backend), output, TermSize::default());
+                    let term_id = term.id();
                     let tab = &mut self.tabs[index];
                     tab.content = TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
                     tab.show_files = false;
                     tab.files = Some(files);
                     tab.restart = Some(RestartKind::Ssh(Box::new(params)));
+                    tab.origin_term = Some(term_id);
                 }
                 Progress::Failed(message) => {
                     c.pending = None;
@@ -2131,9 +2148,12 @@ impl App {
                         pane_action = Some(SplitButton::Close);
                     }
                 }
-                // A toggle for the SFTP panel, for the active SSH tab.
+                // A toggle for the SFTP panel, for the active SSH tab. Hidden
+                // while the tab is split, to avoid confusion about which pane it
+                // belongs to; it returns once the tab is a single session again.
                 if let Some(tab) = self.tabs.get(self.active)
                     && tab.files.is_some()
+                    && matches!(&tab.content, TabContent::Terminal(p) if p.count() == 1)
                 {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut shown = tab.show_files;
@@ -2390,6 +2410,7 @@ impl App {
             None
         };
         if let Some(term) = term {
+            self.tabs[detached_index].origin_term = Some(term.id());
             self.tabs[detached_index].content = TabContent::Terminal(Box::new(Panes::new(term)));
             self.active = detached_index;
         }
@@ -2467,6 +2488,7 @@ impl App {
                 match LocalPty::spawn(size, move || repaint.request_repaint()) {
                     Ok((pty, output)) => {
                         let term = Terminal::new(Box::new(pty), output, size);
+                        self.tabs[index].origin_term = Some(term.id());
                         self.tabs[index].content =
                             TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
                     }
@@ -2478,6 +2500,7 @@ impl App {
                 match SerialBackend::open(&config, move || repaint.request_repaint()) {
                     Ok((backend, output)) => {
                         let term = Terminal::new(Box::new(backend), output, size);
+                        self.tabs[index].origin_term = Some(term.id());
                         self.tabs[index].content =
                             TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
                     }
@@ -2504,13 +2527,17 @@ impl App {
         }
     }
 
-    /// Saves the focused terminal's scrollback + screen to a chosen file.
+    /// Saves the tab's original session's scrollback + screen to a chosen file.
     fn save_tab_output(&mut self, index: usize) {
-        let text = match self.tabs.get(index).map(|t| &t.content) {
-            Some(TabContent::Terminal(panes)) => {
-                panes.get(panes.focused_id()).map(|t| t.full_text())
-            }
-            _ => None,
+        let text = match self.tabs.get(index) {
+            Some(tab) => match &tab.content {
+                TabContent::Terminal(panes) => {
+                    let id = tab.origin_term.unwrap_or_else(|| panes.focused_id());
+                    panes.get(id).or_else(|| panes.get(panes.focused_id())).map(|t| t.full_text())
+                }
+                _ => None,
+            },
+            None => None,
         };
         let Some(text) = text else { return };
         if let Some(path) =
@@ -5039,6 +5066,24 @@ impl eframe::App for App {
                 panes.prune();
             }
         }
+        // If a tab's own (origin) session has ended or been closed, send any
+        // sessions it borrowed into split panes back to their home tabs.
+        for i in 0..self.tabs.len() {
+            let origin_gone = match (self.tabs[i].origin_term, &self.tabs[i].content) {
+                (Some(origin), TabContent::Terminal(panes)) => !panes.ids().contains(&origin),
+                _ => false,
+            };
+            if origin_gone {
+                let moved = match &mut self.tabs[i].content {
+                    TabContent::Terminal(panes) => panes.drain_moved(),
+                    _ => Vec::new(),
+                };
+                for (term, home) in moved {
+                    self.return_home(home, term);
+                }
+            }
+        }
+
         // Close dead tabs via close_tab so any moved-in sessions return home.
         let mut i = 0;
         while i < self.tabs.len() {
@@ -5112,8 +5157,13 @@ impl eframe::App for App {
                 self.macro_run = None;
             }
         }
-        // SFTP file browser for the active SSH tab, when shown.
-        if let Some(tab) = self.tabs.get_mut(self.active)
+        // SFTP file browser for the active SSH tab, when shown and not split.
+        let single_pane = matches!(
+            self.tabs.get(self.active).map(|t| &t.content),
+            Some(TabContent::Terminal(p)) if p.count() == 1
+        );
+        if single_pane
+            && let Some(tab) = self.tabs.get_mut(self.active)
             && tab.show_files
             && let Some(files) = &mut tab.files
         {
