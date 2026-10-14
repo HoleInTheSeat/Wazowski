@@ -3016,6 +3016,9 @@ fn render_folder(
 
     // The header row is a drop target for sessions/folders dragged onto it.
     let header_row = header_inner.response;
+    // The menu goes on the label (the hit widget), not the whole row, so a
+    // right-click on the folder name actually opens it.
+    let header_label = header_inner.inner;
     if editable
         && let Some(payload) = header_row.dnd_release_payload::<DragPayload>()
     {
@@ -3026,7 +3029,7 @@ fn render_folder(
         });
     }
     if editable {
-        header_row.context_menu(|ui| {
+        header_label.context_menu(|ui| {
             if ui.button("New session here").clicked() {
                 *action = Some(TreeAction::NewSessionIn(store.clone(), full.to_owned()));
                 ui.close();
@@ -3065,16 +3068,13 @@ fn render_folder(
     }
 }
 
-/// A label that drags with the primary mouse button only (setting `payload`),
-/// leaving right-click free for a context menu. Returns the response.
+/// A label that can be dragged (setting `payload`) while still reporting clicks
+/// and right-clicks. Uses egui's `dnd_set_drag_payload`, which only begins a drag
+/// after the pointer moves — so a stationary right-click still opens the context
+/// menu. Returns the response for click/menu handling.
 fn drag_label(ui: &mut egui::Ui, text: String, payload: DragPayload) -> egui::Response {
     let resp = ui.add(egui::Button::new(text).frame(false).sense(egui::Sense::click_and_drag()));
-    if resp.dragged_by(egui::PointerButton::Primary) {
-        egui::DragAndDrop::set_payload(ui.ctx(), payload);
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-    } else if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-    }
+    resp.dnd_set_drag_payload(payload);
     resp
 }
 
