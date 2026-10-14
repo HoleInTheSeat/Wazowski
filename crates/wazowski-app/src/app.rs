@@ -160,8 +160,6 @@ enum Dialog {
     DropMenu { payload: DragPayload, to: StoreId, folder: String },
     /// The keybindings editor. `capturing` is the action awaiting a new key.
     Keybindings { capturing: Option<Action> },
-    /// The list of macros, with per-macro run/edit/delete.
-    MacroManager,
     /// The macro editor (new or existing).
     MacroEdit(MacroForm),
     /// Confirm running a macro, showing its steps and where they go.
@@ -465,6 +463,16 @@ pub struct App {
     _instance_lock: Option<std::fs::File>,
     /// The find-in-terminals bar, when open.
     find: Option<FindState>,
+    /// Which list the left pane is showing.
+    sidebar_view: SidebarView,
+}
+
+/// The left-pane view selector.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SidebarView {
+    #[default]
+    Sessions,
+    Macros,
 }
 
 /// State of the find-in-terminals bar.
@@ -602,6 +610,7 @@ impl App {
             settings,
             _instance_lock: instance_lock,
             find: None,
+            sidebar_view: SidebarView::Sessions,
         };
         app.open_startup_tab(ctx);
         app
@@ -1135,16 +1144,15 @@ impl App {
         self.macro_shortcut(ctx);
     }
 
-    /// Opens the macro manager when the Run-macro shortcut is pressed.
+    /// Switches the left pane to the Macros view when the Run-macro shortcut fires.
     fn macro_shortcut(&mut self, ctx: &egui::Context) {
         let sc = self.keymap.get(Action::RunMacro);
         if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
-            self.dialog = Dialog::MacroManager;
+            self.sidebar_view = SidebarView::Macros;
         }
     }
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        let mut run_macro = None;
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Terminal", |ui| {
                 if shortcut_button(ui, "New local shell", &self.keymap.get(Action::NewShell)) {
@@ -1175,20 +1183,6 @@ impl App {
                 ui.separator();
                 if ui.button("Add shared source…").clicked() {
                     self.dialog = Dialog::AddSource(AddSourceForm::default());
-                }
-            });
-            ui.menu_button("Macros", |ui| {
-                if self.macros.macros.is_empty() {
-                    ui.label(RichText::new("No macros yet").weak());
-                }
-                for (i, m) in self.macros.macros.iter().enumerate() {
-                    if ui.button(&m.name).on_hover_text("Run on the active terminal").clicked() {
-                        run_macro = Some(i);
-                    }
-                }
-                ui.separator();
-                if shortcut_button(ui, "Manage macros…", &self.keymap.get(Action::RunMacro)) {
-                    self.dialog = Dialog::MacroManager;
                 }
             });
             ui.menu_button("Tools", |ui| {
@@ -1242,9 +1236,6 @@ impl App {
                 }
             });
         });
-        if let Some(i) = run_macro {
-            self.dialog = Dialog::ConfirmMacro { index: i, target: MacroTarget::ActivePane };
-        }
     }
 
     /// Copies the vault file to a user-chosen location.
@@ -1431,6 +1422,18 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.sidebar_view, SidebarView::Sessions, "Sessions");
+            ui.selectable_value(&mut self.sidebar_view, SidebarView::Macros, "Macros");
+        });
+        ui.separator();
+        match self.sidebar_view {
+            SidebarView::Sessions => self.sidebar_sessions(ui, ctx),
+            SidebarView::Macros => self.sidebar_macros(ui),
+        }
+    }
+
+    fn sidebar_sessions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
             ui.heading("Sessions");
             if ui.small_button("+").on_hover_text("New session").clicked() {
                 self.dialog = Dialog::EditSession(SessionForm::new());
@@ -1466,6 +1469,95 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             self.session_tree(ui, ctx);
         });
+    }
+
+    /// The Macros view: a list of macros to run (double-click) or manage.
+    fn sidebar_macros(&mut self, ui: &mut egui::Ui) {
+        enum Act {
+            Run(usize, MacroTarget),
+            Edit(usize),
+            Duplicate(usize),
+            Delete(usize),
+            New,
+        }
+        let mut act = None;
+        ui.horizontal(|ui| {
+            ui.heading("Macros");
+            if ui.small_button("+").on_hover_text("New macro").clicked() {
+                act = Some(Act::New);
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if self.macros.macros.is_empty() {
+                ui.label(RichText::new("No macros yet. Click + to add one.").weak());
+            }
+            for (i, m) in self.macros.macros.iter().enumerate() {
+                let resp = ui.selectable_label(false, format!("⚙ {}", m.name));
+                if resp.double_clicked() {
+                    act = Some(Act::Run(i, MacroTarget::ActivePane));
+                }
+                resp.on_hover_text("Double-click to run on the active terminal; right-click for more")
+                    .context_menu(|ui| {
+                        if ui.button("Run on active terminal").clicked() {
+                            act = Some(Act::Run(i, MacroTarget::ActivePane));
+                            ui.close();
+                        }
+                        if ui.button("Run on this tab's panes").clicked() {
+                            act = Some(Act::Run(i, MacroTarget::TabPanes));
+                            ui.close();
+                        }
+                        if ui.button("Run on all terminals").clicked() {
+                            act = Some(Act::Run(i, MacroTarget::AllTerminals));
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Edit…").clicked() {
+                            act = Some(Act::Edit(i));
+                            ui.close();
+                        }
+                        if ui.button("Duplicate").clicked() {
+                            act = Some(Act::Duplicate(i));
+                            ui.close();
+                        }
+                        if ui.button("Delete").clicked() {
+                            act = Some(Act::Delete(i));
+                            ui.close();
+                        }
+                    });
+            }
+        });
+        match act {
+            Some(Act::Run(i, target)) => self.dialog = Dialog::ConfirmMacro { index: i, target },
+            Some(Act::Edit(i)) => {
+                let m = &self.macros.macros[i];
+                self.dialog = Dialog::MacroEdit(MacroForm {
+                    index: Some(i),
+                    name: m.name.clone(),
+                    steps: m.steps.clone(),
+                    error: None,
+                });
+            }
+            Some(Act::Duplicate(i)) => {
+                let mut copy = self.macros.macros[i].clone();
+                copy.name = format!("{} copy", copy.name);
+                self.macros.macros.push(copy);
+                self.save_macros();
+            }
+            Some(Act::Delete(i)) => {
+                self.macros.macros.remove(i);
+                self.save_macros();
+            }
+            Some(Act::New) => {
+                self.dialog = Dialog::MacroEdit(MacroForm {
+                    index: None,
+                    name: String::new(),
+                    steps: Vec::new(),
+                    error: None,
+                });
+            }
+            None => {}
+        }
     }
 
     fn session_tree(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2384,7 +2476,6 @@ impl App {
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
             Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
             Dialog::Keybindings { .. } => self.show_keybindings(ctx),
-            Dialog::MacroManager => self.show_macro_manager(ctx),
             Dialog::MacroEdit(_) => self.show_macro_edit(ctx),
             Dialog::ConfirmMacro { .. } => self.show_confirm_macro(ctx),
             Dialog::About => self.show_about(ctx),
@@ -2511,117 +2602,6 @@ impl App {
 
     // --- Macros -------------------------------------------------------------
 
-    /// The list of macros: click one to run it on the active terminal, or
-    /// right-click for other targets and editing.
-    fn show_macro_manager(&mut self, ctx: &egui::Context) {
-        enum Act {
-            Run(usize, MacroTarget),
-            Edit(usize),
-            Duplicate(usize),
-            Delete(usize),
-            New,
-        }
-        let mut act = None;
-        let mut open = true;
-        let mut close = false;
-        egui::Window::new("Macros")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                if self.macros.macros.is_empty() {
-                    ui.label(RichText::new("No macros yet.").weak());
-                }
-                for (i, m) in self.macros.macros.iter().enumerate() {
-                    let resp = ui.selectable_label(
-                        false,
-                        format!("{}  ({} steps)", m.name, m.steps.len()),
-                    );
-                    if resp.clicked() {
-                        act = Some(Act::Run(i, MacroTarget::ActivePane));
-                    }
-                    resp.on_hover_text("Click to run on the active terminal; right-click for more")
-                        .context_menu(|ui| {
-                            if ui.button("Run on active terminal").clicked() {
-                                act = Some(Act::Run(i, MacroTarget::ActivePane));
-                                ui.close();
-                            }
-                            if ui.button("Run on this tab's panes").clicked() {
-                                act = Some(Act::Run(i, MacroTarget::TabPanes));
-                                ui.close();
-                            }
-                            if ui.button("Run on all terminals").clicked() {
-                                act = Some(Act::Run(i, MacroTarget::AllTerminals));
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Edit…").clicked() {
-                                act = Some(Act::Edit(i));
-                                ui.close();
-                            }
-                            if ui.button("Duplicate").clicked() {
-                                act = Some(Act::Duplicate(i));
-                                ui.close();
-                            }
-                            if ui.button("Delete").clicked() {
-                                act = Some(Act::Delete(i));
-                                ui.close();
-                            }
-                        });
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("New macro…").clicked() {
-                        act = Some(Act::New);
-                    }
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
-                });
-            });
-
-        match act {
-            Some(Act::Run(i, target)) => {
-                self.dialog = Dialog::ConfirmMacro { index: i, target };
-                return;
-            }
-            Some(Act::Edit(i)) => {
-                let m = &self.macros.macros[i];
-                self.dialog = Dialog::MacroEdit(MacroForm {
-                    index: Some(i),
-                    name: m.name.clone(),
-                    steps: m.steps.clone(),
-                    error: None,
-                });
-                return;
-            }
-            Some(Act::Duplicate(i)) => {
-                let mut copy = self.macros.macros[i].clone();
-                copy.name = format!("{} copy", copy.name);
-                self.macros.macros.push(copy);
-                self.save_macros();
-            }
-            Some(Act::Delete(i)) => {
-                self.macros.macros.remove(i);
-                self.save_macros();
-            }
-            Some(Act::New) => {
-                self.dialog = Dialog::MacroEdit(MacroForm {
-                    index: None,
-                    name: String::new(),
-                    steps: Vec::new(),
-                    error: None,
-                });
-                return;
-            }
-            None => {}
-        }
-        if close || !open {
-            self.dialog = Dialog::None;
-        }
-    }
-
     /// The macro editor: name plus an ordered, editable list of steps.
     fn show_macro_edit(&mut self, ctx: &egui::Context) {
         let Dialog::MacroEdit(form) = &mut self.dialog else { return };
@@ -2705,9 +2685,9 @@ impl App {
                 _ => self.macros.macros.push(m),
             }
             self.save_macros();
-            self.dialog = Dialog::MacroManager;
+            self.dialog = Dialog::None;
         } else if cancel || !open {
-            self.dialog = Dialog::MacroManager;
+            self.dialog = Dialog::None;
         }
     }
 
