@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
+use eframe::egui::{self, Color32, Key, KeyboardShortcut, RichText};
 use wazowski_core::session::Auth;
 use wazowski_core::{Secret, Session, SessionStore, Vault, VaultError};
 use wazowski_ssh::{
@@ -16,6 +16,7 @@ use wazowski_term::{
 };
 
 use crate::connect::{Connected, PendingConnect, Progress};
+use crate::keybinds::{Action, Keymap};
 use crate::panes::{Panes, SplitDir};
 use crate::sftp_ui::FileBrowser;
 use crate::servers_ui::{ServerEntry, ServerForm, ServersStore};
@@ -24,12 +25,6 @@ use crate::sources::{
 };
 use wazowski_servers::{ServerConfig, ServerKind};
 
-const NEW_TAB: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::T);
-const CLOSE_TAB: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::W);
-const NEXT_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::PageDown);
-const PREV_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::PageUp);
 
 /// An open tab: either an established terminal, or a connection in progress.
 struct Tab {
@@ -139,6 +134,8 @@ enum Dialog {
     AddSource(AddSourceForm),
     MissingShare { id: String },
     DropMenu { payload: DragPayload, to: StoreId, folder: String },
+    /// The keybindings editor. `capturing` is the action awaiting a new key.
+    Keybindings { capturing: Option<Action> },
 }
 
 /// Fields for the "Add shared source" dialog (folder or git).
@@ -392,6 +389,8 @@ pub struct App {
     admin_task: Option<AdminTask>,
     /// Multi-exec: mirror typing in the active terminal to all other terminals.
     broadcast: bool,
+    /// Configurable keyboard shortcuts.
+    keymap: Keymap,
 }
 
 /// A privileged helper command running via a worker thread.
@@ -445,6 +444,10 @@ impl App {
             .expect("loading a missing servers file yields an empty store");
         let servers = servers_store.configs.iter().cloned().map(ServerEntry::new).collect();
 
+        let keymap = Keymap::default_path()
+            .and_then(Keymap::load)
+            .unwrap_or_else(|_| Keymap::defaults());
+
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -463,6 +466,7 @@ impl App {
             servers,
             admin_task: None,
             broadcast: false,
+            keymap,
         };
         app.open_local_shell(ctx);
         app
@@ -911,35 +915,52 @@ impl App {
     // --- Rendering ----------------------------------------------------------
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let (new, close, next, prev) = ctx.input_mut(|i| {
-            (
-                i.consume_shortcut(&NEW_TAB),
-                i.consume_shortcut(&CLOSE_TAB),
-                i.consume_shortcut(&NEXT_TAB),
-                i.consume_shortcut(&PREV_TAB),
-            )
-        });
-        if new {
+        let triggered = |action: Action, ctx: &egui::Context, map: &Keymap| {
+            let sc = map.get(action);
+            ctx.input_mut(|i| i.consume_shortcut(&sc))
+        };
+        if triggered(Action::NewShell, ctx, &self.keymap) {
             self.open_local_shell(ctx);
         }
-        if close && !self.tabs.is_empty() {
+        if triggered(Action::CloseTab, ctx, &self.keymap) && !self.tabs.is_empty() {
             self.close_tab(self.active);
         }
         if !self.tabs.is_empty() {
             let n = self.tabs.len();
-            if next {
+            if triggered(Action::NextTab, ctx, &self.keymap) {
                 self.active = (self.active + 1) % n;
             }
-            if prev {
+            if triggered(Action::PrevTab, ctx, &self.keymap) {
                 self.active = (self.active + n - 1) % n;
             }
         }
+        if triggered(Action::SplitRight, ctx, &self.keymap) {
+            self.split_active_pane(SplitDir::Horizontal, ctx);
+        }
+        if triggered(Action::SplitDown, ctx, &self.keymap) {
+            self.split_active_pane(SplitDir::Vertical, ctx);
+        }
+        if triggered(Action::ClosePane, ctx, &self.keymap) {
+            self.close_active_pane();
+        }
+        if triggered(Action::ToggleBroadcast, ctx, &self.keymap) {
+            self.broadcast = !self.broadcast;
+        }
+        // Action::RunMacro is handled (and consumed) by the macros feature.
+        self.macro_shortcut(ctx);
+    }
+
+    /// Consumes the Run-macro shortcut. Filled in by the macros feature; for now
+    /// it just swallows the key so it doesn't reach the focused terminal.
+    fn macro_shortcut(&mut self, ctx: &egui::Context) {
+        let sc = self.keymap.get(Action::RunMacro);
+        let _ = ctx.input_mut(|i| i.consume_shortcut(&sc));
     }
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Terminal", |ui| {
-                if shortcut_button(ui, "New local shell", &NEW_TAB) {
+                if shortcut_button(ui, "New local shell", &self.keymap.get(Action::NewShell)) {
                     self.open_local_shell(ui.ctx());
                 }
                 if ui.button("New serial connection…").clicked() {
@@ -965,6 +986,10 @@ impl App {
             ui.menu_button("Tools", |ui| {
                 if ui.button("Quick servers").clicked() {
                     self.open_servers_tab();
+                }
+                ui.separator();
+                if ui.button("Keybindings…").clicked() {
+                    self.dialog = Dialog::Keybindings { capturing: None };
                 }
             });
             ui.menu_button("Vault", |ui| {
@@ -1717,6 +1742,94 @@ impl App {
             Dialog::ServerFix { .. } => self.show_server_fix(ctx),
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
             Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
+            Dialog::Keybindings { .. } => self.show_keybindings(ctx),
+        }
+    }
+
+    /// The keybindings editor: lists every action, lets the user click one and
+    /// press keys to rebind it, with reset-to-default and a save.
+    fn show_keybindings(&mut self, ctx: &egui::Context) {
+        let Dialog::Keybindings { capturing } = &mut self.dialog else { return };
+        let mut capturing = *capturing;
+
+        // If an action is awaiting a key, grab the first non-modifier key press.
+        if let Some(action) = capturing {
+            let captured = ctx.input_mut(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, modifiers, .. }
+                        if !is_modifier_key(*key) =>
+                    {
+                        Some(KeyboardShortcut::new(*modifiers, *key))
+                    }
+                    _ => None,
+                })
+            });
+            if let Some(shortcut) = captured {
+                self.keymap.set(action, shortcut);
+                capturing = None;
+            }
+        }
+
+        let mut open = true;
+        let mut close = false;
+        let mut save = false;
+        egui::Window::new("Keybindings")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Click a shortcut, then press the keys to rebind it.");
+                ui.add_space(6.0);
+                egui::Grid::new("keybinds-grid").num_columns(3).spacing([12.0, 6.0]).show(
+                    ui,
+                    |ui| {
+                        for action in Action::ALL {
+                            ui.label(action.label());
+                            let label = if capturing == Some(action) {
+                                "press keys…".to_owned()
+                            } else {
+                                self.keymap.text(action)
+                            };
+                            let selected = capturing == Some(action);
+                            if ui.selectable_label(selected, label).clicked() {
+                                capturing = if selected { None } else { Some(action) };
+                            }
+                            if ui.small_button("Reset").clicked() {
+                                self.keymap.reset(action);
+                                capturing = None;
+                            }
+                            ui.end_row();
+                        }
+                    },
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                    if capturing.is_some() {
+                        ui.label(RichText::new("Esc to cancel capture").weak());
+                    }
+                });
+            });
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && capturing.is_some() {
+            capturing = None;
+        }
+        if save {
+            if let Err(e) = self.keymap.save() {
+                self.error = Some(format!("Could not save keybindings: {e:#}"));
+            }
+            close = true;
+        }
+        if close || !open {
+            self.dialog = Dialog::None;
+        } else if let Dialog::Keybindings { capturing: c } = &mut self.dialog {
+            *c = capturing;
         }
     }
 
@@ -4167,6 +4280,13 @@ fn entered(ui: &egui::Ui, resp: &egui::Response) -> bool {
 }
 
 /// A menu button that shows its keyboard shortcut; returns whether it was clicked.
+/// Keys not allowed as a shortcut's main key. egui reports Ctrl/Alt/Shift via
+/// `Modifiers` rather than as `Key`s, so only Escape needs excluding here (it
+/// cancels capture instead of becoming a binding).
+fn is_modifier_key(key: Key) -> bool {
+    matches!(key, Key::Escape)
+}
+
 fn shortcut_button(ui: &mut egui::Ui, text: &str, shortcut: &KeyboardShortcut) -> bool {
     let button = egui::Button::new(text).shortcut_text(ui.ctx().format_shortcut(shortcut));
     ui.add(button).clicked()
