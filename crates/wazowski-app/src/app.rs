@@ -116,7 +116,14 @@ enum Dialog {
     ConfirmImportVault { src: PathBuf },
     EditServer(ServerForm),
     StartServer { id: String, auto_stop: bool, minutes: String },
-    ServerFix { title: String, message: String, command: Option<Vec<String>>, retry_id: String },
+    ServerFix {
+        title: String,
+        message: String,
+        command: Option<Vec<String>>,
+        retry_id: String,
+        /// The remedy only takes effect after a restart (e.g. setcap).
+        restart_required: bool,
+    },
     AskUsername(UsernamePrompt),
     AddSource(AddSourceForm),
     MissingShare { id: String },
@@ -349,8 +356,10 @@ pub struct App {
 struct AdminTask {
     label: String,
     rx: std::sync::mpsc::Receiver<Result<(), String>>,
-    /// Server to retry starting if the command succeeds.
+    /// Server to retry starting if the command succeeds (and no restart needed).
     retry_id: Option<String>,
+    /// If set, the grant only applies after restarting Wazowski.
+    restart_required: bool,
 }
 
 /// Which session store an action targets.
@@ -725,6 +734,7 @@ impl App {
                     message,
                     command,
                     retry_id: id.to_owned(),
+                    restart_required: true,
                 };
             }
             StartError::NotInstalled(bin) => {
@@ -741,6 +751,7 @@ impl App {
                     message,
                     command,
                     retry_id: id.to_owned(),
+                    restart_required: false,
                 };
             }
             StartError::Other(m) => {
@@ -763,7 +774,13 @@ impl App {
     }
 
     /// Runs a privileged command (via pkexec on Linux) on a worker thread.
-    fn run_admin(&mut self, label: String, mut command: Vec<String>, retry_id: Option<String>) {
+    fn run_admin(
+        &mut self,
+        label: String,
+        mut command: Vec<String>,
+        retry_id: Option<String>,
+        restart_required: bool,
+    ) {
         if command.is_empty() {
             return;
         }
@@ -781,10 +798,11 @@ impl App {
                 });
             let _ = tx.send(result);
         });
-        self.admin_task = Some(AdminTask { label, rx, retry_id });
+        self.admin_task = Some(AdminTask { label, rx, retry_id, restart_required });
     }
 
-    /// Polls a running privileged command; retries the server start on success.
+    /// Polls a running privileged command. On success, either retries the start
+    /// (install) or tells the user to restart (setcap takes effect on re-exec).
     fn poll_admin(&mut self, ctx: &egui::Context) {
         let Some(task) = &self.admin_task else { return };
         match task.rx.try_recv() {
@@ -792,13 +810,21 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(300));
             }
             Ok(Ok(())) => {
-                let retry = self.admin_task.take().and_then(|t| t.retry_id);
-                if let Some(id) = retry {
-                    self.dialog = Dialog::StartServer {
-                        id,
-                        auto_stop: true,
-                        minutes: "60".into(),
+                let task = self.admin_task.take().expect("just checked");
+                if task.restart_required {
+                    self.dialog = Dialog::ServerFix {
+                        title: "Permission granted".into(),
+                        message: "Low-port permission was granted, but it only takes effect after \
+                                  a restart. Restart Wazowski, then start the server — or use a \
+                                  port of 1024 or higher to avoid needing this."
+                            .into(),
+                        command: None,
+                        retry_id: String::new(),
+                        restart_required: false,
                     };
+                } else if let Some(id) = task.retry_id {
+                    self.dialog =
+                        Dialog::StartServer { id, auto_stop: true, minutes: "60".into() };
                 }
             }
             Ok(Err(e)) => {
@@ -1812,9 +1838,17 @@ impl App {
     }
 
     fn show_server_fix(&mut self, ctx: &egui::Context) {
-        let Dialog::ServerFix { title, message, command, retry_id } = &self.dialog else { return };
-        let (title, message, command, retry_id) =
-            (title.clone(), message.clone(), command.clone(), retry_id.clone());
+        let Dialog::ServerFix { title, message, command, retry_id, restart_required } = &self.dialog
+        else {
+            return;
+        };
+        let (title, message, command, retry_id, restart_required) = (
+            title.clone(),
+            message.clone(),
+            command.clone(),
+            retry_id.clone(),
+            *restart_required,
+        );
         let mut run = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::new("server-fix")).show(ctx, |ui| {
@@ -1838,7 +1872,8 @@ impl App {
             && let Some(cmd) = command
         {
             self.dialog = Dialog::None;
-            self.run_admin(title, cmd, Some(retry_id));
+            let retry = (!retry_id.is_empty()).then_some(retry_id);
+            self.run_admin(title, cmd, retry, restart_required);
         } else if cancel {
             self.dialog = Dialog::None;
         }
