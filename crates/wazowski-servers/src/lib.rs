@@ -247,3 +247,65 @@ mod tests {
         assert!(opts.iter().any(|(_, ip)| *ip == IpAddr::from([127, 0, 0, 1])));
     }
 }
+
+#[cfg(test)]
+mod sftp_tests {
+    use super::*;
+    use std::io::Write as _;
+    use wazowski_ssh::{AuthMaterial, ConnectParams, HostKeyPolicy, connect};
+    use wazowski_term::TermSize;
+
+    #[test]
+    #[ignore = "spawns an SFTP server and connects a real SSH client"]
+    fn sftp_server_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readme.txt"), b"served file").unwrap();
+
+        let mut cfg = ServerConfig {
+            id: "sftp-test".into(),
+            name: "sftp".into(),
+            kind: ServerKind::Sftp,
+            root: dir.path().to_path_buf(),
+            bind: IpAddr::from([127, 0, 0, 1]),
+            port: 0,
+            writable: true,
+            username: "user".into(),
+            password: "pw".into(),
+        };
+        let server = start(&cfg, || {}).unwrap();
+        // addr is "sftp://127.0.0.1:PORT"
+        let port: u16 = server.addr().rsplit(':').next().unwrap().parse().unwrap();
+        cfg.port = port;
+
+        let known = tempfile::NamedTempFile::new().unwrap();
+        let (backend, _rx) = connect(
+            ConnectParams {
+                host: "127.0.0.1".into(),
+                port,
+                username: "user".into(),
+                auth: AuthMaterial::Password("pw".into()),
+                policy: HostKeyPolicy::AcceptNew,
+                size: TermSize::default(),
+                known_hosts: Some(known.path().to_path_buf()),
+                legacy_algorithms: false,
+            },
+            || {},
+        )
+        .expect("connect to sftp server");
+        let sftp = backend.sftp();
+
+        // List the served folder and read the existing file back.
+        let entries = sftp.list_dir("/").expect("list");
+        assert!(entries.iter().any(|e| e.name == "readme.txt"), "listing: {entries:?}");
+
+        let local = dir.path().join("downloaded.txt");
+        sftp.download("/readme.txt", local.clone()).expect("download");
+        assert_eq!(std::fs::read(&local).unwrap(), b"served file");
+
+        // Upload a new file and confirm it lands in the served folder.
+        let up = dir.path().join("upload.txt");
+        std::fs::File::create(&up).unwrap().write_all(b"uploaded").unwrap();
+        sftp.upload(up, "/newfile.txt").expect("upload");
+        assert_eq!(std::fs::read(dir.path().join("newfile.txt")).unwrap(), b"uploaded");
+    }
+}

@@ -5879,14 +5879,18 @@ dependencies = [
  "anyhow",
  "async-tftp",
  "axum",
+ "directories",
  "if-addrs",
  "log",
+ "rand 0.10.3",
  "russh",
  "russh-sftp",
  "serde",
  "tempfile",
  "tokio",
  "tower-http",
+ "wazowski-ssh",
+ "wazowski-term",
 ]
 
 [[package]]

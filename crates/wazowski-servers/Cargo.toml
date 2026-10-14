@@ -15,6 +15,10 @@ async-tftp.workspace = true
 russh.workspace = true
 russh-sftp.workspace = true
 if-addrs.workspace = true
+rand.workspace = true
+directories.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+wazowski-ssh.workspace = true
+wazowski-term.workspace = true
