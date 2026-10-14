@@ -27,12 +27,12 @@ pub(crate) async fn serve(
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let hint = if e.kind() == std::io::ErrorKind::NotFound {
-                "iperf3 is not installed or not on PATH".to_string()
+            let err = if e.kind() == std::io::ErrorKind::NotFound {
+                crate::StartError::NotInstalled("iperf3".into())
             } else {
-                e.to_string()
+                crate::StartError::Other(e.to_string())
             };
-            let _ = ready.send(Err(hint));
+            let _ = ready.send(Err(err));
             return Ok(());
         }
     };

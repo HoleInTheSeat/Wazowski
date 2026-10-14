@@ -115,6 +115,8 @@ enum Dialog {
     ConfirmQuit,
     ConfirmImportVault { src: PathBuf },
     EditServer(ServerForm),
+    StartServer { id: String, auto_stop: bool, minutes: String },
+    ServerFix { title: String, message: String, command: Option<Vec<String>>, retry_id: String },
     AskUsername(UsernamePrompt),
     AddSource(AddSourceForm),
     MissingShare { id: String },
@@ -339,6 +341,16 @@ pub struct App {
     /// Quick-server configs plus their running state.
     servers_store: ServersStore,
     servers: Vec<ServerEntry>,
+    /// A privileged command (install/setcap) running in the background.
+    admin_task: Option<AdminTask>,
+}
+
+/// A privileged helper command running via a worker thread.
+struct AdminTask {
+    label: String,
+    rx: std::sync::mpsc::Receiver<Result<(), String>>,
+    /// Server to retry starting if the command succeeds.
+    retry_id: Option<String>,
 }
 
 /// Which session store an action targets.
@@ -398,6 +410,7 @@ impl App {
             last_sync: std::time::Instant::now(),
             servers_store,
             servers,
+            admin_task: None,
         };
         app.open_local_shell(ctx);
         app
@@ -656,38 +669,145 @@ impl App {
 
     /// Drains logs from running servers; returns whether any are running.
     fn poll_servers(&mut self) -> bool {
+        let now = std::time::Instant::now();
         let mut any = false;
+        let mut expired = Vec::new();
         for entry in &mut self.servers {
             if let Some(running) = &entry.running {
                 running.drain_log(&mut entry.log);
                 any = true;
+                if entry.stop_at.is_some_and(|t| now >= t) {
+                    entry.log.push("Auto-stop timer elapsed.".into());
+                    expired.push(entry.config.id.clone());
+                }
             }
+        }
+        for id in expired {
+            self.stop_server(&id);
         }
         any
     }
 
-    fn start_server(&mut self, id: &str, ctx: &egui::Context) {
+    /// Starts a server; `auto_stop` schedules an automatic stop after `minutes`.
+    /// A typed failure opens a fix-it prompt (privileged port, missing iperf3).
+    fn start_server(&mut self, id: &str, auto_stop: Option<u64>, ctx: &egui::Context) {
         let Some(entry) = self.servers.iter_mut().find(|e| e.config.id == id) else { return };
         if entry.is_running() {
             return;
         }
         entry.log.clear();
-        let ctx = ctx.clone();
-        match wazowski_servers::start(&entry.config, move || ctx.request_repaint()) {
-            Ok(running) => entry.running = Some(running),
-            Err(e) => {
-                entry.log.push(format!("Failed to start: {e:#}"));
-                self.error = Some(format!("Could not start the server: {e:#}"));
+        let ctx2 = ctx.clone();
+        match wazowski_servers::start(&entry.config, move || ctx2.request_repaint()) {
+            Ok(running) => {
+                entry.running = Some(running);
+                entry.stop_at = auto_stop
+                    .map(|m| std::time::Instant::now() + std::time::Duration::from_secs(m * 60));
+            }
+            Err(e) => self.handle_start_error(id, e),
+        }
+    }
+
+    /// Turns a start failure into a helpful fix-it dialog where possible.
+    fn handle_start_error(&mut self, id: &str, e: wazowski_servers::StartError) {
+        use wazowski_servers::StartError;
+        match e {
+            StartError::PrivilegedPort(port) => {
+                let command = wazowski_servers::low_port_setcap_command();
+                let mut message = format!(
+                    "Port {port} is privileged (below 1024). Pick a port of 1024 or higher, \
+                     or grant this app permission to use low ports."
+                );
+                if command.is_none() {
+                    message.push_str("\n\nGranting low-port permission isn't available on this platform.");
+                }
+                self.dialog = Dialog::ServerFix {
+                    title: "Privileged port".into(),
+                    message,
+                    command,
+                    retry_id: id.to_owned(),
+                };
+            }
+            StartError::NotInstalled(bin) => {
+                let command = wazowski_servers::iperf_install_command();
+                let message = match &command {
+                    Some(cmd) => format!("{bin} isn't installed. Install it with: {}", cmd.join(" ")),
+                    None => format!(
+                        "{bin} isn't installed, and no package manager was detected. Install it \
+                         with your system's package manager, then try again."
+                    ),
+                };
+                self.dialog = Dialog::ServerFix {
+                    title: format!("{bin} not installed"),
+                    message,
+                    command,
+                    retry_id: id.to_owned(),
+                };
+            }
+            StartError::Other(m) => {
+                if let Some(entry) = self.servers.iter_mut().find(|e| e.config.id == id) {
+                    entry.log.push(format!("Failed to start: {m}"));
+                }
+                self.error = Some(format!("Could not start the server: {m}"));
             }
         }
     }
 
     fn stop_server(&mut self, id: &str) {
-        if let Some(entry) = self.servers.iter_mut().find(|e| e.config.id == id)
-            && let Some(running) = entry.running.take()
-        {
-            running.stop();
-            entry.log.push("Stopped.".into());
+        if let Some(entry) = self.servers.iter_mut().find(|e| e.config.id == id) {
+            if let Some(running) = entry.running.take() {
+                running.stop();
+                entry.log.push("Stopped.".into());
+            }
+            entry.stop_at = None;
+        }
+    }
+
+    /// Runs a privileged command (via pkexec on Linux) on a worker thread.
+    fn run_admin(&mut self, label: String, mut command: Vec<String>, retry_id: Option<String>) {
+        if command.is_empty() {
+            return;
+        }
+        if wazowski_servers::needs_pkexec() {
+            command.insert(0, "pkexec".into());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .status()
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    if s.success() { Ok(()) } else { Err(format!("command failed ({s})")) }
+                });
+            let _ = tx.send(result);
+        });
+        self.admin_task = Some(AdminTask { label, rx, retry_id });
+    }
+
+    /// Polls a running privileged command; retries the server start on success.
+    fn poll_admin(&mut self, ctx: &egui::Context) {
+        let Some(task) = &self.admin_task else { return };
+        match task.rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            }
+            Ok(Ok(())) => {
+                let retry = self.admin_task.take().and_then(|t| t.retry_id);
+                if let Some(id) = retry {
+                    self.dialog = Dialog::StartServer {
+                        id,
+                        auto_stop: true,
+                        minutes: "60".into(),
+                    };
+                }
+            }
+            Ok(Err(e)) => {
+                let label = self.admin_task.take().map(|t| t.label).unwrap_or_default();
+                self.error = Some(format!("{label} failed: {e}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.admin_task = None;
+            }
         }
     }
 
@@ -1338,6 +1458,12 @@ impl App {
         ui.label(
             RichText::new("Serve a folder over HTTP/TFTP/SFTP, or run an iperf3 server.").weak(),
         );
+        if let Some(task) = &self.admin_task {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Running: {}…", task.label));
+            });
+        }
         ui.separator();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -1351,7 +1477,16 @@ impl App {
                         ui.strong(&entry.config.name);
                         ui.label(RichText::new(entry.config.kind.label()).weak());
                         match &entry.running {
-                            Some(r) => ui.colored_label(Color32::GREEN, format!("● {}", r.addr())),
+                            Some(r) => {
+                                let timer = entry
+                                    .stop_at
+                                    .map(|t| {
+                                        let secs = t.saturating_duration_since(std::time::Instant::now()).as_secs();
+                                        format!("  ⏱ stops in {}m", secs / 60 + 1)
+                                    })
+                                    .unwrap_or_default();
+                                ui.colored_label(Color32::GREEN, format!("● {}{timer}", r.addr()))
+                            }
                             None => ui.label(
                                 RichText::new(format!("○ {}:{}", entry.config.bind, entry.config.port))
                                     .weak(),
@@ -1394,8 +1529,7 @@ impl App {
 
         match act {
             Some(Act::Start(id)) => {
-                let ctx = ui.ctx().clone();
-                self.start_server(&id, &ctx);
+                self.dialog = Dialog::StartServer { id, auto_stop: true, minutes: "60".into() };
             }
             Some(Act::Stop(id)) => self.stop_server(&id),
             Some(Act::Edit(id)) => {
@@ -1434,6 +1568,8 @@ impl App {
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
             Dialog::AddSource(_) => self.show_add_source(ctx),
             Dialog::EditServer(_) => self.show_edit_server(ctx),
+            Dialog::StartServer { .. } => self.show_start_server(ctx),
+            Dialog::ServerFix { .. } => self.show_server_fix(ctx),
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
             Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
         }
@@ -1622,6 +1758,89 @@ impl App {
     fn set_server_error(&mut self, message: &str) {
         if let Dialog::EditServer(f) = &mut self.dialog {
             f.error = Some(message.to_owned());
+        }
+    }
+
+    fn show_start_server(&mut self, ctx: &egui::Context) {
+        let mut start = false;
+        let mut cancel = false;
+        let name = if let Dialog::StartServer { id, .. } = &self.dialog {
+            self.servers.iter().find(|e| e.config.id == *id).map(|e| e.config.name.clone())
+        } else {
+            None
+        };
+        if let Dialog::StartServer { auto_stop, minutes, .. } = &mut self.dialog {
+            egui::Modal::new(egui::Id::new("start-server")).show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.heading(format!("Start {}", name.as_deref().unwrap_or("server")));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.checkbox(auto_stop, "Stop server after");
+                    ui.add_enabled(*auto_stop, egui::TextEdit::singleline(minutes).desired_width(50.0));
+                    ui.label("minutes");
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    start |= ui.button("Start").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if start
+            && let Dialog::StartServer { id, auto_stop, minutes } = &self.dialog
+        {
+            let auto = if *auto_stop {
+                match minutes.trim().parse::<u64>() {
+                    Ok(m) if m > 0 => Some(m),
+                    _ => {
+                        // Keep the dialog open; a cheap nudge via the error bar.
+                        self.error = Some("Enter a positive number of minutes.".into());
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let id = id.clone();
+            self.dialog = Dialog::None;
+            let ctx = ctx.clone();
+            self.start_server(&id, auto, &ctx);
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn show_server_fix(&mut self, ctx: &egui::Context) {
+        let Dialog::ServerFix { title, message, command, retry_id } = &self.dialog else { return };
+        let (title, message, command, retry_id) =
+            (title.clone(), message.clone(), command.clone(), retry_id.clone());
+        let mut run = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("server-fix")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading(RichText::new(format!("⚠ {title}")).color(Color32::LIGHT_YELLOW));
+            ui.label(message);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if command.is_some() {
+                    let label = if wazowski_servers::needs_pkexec() {
+                        "Run (asks for your password)"
+                    } else {
+                        "Run"
+                    };
+                    run |= ui.button(label).clicked();
+                }
+                cancel |= ui.button("Close").clicked();
+            });
+        });
+        if run
+            && let Some(cmd) = command
+        {
+            self.dialog = Dialog::None;
+            self.run_admin(title, cmd, Some(retry_id));
+        } else if cancel {
+            self.dialog = Dialog::None;
         }
     }
 
@@ -3146,6 +3365,7 @@ impl eframe::App for App {
         }
 
         self.poll_connections(&ctx);
+        self.poll_admin(&ctx);
         // Keep server logs flowing and repaint while any server runs.
         if self.poll_servers() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));

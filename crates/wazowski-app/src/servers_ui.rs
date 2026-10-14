@@ -66,11 +66,13 @@ pub struct ServerEntry {
     pub config: ServerConfig,
     pub running: Option<RunningServer>,
     pub log: Vec<String>,
+    /// When to auto-stop the server, if a timer was set.
+    pub stop_at: Option<std::time::Instant>,
 }
 
 impl ServerEntry {
     pub fn new(config: ServerConfig) -> Self {
-        Self { config, running: None, log: Vec::new() }
+        Self { config, running: None, log: Vec::new(), stop_at: None }
     }
 
     pub fn is_running(&self) -> bool {

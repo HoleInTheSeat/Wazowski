@@ -24,7 +24,14 @@ pub(crate) async fn serve(
     let tftpd = match builder.bind(addr).build().await {
         Ok(s) => s,
         Err(e) => {
-            let _ = ready.send(Err(format!("could not start TFTP on {addr}: {e}")));
+            // async-tftp wraps the IO error; privileged ports surface as "permission".
+            let msg = e.to_string();
+            let err = if cfg.port < 1024 && msg.to_lowercase().contains("permission") {
+                crate::StartError::PrivilegedPort(cfg.port)
+            } else {
+                crate::StartError::Other(format!("could not start TFTP on {addr}: {e}"))
+            };
+            let _ = ready.send(Err(err));
             return Ok(());
         }
     };

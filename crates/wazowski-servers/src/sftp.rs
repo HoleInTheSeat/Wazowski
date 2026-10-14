@@ -40,7 +40,7 @@ pub(crate) async fn serve(
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            let _ = ready.send(Err(format!("could not bind {addr}: {e}")));
+            let _ = ready.send(Err(crate::bind_error(&e, cfg.port, addr)));
             return Ok(());
         }
     };

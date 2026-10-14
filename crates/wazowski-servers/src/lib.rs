@@ -136,10 +136,36 @@ impl Log {
     }
 }
 
+/// Why a server failed to start, so the UI can offer a specific remedy.
+#[derive(Debug, Clone)]
+pub enum StartError {
+    /// Binding the port was refused — typically a privileged port (< 1024).
+    PrivilegedPort(u16),
+    /// A required external program isn't installed (the binary name).
+    NotInstalled(String),
+    /// Anything else, already phrased for display.
+    Other(String),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::PrivilegedPort(p) => {
+                write!(f, "binding port {p} was denied (ports below 1024 need elevated privileges)")
+            }
+            StartError::NotInstalled(bin) => write!(f, "{bin} is not installed"),
+            StartError::Other(m) => f.write_str(m),
+        }
+    }
+}
+
 /// Starts a server from its config. Blocks only briefly (until the socket is
 /// bound), then serves in the background; `wake` is called when new log lines
 /// arrive so the UI can repaint.
-pub fn start(cfg: &ServerConfig, wake: impl Fn() + Send + Sync + 'static) -> Result<RunningServer> {
+pub fn start(
+    cfg: &ServerConfig,
+    wake: impl Fn() + Send + Sync + 'static,
+) -> std::result::Result<RunningServer, StartError> {
     let (log_tx, log_rx) = channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -151,8 +177,7 @@ pub fn start(cfg: &ServerConfig, wake: impl Fn() + Send + Sync + 'static) -> Res
         match result {
             Ok(()) => log.line("Server stopped."),
             Err(e) => {
-                // Report the error to the starter if we never got ready.
-                let _ = ready_tx.send(Err(format!("{e:#}")));
+                let _ = ready_tx.send(Err(StartError::Other(format!("{e:#}"))));
                 log.line(format!("Server error: {e:#}"));
             }
         }
@@ -161,9 +186,61 @@ pub fn start(cfg: &ServerConfig, wake: impl Fn() + Send + Sync + 'static) -> Res
     // Wait for bind to succeed (or fail) before returning.
     match ready_rx.recv() {
         Ok(Ok(addr)) => Ok(RunningServer { shutdown: Some(shutdown_tx), log_rx, addr }),
-        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
-        Err(_) => Err(anyhow::anyhow!("the server task exited before starting")),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(StartError::Other("the server task exited before starting".into())),
     }
+}
+
+/// The command to install iperf3 using a detected package manager, if any.
+/// (The caller runs it with elevation where needed.)
+pub fn iperf_install_command() -> Option<Vec<String>> {
+    let candidates: &[(&str, &[&str])] = &[
+        ("dnf", &["install", "-y", "iperf3"]),
+        ("apt-get", &["install", "-y", "iperf3"]),
+        ("pacman", &["-S", "--noconfirm", "iperf3"]),
+        ("zypper", &["install", "-y", "iperf"]),
+        ("brew", &["install", "iperf3"]),
+    ];
+    for (bin, args) in candidates {
+        if on_path(bin) {
+            let mut cmd = vec![(*bin).to_string()];
+            cmd.extend(args.iter().map(|s| (*s).to_string()));
+            return Some(cmd);
+        }
+    }
+    None
+}
+
+/// The command to let this binary bind privileged ports without root (Linux).
+pub fn low_port_setcap_command() -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let exe = std::env::current_exe().ok()?;
+        Some(vec![
+            "setcap".into(),
+            "cap_net_bind_service=+ep".into(),
+            exe.to_string_lossy().into_owned(),
+        ])
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Whether running package managers / elevation needs a privilege helper
+/// (pkexec on Linux; Homebrew/macOS and Windows installers don't).
+pub fn needs_pkexec() -> bool {
+    cfg!(target_os = "linux")
+}
+
+fn on_path(bin: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {bin}"))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Lists usable bind addresses for the UI: all interfaces, localhost, and each
@@ -184,8 +261,17 @@ pub fn bind_options() -> Vec<(String, IpAddr)> {
     opts
 }
 
+/// Classifies a TCP/UDP bind error, flagging privileged-port denials.
+pub(crate) fn bind_error(e: &std::io::Error, port: u16, addr: std::net::SocketAddr) -> StartError {
+    if port < 1024 && e.kind() == std::io::ErrorKind::PermissionDenied {
+        StartError::PrivilegedPort(port)
+    } else {
+        StartError::Other(format!("could not bind {addr}: {e}"))
+    }
+}
+
 /// Reports a successfully bound address, or the failure, to the starter.
-pub(crate) type Ready = std::sync::mpsc::Sender<std::result::Result<String, String>>;
+pub(crate) type Ready = std::sync::mpsc::Sender<std::result::Result<String, StartError>>;
 
 async fn serve(
     cfg: &ServerConfig,
