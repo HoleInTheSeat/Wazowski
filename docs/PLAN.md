@@ -95,19 +95,22 @@ Agreed "do next" items (rough order TBD with the user):
   sessions to resume.
 - **About view** ✅ — Terminal ▸ About Wazowski: version + repo/releases links.
 
+## Phase 7 — network toolbox ✅
+
+- **Port scanner** ✅ — common ports or a user range/list.
+- **Subnet scanner** ✅ — ping sweep + per-host common-service detection and a
+  port-scan button.
+- **List open ports on the host** ✅ (via `ss`/`netstat`).
+- **Wake-on-LAN** ✅ — magic packet to broadcast.
+
 ## Later backlog (roadmap, not yet scheduled)
 
-- **Port scanner** — scan an IP for "common" ports or a user range/list.
-- **Subnet scanner** — ping each IP, then a button per host to port-scan it;
-  auto-scan common service ports (ssh/rdp/vnc/ftp/http/…) like MobaXterm.
-- **List open ports on the host** running Wazowski.
 - **File diff comparison.**
 - **List host hardware.**
 - **Running processes view** — likely `htop` in a tab, or a native list.
 - **Auto-updater** — best-practice update flow with a "Check for updates" button.
 - **Icons & colors for shared sessions / folders** — e.g. a switch clip-art icon
   and custom color for a folder of switch sessions.
-- **Wake-on-LAN** — send magic packets.
 - **Visual polish / "make the UI cooler"** — themes, fonts, animations; done last.
 
 ## Portability goals
