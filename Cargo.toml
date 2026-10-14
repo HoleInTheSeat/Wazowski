@@ -12,6 +12,7 @@ eframe = "0.36"
 egui = "0.36"
 alacritty_terminal = "0.26"
 portable-pty = "0.9"
+serialport = { version = "4", default-features = false }
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"

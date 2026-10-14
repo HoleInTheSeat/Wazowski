@@ -10,7 +10,10 @@ use wazowski_core::{Secret, Session, SessionStore, Vault, VaultError};
 use wazowski_ssh::{
     AuthMaterial, ConnectParams, HostKeyPolicy, UnknownHostKey, trust_host,
 };
-use wazowski_term::{LocalPty, TermSize, Terminal, TerminalView};
+use wazowski_term::{
+    COMMON_BAUDS, LocalPty, SerialBackend, SerialConfig, SerialFlow, SerialParity, TermSize,
+    Terminal, TerminalView, available_ports,
+};
 
 use crate::connect::{Connected, PendingConnect, Progress};
 use crate::sftp_ui::FileBrowser;
@@ -115,6 +118,7 @@ enum Dialog {
     ConfirmQuit,
     ConfirmImportVault { src: PathBuf },
     EditServer(ServerForm),
+    SerialConnect(SerialForm),
     StartServer { id: String, auto_stop: bool, minutes: String },
     ServerFix {
         title: String,
@@ -159,6 +163,35 @@ impl Default for AddSourceForm {
             username: String::new(),
             token: String::new(),
             key_path: String::new(),
+        }
+    }
+}
+
+/// Fields for the "New serial connection" dialog.
+struct SerialForm {
+    ports: Vec<String>,
+    path: String,
+    baud: String,
+    data_bits: u8,
+    parity: SerialParity,
+    stop_bits: u8,
+    flow: SerialFlow,
+    error: Option<String>,
+}
+
+impl SerialForm {
+    fn new() -> Self {
+        let ports = available_ports();
+        let path = ports.first().cloned().unwrap_or_default();
+        Self {
+            ports,
+            path,
+            baud: "115200".into(),
+            data_bits: 8,
+            parity: SerialParity::None,
+            stop_bits: 1,
+            flow: SerialFlow::None,
+            error: None,
         }
     }
 }
@@ -870,6 +903,9 @@ impl App {
             ui.menu_button("Terminal", |ui| {
                 if shortcut_button(ui, "New local shell", &NEW_TAB) {
                     self.open_local_shell(ui.ctx());
+                }
+                if ui.button("New serial connection…").clicked() {
+                    self.dialog = Dialog::SerialConnect(SerialForm::new());
                 }
                 if ui.add_enabled(!self.tabs.is_empty(), egui::Button::new("Close tab")).clicked() {
                     self.close_tab(self.active);
@@ -1594,6 +1630,7 @@ impl App {
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
             Dialog::AddSource(_) => self.show_add_source(ctx),
             Dialog::EditServer(_) => self.show_edit_server(ctx),
+            Dialog::SerialConnect(_) => self.show_serial_connect(ctx),
             Dialog::StartServer { .. } => self.show_start_server(ctx),
             Dialog::ServerFix { .. } => self.show_server_fix(ctx),
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
@@ -1783,6 +1820,139 @@ impl App {
 
     fn set_server_error(&mut self, message: &str) {
         if let Dialog::EditServer(f) = &mut self.dialog {
+            f.error = Some(message.to_owned());
+        }
+    }
+
+    fn show_serial_connect(&mut self, ctx: &egui::Context) {
+        let mut connect = false;
+        let mut cancel = false;
+        let mut refresh = false;
+        if let Dialog::SerialConnect(f) = &mut self.dialog {
+            egui::Modal::new(egui::Id::new("serial-connect")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.heading("New serial connection");
+                ui.add_space(6.0);
+                egui::Grid::new("serial-fields").num_columns(2).show(ui, |ui| {
+                    ui.label("Port");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("serial-port")
+                            .selected_text(if f.path.is_empty() { "(none)" } else { &f.path })
+                            .show_ui(ui, |ui| {
+                                for port in &f.ports {
+                                    ui.selectable_value(&mut f.path, port.clone(), port);
+                                }
+                            });
+                        refresh |= ui.button("⟳").on_hover_text("Rescan ports").clicked();
+                    });
+                    ui.end_row();
+                    ui.label("Baud");
+                    egui::ComboBox::from_id_salt("serial-baud")
+                        .selected_text(&f.baud)
+                        .show_ui(ui, |ui| {
+                            for b in COMMON_BAUDS {
+                                ui.selectable_value(&mut f.baud, b.to_string(), b.to_string());
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Data bits");
+                    egui::ComboBox::from_id_salt("serial-data")
+                        .selected_text(f.data_bits.to_string())
+                        .show_ui(ui, |ui| {
+                            for b in [8u8, 7, 6, 5] {
+                                ui.selectable_value(&mut f.data_bits, b, b.to_string());
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Parity");
+                    egui::ComboBox::from_id_salt("serial-parity")
+                        .selected_text(format!("{:?}", f.parity))
+                        .show_ui(ui, |ui| {
+                            for p in [SerialParity::None, SerialParity::Odd, SerialParity::Even] {
+                                ui.selectable_value(&mut f.parity, p, format!("{p:?}"));
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Stop bits");
+                    egui::ComboBox::from_id_salt("serial-stop")
+                        .selected_text(f.stop_bits.to_string())
+                        .show_ui(ui, |ui| {
+                            for b in [1u8, 2] {
+                                ui.selectable_value(&mut f.stop_bits, b, b.to_string());
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Flow control");
+                    egui::ComboBox::from_id_salt("serial-flow")
+                        .selected_text(format!("{:?}", f.flow))
+                        .show_ui(ui, |ui| {
+                            for fc in [SerialFlow::None, SerialFlow::Software, SerialFlow::Hardware] {
+                                ui.selectable_value(&mut f.flow, fc, format!("{fc:?}"));
+                            }
+                        });
+                    ui.end_row();
+                });
+                if f.ports.is_empty() {
+                    ui.colored_label(Color32::LIGHT_YELLOW, "No serial ports detected.");
+                }
+                if let Some(error) = &f.error {
+                    ui.colored_label(Color32::LIGHT_RED, error.as_str());
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    connect |= ui.button("Connect").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if refresh
+            && let Dialog::SerialConnect(f) = &mut self.dialog
+        {
+            f.ports = available_ports();
+            if !f.ports.contains(&f.path) {
+                f.path = f.ports.first().cloned().unwrap_or_default();
+            }
+        }
+        if connect {
+            self.open_serial(ctx);
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn open_serial(&mut self, ctx: &egui::Context) {
+        let Dialog::SerialConnect(f) = &self.dialog else { return };
+        if f.path.is_empty() {
+            return self.set_serial_error("Choose a serial port.");
+        }
+        let baud: u32 = match f.baud.trim().parse() {
+            Ok(b) if b > 0 => b,
+            _ => return self.set_serial_error("Baud must be a positive number."),
+        };
+        let config = SerialConfig {
+            path: f.path.clone(),
+            baud,
+            data_bits: f.data_bits,
+            parity: f.parity,
+            stop_bits: f.stop_bits,
+            flow: f.flow,
+        };
+        let label = format!("Serial {}", config.path.rsplit('/').next().unwrap_or(&config.path));
+        let size = TermSize::default();
+        let repaint = ctx.clone();
+        match SerialBackend::open(&config, move || repaint.request_repaint()) {
+            Ok((backend, output)) => {
+                let term = Terminal::new(Box::new(backend), output, size);
+                self.dialog = Dialog::None;
+                self.push_tab(label, TabContent::Terminal(Box::new(term)), None);
+            }
+            Err(e) => self.set_serial_error(&format!("{e:#}")),
+        }
+    }
+
+    fn set_serial_error(&mut self, message: &str) {
+        if let Dialog::SerialConnect(f) = &mut self.dialog {
             f.error = Some(message.to_owned());
         }
     }

@@ -8,5 +8,6 @@ license.workspace = true
 egui.workspace = true
 alacritty_terminal.workspace = true
 portable-pty.workspace = true
+serialport.workspace = true
 anyhow.workspace = true
 log.workspace = true
