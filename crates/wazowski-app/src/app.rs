@@ -383,6 +383,8 @@ pub struct App {
     servers: Vec<ServerEntry>,
     /// A privileged command (install/setcap) running in the background.
     admin_task: Option<AdminTask>,
+    /// Multi-exec: mirror typing in the active terminal to all other terminals.
+    broadcast: bool,
 }
 
 /// A privileged helper command running via a worker thread.
@@ -453,6 +455,7 @@ impl App {
             servers_store,
             servers,
             admin_task: None,
+            broadcast: false,
         };
         app.open_local_shell(ctx);
         app
@@ -1435,6 +1438,8 @@ impl App {
                 if ui.button("+").on_hover_text("New local shell").clicked() {
                     self.open_local_shell(ui.ctx());
                 }
+                ui.toggle_value(&mut self.broadcast, "⇉ Broadcast")
+                    .on_hover_text("Multi-exec: send typing to every terminal at once");
                 // A toggle for the SFTP panel, for the active SSH tab.
                 if let Some(tab) = self.tabs.get(self.active)
                     && tab.files.is_some()
@@ -1470,10 +1475,18 @@ impl App {
         let interactive = matches!(self.dialog, Dialog::None);
         // Collect retry/copy actions to apply after the borrow ends.
         let mut retry = None;
-        match self.tabs.get_mut(self.active) {
+        // Multi-exec: bytes typed into the active terminal, to mirror elsewhere.
+        let mut broadcast_bytes: Vec<u8> = Vec::new();
+        let active = self.active;
+        let broadcast = self.broadcast;
+        match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
                 TabContent::Terminal(terminal) => {
                     TerminalView::new(terminal).interactive(interactive).show(ui);
+                    let typed = terminal.take_broadcast();
+                    if broadcast {
+                        broadcast_bytes = typed;
+                    }
                 }
                 TabContent::Connecting(c) => {
                     if let Some(action) = connecting_view(ui, c, tab.id) {
@@ -1498,6 +1511,16 @@ impl App {
         if let Some(tab_id) = retry {
             let ctx = ui.ctx().clone();
             self.retry_tab(tab_id, &ctx);
+        }
+        // Mirror the active terminal's input to every other terminal.
+        if !broadcast_bytes.is_empty() {
+            for (i, tab) in self.tabs.iter_mut().enumerate() {
+                if i != active
+                    && let TabContent::Terminal(t) = &mut tab.content
+                {
+                    t.write(&broadcast_bytes);
+                }
+            }
         }
     }
 

@@ -30,6 +30,8 @@ pub struct Terminal {
     pub(crate) scroll_remainder: f32,
     /// Set when we asked egui for the clipboard, so the next paste event is a real paste.
     pub(crate) paste_requested: bool,
+    /// User input recorded since the last drain, for multi-exec broadcast.
+    broadcast_buf: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -74,6 +76,7 @@ impl Terminal {
             title: DEFAULT_TITLE.to_owned(),
             exited: false,
             scroll_remainder: 0.0,
+            broadcast_buf: Vec::new(),
             paste_requested: false,
         }
     }
@@ -147,7 +150,14 @@ impl Terminal {
     pub(crate) fn input(&mut self, data: &[u8]) {
         self.term.scroll_display(Scroll::Bottom);
         self.term.selection = None;
+        // Record for multi-exec broadcast (only real user input, not responses).
+        self.broadcast_buf.extend_from_slice(data);
         self.write(data);
+    }
+
+    /// Drains and returns user input entered since the last call (for multi-exec).
+    pub fn take_broadcast(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.broadcast_buf)
     }
 
     /// Pastes text, wrapped in bracketed-paste markers if the program asked for them.
