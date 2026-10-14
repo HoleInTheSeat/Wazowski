@@ -54,6 +54,8 @@ pub enum PaneAction {
     Return(u64),
     /// Close this pane (collapsing the split); a moved-in session returns home.
     ClosePane(u64),
+    /// Close every other pane, keeping only this one.
+    CloseOthers(u64),
 }
 
 /// One node of a tab's layout tree.
@@ -121,6 +123,14 @@ impl Pane {
         }
     }
 
+    fn get_mut(&mut self, id: u64) -> Option<&mut Terminal> {
+        match self {
+            Pane::Leaf(l) if l.term.id() == id => Some(l.term.as_mut()),
+            Pane::Leaf(_) => None,
+            Pane::Split { a, b, .. } => a.get_mut(id).or_else(|| b.get_mut(id)),
+        }
+    }
+
     fn collect_ids(&self, out: &mut Vec<u64>) {
         match self {
             Pane::Leaf(l) => out.push(l.term.id()),
@@ -138,6 +148,17 @@ impl Pane {
             Pane::Split { a, b, .. } => {
                 a.collect_moved_ids(out);
                 b.collect_moved_ids(out);
+            }
+        }
+    }
+
+    fn collect_exited_moved(&self, out: &mut Vec<u64>) {
+        match self {
+            Pane::Leaf(l) if l.home.is_some() && l.term.has_exited() => out.push(l.term.id()),
+            Pane::Leaf(_) => {}
+            Pane::Split { a, b, .. } => {
+                a.collect_exited_moved(out);
+                b.collect_exited_moved(out);
             }
         }
     }
@@ -282,6 +303,10 @@ impl Panes {
         self.root.as_ref().and_then(|r| r.get(id))
     }
 
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut Terminal> {
+        self.root.as_mut().and_then(|r| r.get_mut(id))
+    }
+
     pub fn for_each(&mut self, mut f: impl FnMut(&mut Terminal)) {
         if let Some(root) = &mut self.root {
             root.for_each(&mut f);
@@ -376,6 +401,15 @@ impl Panes {
     /// The terminal id of the leaf currently hosting `home_tab_id`'s session.
     pub fn moved_from(&self, home_tab_id: u64) -> Option<u64> {
         self.root.as_ref().and_then(|r| r.find_moved(home_tab_id))
+    }
+
+    /// Terminal ids of moved-in leaves whose session has exited.
+    pub fn exited_moved(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        if let Some(root) = &self.root {
+            root.collect_exited_moved(&mut out);
+        }
+        out
     }
 
     pub fn prune(&mut self) {
@@ -564,6 +598,10 @@ fn title_bar(cx: &mut Ctx, ui: &mut Ui, bar: Rect, leaf: &Leaf, id: u64) {
                 }
                 if ui.button("Close this pane").clicked() {
                     *cx.action = Some(PaneAction::ClosePane(id));
+                    ui.close();
+                }
+                if ui.button("Close other panes").clicked() {
+                    *cx.action = Some(PaneAction::CloseOthers(id));
                     ui.close();
                 }
                 if !cx.targets.is_empty() {

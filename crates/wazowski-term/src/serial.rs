@@ -142,6 +142,11 @@ impl Backend for SerialBackend {
     fn resize(&mut self, _size: TermSize) -> io::Result<()> {
         Ok(()) // serial has no window size
     }
+
+    fn set_baud(&mut self, baud: u32) -> io::Result<bool> {
+        self.writer.set_baud_rate(baud).map_err(io::Error::other)?;
+        Ok(true)
+    }
 }
 
 impl Drop for SerialBackend {

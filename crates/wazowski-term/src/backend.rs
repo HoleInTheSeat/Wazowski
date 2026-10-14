@@ -31,4 +31,10 @@ pub enum BackendEvent {
 pub trait Backend: Send {
     fn write(&mut self, data: &[u8]) -> io::Result<()>;
     fn resize(&mut self, size: TermSize) -> io::Result<()>;
+    /// Changes the serial baud rate on the fly. Returns `Ok(true)` if the backend
+    /// is a serial port and the change applied; the default `Ok(false)` means the
+    /// backend has no baud rate (local PTY, SSH, …).
+    fn set_baud(&mut self, _baud: u32) -> io::Result<bool> {
+        Ok(false)
+    }
 }

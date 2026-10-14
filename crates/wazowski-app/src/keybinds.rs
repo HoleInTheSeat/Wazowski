@@ -26,10 +26,12 @@ pub enum Action {
     ToggleBroadcast,
     RunMacro,
     Find,
+    BaudUp,
+    BaudDown,
 }
 
 impl Action {
-    pub const ALL: [Action; 10] = [
+    pub const ALL: [Action; 12] = [
         Action::NewShell,
         Action::CloseTab,
         Action::NextTab,
@@ -40,6 +42,8 @@ impl Action {
         Action::ToggleBroadcast,
         Action::RunMacro,
         Action::Find,
+        Action::BaudUp,
+        Action::BaudDown,
     ];
 
     /// Human-readable name shown in the Settings dialog and menus.
@@ -55,6 +59,8 @@ impl Action {
             Action::ToggleBroadcast => "Toggle broadcast",
             Action::RunMacro => "Run macro…",
             Action::Find => "Find in terminals",
+            Action::BaudUp => "Serial: raise baud",
+            Action::BaudDown => "Serial: lower baud",
         }
     }
 
@@ -74,6 +80,8 @@ impl Action {
             Action::ToggleBroadcast => KeyboardShortcut::new(ctrl_shift, Key::B),
             Action::RunMacro => KeyboardShortcut::new(ctrl_shift, Key::M),
             Action::Find => KeyboardShortcut::new(ctrl_shift, Key::F),
+            Action::BaudUp => KeyboardShortcut::new(ctrl_shift, Key::ArrowUp),
+            Action::BaudDown => KeyboardShortcut::new(ctrl_shift, Key::ArrowDown),
         }
     }
 }

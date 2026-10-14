@@ -148,6 +148,18 @@ impl Terminal {
         }
     }
 
+    /// Changes the serial baud rate on the fly. Returns whether this terminal's
+    /// backend is a serial port (and the change applied).
+    pub fn set_baud(&mut self, baud: u32) -> bool {
+        match self.backend.set_baud(baud) {
+            Ok(applied) => applied,
+            Err(e) => {
+                log::warn!("could not change baud rate: {e}");
+                false
+            }
+        }
+    }
+
     /// Sends raw bytes to the backend.
     pub fn write(&mut self, data: &[u8]) {
         if self.exited {

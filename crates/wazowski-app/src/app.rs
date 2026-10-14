@@ -284,6 +284,8 @@ impl AddSourceForm {
 /// Fields for the "New serial connection" dialog.
 struct SerialForm {
     ports: Vec<String>,
+    /// Case-insensitive substring filter for the port list (e.g. "usb").
+    filter: String,
     path: String,
     baud: String,
     data_bits: u8,
@@ -299,6 +301,7 @@ impl SerialForm {
         let path = ports.first().cloned().unwrap_or_default();
         Self {
             ports,
+            filter: String::new(),
             path,
             baud: "115200".into(),
             data_bits: 8,
@@ -780,6 +783,14 @@ impl App {
                     self.return_home(home, term);
                 }
             }
+            PaneAction::CloseOthers(leaf) => {
+                let others = self.active_panes_mut().map(|p| p.keep_only(leaf)).unwrap_or_default();
+                for (term, home) in others {
+                    if let Some(home) = home {
+                        self.return_home(home, term);
+                    }
+                }
+            }
             PaneAction::Swap { leaf, from_tab } => self.swap_into_pane(leaf, from_tab),
         }
     }
@@ -818,6 +829,48 @@ impl App {
         let old = self.active_panes_mut().and_then(|p| p.replace_leaf(leaf, term, Some(home)));
         if let Some((old_term, Some(old_home))) = old {
             self.return_home(old_home, old_term);
+        }
+    }
+
+    /// Steps the active serial tab's baud rate up (`delta > 0`) or down through
+    /// the common rates, applying it live and remembering it for a restart.
+    fn adjust_baud(&mut self, delta: i32) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let current = match &tab.restart {
+            Some(RestartKind::Serial(cfg)) => cfg.baud,
+            _ => return,
+        };
+        let idx = COMMON_BAUDS.iter().position(|&b| b == current).unwrap_or_else(|| {
+            COMMON_BAUDS
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, b)| (i64::from(**b) - i64::from(current)).abs())
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        });
+        let new_idx = (idx as i32 + delta).clamp(0, COMMON_BAUDS.len() as i32 - 1) as usize;
+        let new_baud = COMMON_BAUDS[new_idx];
+        if new_baud == current {
+            return;
+        }
+        let applied = match &mut tab.content {
+            TabContent::Terminal(panes) => {
+                let focused = panes.focused_id();
+                panes.get_mut(focused).is_some_and(|t| t.set_baud(new_baud))
+            }
+            _ => false,
+        };
+        if applied && let Some(RestartKind::Serial(cfg)) = &mut tab.restart {
+            cfg.baud = new_baud;
+        }
+    }
+
+    /// The active tab's live serial baud rate, if it is a serial terminal.
+    fn active_serial_baud(&self) -> Option<u32> {
+        let tab = self.tabs.get(self.active)?;
+        match (&tab.content, &tab.restart) {
+            (TabContent::Terminal(_), Some(RestartKind::Serial(cfg))) => Some(cfg.baud),
+            _ => None,
         }
     }
 
@@ -1337,6 +1390,12 @@ impl App {
                 Some(_) => self.find = None,
                 None => self.find = Some(FindState { just_opened: true, ..Default::default() }),
             }
+        }
+        if triggered(Action::BaudUp, ctx, &self.keymap) {
+            self.adjust_baud(1);
+        }
+        if triggered(Action::BaudDown, ctx, &self.keymap) {
+            self.adjust_baud(-1);
         }
         // Action::RunMacro is handled (and consumed) by the macros feature.
         self.macro_shortcut(ctx);
@@ -2221,6 +2280,7 @@ impl App {
         let mut close = None;
         let mut toggle_files = None;
         let mut pane_action: Option<SplitButton> = None;
+        let mut baud_delta: Option<i32> = None;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, tab) in self.tabs.iter().enumerate() {
@@ -2264,6 +2324,17 @@ impl App {
                         pane_action = Some(SplitButton::Close);
                     }
                 }
+                // Live baud controls, for the active serial terminal.
+                if let Some(baud) = self.active_serial_baud() {
+                    ui.separator();
+                    if ui.button("−").on_hover_text("Lower baud (Ctrl+Shift+Down)").clicked() {
+                        baud_delta = Some(-1);
+                    }
+                    ui.label(format!("{baud} baud"));
+                    if ui.button("+").on_hover_text("Raise baud (Ctrl+Shift+Up)").clicked() {
+                        baud_delta = Some(1);
+                    }
+                }
                 // A toggle for the SFTP panel, for the active SSH tab. Hidden
                 // while the tab is split, to avoid confusion about which pane it
                 // belongs to; it returns once the tab is a single session again.
@@ -2289,6 +2360,9 @@ impl App {
             Some(SplitButton::Split(dir)) => self.split_active_pane(dir, ui.ctx()),
             Some(SplitButton::Close) => self.close_active_pane(),
             None => {}
+        }
+        if let Some(delta) = baud_delta {
+            self.adjust_baud(delta);
         }
         if let Some(i) = close {
             self.close_tab(i);
@@ -3382,12 +3456,14 @@ impl App {
         });
     }
 
-    /// Sends `bytes` to each target terminal that still exists.
+    /// Sends `bytes` to each target terminal. When broadcast is on, it also
+    /// mirrors to every other non-excluded terminal, like typed input does.
     fn macro_send(&mut self, ids: &[u64], bytes: &[u8]) {
+        let broadcast = self.broadcast;
         for tab in &mut self.tabs {
             if let TabContent::Terminal(panes) = &mut tab.content {
                 panes.for_each(|t| {
-                    if ids.contains(&t.id()) {
+                    if ids.contains(&t.id()) || (broadcast && !t.broadcast_excluded()) {
                         t.write(bytes);
                     }
                 });
@@ -3664,10 +3740,23 @@ impl App {
                 egui::Grid::new("serial-fields").num_columns(2).show(ui, |ui| {
                     ui.label("Port");
                     ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut f.filter)
+                                .hint_text("filter, e.g. usb")
+                                .desired_width(90.0),
+                        )
+                        .on_hover_text("Case-insensitive substring filter for the port list");
+                        let needle = f.filter.to_lowercase();
+                        let matches: Vec<String> = f
+                            .ports
+                            .iter()
+                            .filter(|p| needle.is_empty() || p.to_lowercase().contains(&needle))
+                            .cloned()
+                            .collect();
                         egui::ComboBox::from_id_salt("serial-port")
                             .selected_text(if f.path.is_empty() { "(none)" } else { &f.path })
                             .show_ui(ui, |ui| {
-                                for port in &f.ports {
+                                for port in &matches {
                                     ui.selectable_value(&mut f.path, port.clone(), port);
                                 }
                             });
@@ -5466,6 +5555,25 @@ impl eframe::App for App {
                 self.last_sync = std::time::Instant::now();
             }
             ctx.request_repaint_after(SYNC_EVERY);
+        }
+
+        // A borrowed session (shown in another tab's split) that has exited
+        // returns to its own tab, which then shows the "ended" banner with the
+        // restart / save / close options — just like ending in its own tab.
+        for i in 0..self.tabs.len() {
+            let exited = match &self.tabs[i].content {
+                TabContent::Terminal(panes) => panes.exited_moved(),
+                _ => Vec::new(),
+            };
+            for id in exited {
+                let taken = match &mut self.tabs[i].content {
+                    TabContent::Terminal(panes) => panes.remove_leaf(id),
+                    _ => None,
+                };
+                if let Some((term, Some(home))) = taken {
+                    self.return_home(home, term);
+                }
+            }
         }
 
         // If a split tab's own (origin) session has exited, collapse the split
