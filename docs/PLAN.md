@@ -66,31 +66,31 @@ Each phase ends with something runnable.
 Agreed "do next" items (rough order TBD with the user):
 
 - **Release filenames carry the version** ✅ (tag is embedded in each asset name).
-- **Session-aware split panes** — splitting a pane shows a MobaXterm-style title
-  bar per split area; clicking it picks which currently-open tab/session that
-  split displays (panes reference sessions rather than owning a single shell).
-- **Left-pane view switcher** — tabs at the top of the left pane to toggle
-  between Sessions and Macros. The Macros view lists macros: double-click runs
-  (with the confirm dialog), right-click for edit/delete/duplicate/run-targets.
-- **Settings tab** — opened from the Terminal menu, rendered like a session tab;
-  holds global options, persisted. Settings to include:
-  - Automatic vault backup options.
-  - Single-instance enforcement (block a second Wazowski unless allowed here).
-  - Startup tab (a chosen session, or none).
-  - New-tab placement: Never (append at far right) / When duplicating / Always
-    (open next to the current tab).
-- **Edit shared sources** — edit a folder share's path, and a git share's url,
-  branch, file, and auth (for renames, moved repos/branches, changed auth).
-- **Hover tooltips in the left pane** — after ~3 s, brief useful info (e.g. a git
-  share shows it's a repo plus the repo name), kept concise.
-- **Find in terminals** — Ctrl+Shift+F searches on-screen terminals for entered
-  text; case-insensitive with substring match by default, with options.
-- **Keep closed SSH tabs open** — when a session ends, keep the tab with buttons
-  to restart the session, save the terminal buffer to a file, or close.
-- **Recent-sessions launcher** — the empty "Wazowski" screen shows a grid/list of
-  buttons for the last 10 sessions to quickly resume.
-- **About view** — version, and links to GitHub/changelog/etc.; opened from the
-  Terminal menu.
+- **Session-aware split panes** (TODO — only remaining Phase 6 "now" item):
+  splitting a pane shows a MobaXterm-style title bar per split area; clicking it
+  picks which currently-open session that split displays. Agreed behavior: the
+  session *moves* into the pane (one terminal, one place) and *moves back to its
+  own tab* when the split view is closed.
+- **Left-pane view switcher** ✅ — Sessions/Macros tabs at the top of the left
+  pane; Macros view: double-click runs (confirm dialog), right-click for run
+  targets / edit / duplicate / delete; Ctrl+Shift+M switches to it.
+- **Settings tab** ✅ — Terminal ▸ Settings, rendered like a session tab,
+  persisted to settings.toml:
+  - Automatic vault backup (enable, interval, folder, open-folder, back-up-now). ✅
+  - Single-instance enforcement (advisory lock, fs2) unless allowed. ✅
+  - Startup tab (nothing / local shell / a saved session). ✅
+  - New-tab placement: Never / When duplicating / Always. ✅
+- **Edit shared sources** ✅ — right-click ▸ Edit source…; folder path, or git
+  url/branch/file/auth, all editable in place.
+- **Hover tooltips in the left pane** ✅ — ~3 s delayed; sessions show
+  address/auth/legacy, shared sources show folder/git details.
+- **Find in terminals** ✅ — Ctrl+Shift+F; highlights matches on the visible
+  panes with a live count; case-insensitive by default + a case toggle.
+- **Keep closed SSH tabs open** ✅ — ended SSH/serial tabs stay with Restart /
+  Save output… / Close; local shells auto-close.
+- **Recent-sessions launcher** ✅ — the empty "Wazowski" screen lists the last 10
+  sessions to resume.
+- **About view** ✅ — Terminal ▸ About Wazowski: version + repo/releases links.
 
 ## Later backlog (roadmap, not yet scheduled)
 
