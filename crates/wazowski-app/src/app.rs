@@ -236,6 +236,8 @@ struct AddSourceForm {
     username: String,
     token: String,
     key_path: String,
+    icon: String,
+    color: Option<[u8; 3]>,
 }
 
 impl Default for AddSourceForm {
@@ -252,6 +254,8 @@ impl Default for AddSourceForm {
             username: String::new(),
             token: String::new(),
             key_path: String::new(),
+            icon: String::new(),
+            color: None,
         }
     }
 }
@@ -271,6 +275,8 @@ impl AddSourceForm {
             username: def.username.clone(),
             token: token.unwrap_or_default(),
             key_path: def.key_path.clone(),
+            icon: def.icon.clone(),
+            color: def.color,
         }
     }
 }
@@ -1780,7 +1786,16 @@ impl App {
         // Each shared source as its own collapsible section.
         for source in &self.shared {
             let badge = if source.available() { "" } else { "  (offline)" };
-            let header = egui::CollapsingHeader::new(format!("🌐 {}{badge}", source.name()))
+            let def = source.def();
+            let icon = if def.icon.is_empty() { "🌐" } else { def.icon.as_str() };
+            let title = {
+                let t = RichText::new(format!("{icon} {}{badge}", source.name()));
+                match def.color {
+                    Some([r, g, b]) => t.color(Color32::from_rgb(r, g, b)),
+                    None => t,
+                }
+            };
+            let header = egui::CollapsingHeader::new(title)
                 .id_salt(("shared-source", source.id()))
                 .default_open(true);
             let store = StoreId::Shared(source.id().to_owned());
@@ -4020,6 +4035,8 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
+                appearance_picker(ui, &mut f.icon, &mut f.color, "🌐");
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     add |= ui.button(if editing { "Save" } else { "Add" }).clicked();
                     cancel |= ui.button("Cancel").clicked();
@@ -4083,6 +4100,8 @@ impl App {
             auth: f.auth,
             username: f.username.trim().to_owned(),
             key_path: f.key_path.trim().to_owned(),
+            icon: f.icon.clone(),
+            color: f.color,
         };
         let mut token = None;
         match f.kind {

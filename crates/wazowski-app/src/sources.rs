@@ -65,6 +65,12 @@ pub struct SourceDef {
     /// Git SSH private key path (empty = agent/default key).
     #[serde(default)]
     pub key_path: String,
+    /// Optional custom icon (an emoji); empty uses the default.
+    #[serde(default)]
+    pub icon: String,
+    /// Optional custom header color, as sRGB `[r, g, b]`.
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
 }
 
 /// The keyring service under which git HTTPS tokens are stored.
@@ -447,6 +453,8 @@ mod tests {
             auth: GitAuthKind::None,
             username: String::new(),
             key_path: String::new(),
+            icon: String::new(),
+            color: None,
         };
 
         // A brand-new source has no file yet; create() writes an empty one.
@@ -481,6 +489,8 @@ mod tests {
             auth: GitAuthKind::None,
             username: String::new(),
             key_path: String::new(),
+            icon: String::new(),
+            color: None,
         })
         .unwrap();
         let reloaded = SourcesConfig::load(path).unwrap();
@@ -500,6 +510,8 @@ mod tests {
             auth: GitAuthKind::None,
             username: String::new(),
             key_path: String::new(),
+            icon: String::new(),
+            color: None,
         }
     }
 
