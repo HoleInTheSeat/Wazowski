@@ -574,6 +574,17 @@ async fn execute_sftp(
             session.rename(from, to).await?;
             SftpReply::Done
         }
+        SftpOp::Copy { from, to } => {
+            let mut source = session.open(from).await?;
+            let mut dest = session
+                .open_with_flags(to, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE)
+                .await?;
+            tokio::io::copy(&mut source, &mut dest)
+                .await
+                .map_err(russh_sftp::client::error::Error::from)?;
+            dest.shutdown().await.map_err(russh_sftp::client::error::Error::from)?;
+            SftpReply::Done
+        }
     })
 }
 

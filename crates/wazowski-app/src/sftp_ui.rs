@@ -64,8 +64,12 @@ pub struct FileBrowser {
     temp_dir: PathBuf,
     /// Remote files opened locally, watched for edits.
     open_files: Vec<OpenFile>,
-    /// Whether the panel follows the terminal's current directory.
-    follow: bool,
+    /// Whether to periodically re-list the current directory.
+    auto_refresh: bool,
+    /// When the directory was last (auto-)refreshed.
+    last_refresh: std::time::Instant,
+    /// Inline "duplicate" prompt: (source name, new name) when active.
+    duplicate: Option<(String, String)>,
 }
 
 impl FileBrowser {
@@ -87,22 +91,19 @@ impl FileBrowser {
             new_folder: None,
             temp_dir,
             open_files: Vec::new(),
-            follow: false,
+            auto_refresh: false,
+            last_refresh: std::time::Instant::now(),
+            duplicate: None,
         }
     }
 
-    /// Whether "follow terminal directory" is enabled.
-    pub fn following(&self) -> bool {
-        self.follow
+    /// The current auto-refresh state (persisted per session by the app).
+    pub fn auto_refresh(&self) -> bool {
+        self.auto_refresh
     }
 
-    /// Navigates to `path` if it differs from the current directory (used to
-    /// follow the terminal's working directory). No-op while busy.
-    pub fn follow_path(&mut self, path: &str, ctx: &Context) {
-        if self.busy() || path.is_empty() || path == self.cwd {
-            return;
-        }
-        self.list(path.to_owned(), ctx);
+    pub fn set_auto_refresh(&mut self, on: bool) {
+        self.auto_refresh = on;
     }
 
     /// Spawns a job that lists `path`, resolving it to an absolute path first.
@@ -151,6 +152,7 @@ impl FileBrowser {
                 self.selected = None;
                 self.status.clear();
                 self.job = None;
+                self.last_refresh = std::time::Instant::now();
             }
             Ok(Ok(JobOutcome::Opened { remote, local })) => {
                 self.job = None;
@@ -192,6 +194,16 @@ impl FileBrowser {
         }
         self.poll(ctx);
 
+        // Auto-refresh the listing periodically. This runs only while the panel
+        // is drawn, so it naturally pauses on tabs the user isn't viewing.
+        const AUTO_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+        if self.auto_refresh && !self.busy() && self.last_refresh.elapsed() >= AUTO_REFRESH_EVERY {
+            self.refresh(ctx);
+        }
+        if self.auto_refresh {
+            ctx.request_repaint_after(AUTO_REFRESH_EVERY);
+        }
+
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.heading("Files");
@@ -215,8 +227,8 @@ impl FileBrowser {
                 }
             });
         });
-        ui.checkbox(&mut self.follow, "Follow terminal directory")
-            .on_hover_text("When the shell changes directory (cd), follow it here");
+        ui.checkbox(&mut self.auto_refresh, "Auto-refresh")
+            .on_hover_text("Periodically re-list this directory (only while this tab is visible)");
 
         ui.add_space(2.0);
         ui.label(RichText::new(&self.cwd).monospace().weak());
@@ -246,6 +258,30 @@ impl FileBrowser {
             ui.separator();
         }
 
+        if let Some((_, new_name)) = &mut self.duplicate {
+            let mut confirm = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                ui.label("Duplicate as:");
+                let resp = ui.text_edit_singleline(new_name);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    confirm = true;
+                }
+                if ui.button("Copy").clicked() {
+                    confirm = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+            if confirm {
+                self.do_duplicate(ctx);
+            } else if cancel {
+                self.duplicate = None;
+            }
+            ui.separator();
+        }
+
         // Watch opened files for local edits, and keep polling while any are open.
         self.watch_open_files();
         if !self.open_files.is_empty() {
@@ -267,10 +303,16 @@ impl FileBrowser {
     }
 
     fn entry_list(&mut self, ui: &mut egui::Ui, ctx: &Context) {
-        let mut navigate_into = None;
-        let mut download_file = None;
+        enum Act {
+            Navigate(String),
+            Open(String),
+            Download(String),
+            Duplicate(String),
+            Delete(String, bool),
+        }
+        let mut act = None;
 
-        egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, entry) in self.entries.iter().enumerate() {
                 let icon = if entry.is_dir { "📁" } else { "📄" };
                 let label = if entry.is_dir {
@@ -283,52 +325,51 @@ impl FileBrowser {
                     self.selected = Some(i);
                 }
                 if resp.double_clicked() {
-                    if entry.is_dir {
-                        navigate_into = Some(entry.name.clone());
+                    act = Some(if entry.is_dir {
+                        Act::Navigate(entry.name.clone())
                     } else {
-                        download_file = Some((entry.name.clone(), entry.size));
-                    }
+                        Act::Open(entry.name.clone())
+                    });
                 }
-                let resp = resp.on_hover_text(if entry.is_dir {
-                    "Double-click to open"
+                let name = entry.name.clone();
+                let is_dir = entry.is_dir;
+                resp.on_hover_text(if is_dir {
+                    "Double-click to open; right-click for actions"
                 } else {
-                    "Double-click to open locally; edits can be uploaded back"
+                    "Double-click to open locally; right-click for actions"
+                })
+                .context_menu(|ui| {
+                    if ui.button("Open").clicked() {
+                        act = Some(if is_dir { Act::Navigate(name.clone()) } else { Act::Open(name.clone()) });
+                        ui.close();
+                    }
+                    if !is_dir {
+                        if ui.button("Download…").clicked() {
+                            act = Some(Act::Download(name.clone()));
+                            ui.close();
+                        }
+                        if ui.button("Duplicate…").clicked() {
+                            act = Some(Act::Duplicate(name.clone()));
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Delete").clicked() {
+                        act = Some(Act::Delete(name.clone(), is_dir));
+                        ui.close();
+                    }
                 });
-                let _ = resp;
             }
         });
 
-        if let Some(name) = navigate_into {
-            let target = join(&self.cwd, &name);
-            self.list(target, ctx);
+        match act {
+            Some(Act::Navigate(name)) => self.list(join(&self.cwd, &name), ctx),
+            Some(Act::Open(name)) => self.open_file(&name, ctx),
+            Some(Act::Download(name)) => self.download(&name, ctx),
+            Some(Act::Duplicate(name)) => self.duplicate = Some((name.clone(), name)),
+            Some(Act::Delete(name, is_dir)) => self.delete(&name, is_dir, ctx),
+            None => {}
         }
-        if let Some((name, _)) = download_file {
-            self.open_file(&name, ctx);
-        }
-
-        ui.add_space(4.0);
-        let has_selection = self.selected.is_some() && !self.busy();
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(has_selection, |ui| {
-                if ui.button("Download").clicked()
-                    && let Some(entry) = self.selected_entry()
-                    && !entry.is_dir
-                {
-                    let name = entry.name.clone();
-                    self.download(&name, ctx);
-                }
-                if ui.button("Delete").clicked()
-                    && let Some(entry) = self.selected_entry()
-                {
-                    let (name, is_dir) = (entry.name.clone(), entry.is_dir);
-                    self.delete(&name, is_dir, ctx);
-                }
-            });
-        });
-    }
-
-    fn selected_entry(&self) -> Option<&FileEntry> {
-        self.selected.and_then(|i| self.entries.get(i))
     }
 
     fn go_up(&mut self, ctx: &Context) {
@@ -401,48 +442,81 @@ impl FileBrowser {
         }
     }
 
-    /// Lists files opened locally from this session: edited ones are flagged and
-    /// can be uploaded back; any can be closed (stops watching).
+    /// Lists files opened locally from this session. Right-click a file to
+    /// upload edits back, delete its temp copy, or stop watching it. The header
+    /// button deletes the whole temp directory.
     fn open_files_panel(&mut self, ui: &mut egui::Ui, ctx: &Context) {
         if self.open_files.is_empty() {
             return;
         }
+        enum Act {
+            Upload(usize),
+            DeleteLocal(usize),
+            Close(usize),
+            DeleteAll,
+        }
+        let mut act = None;
         ui.separator();
-        ui.label(RichText::new("Opened files").strong());
-        let mut upload: Option<usize> = None;
-        let mut close: Option<usize> = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Opened files").strong());
+            if ui
+                .button("🗑")
+                .on_hover_text("Delete all downloaded temp files for this session")
+                .clicked()
+            {
+                act = Some(Act::DeleteAll);
+            }
+        });
         for (i, f) in self.open_files.iter().enumerate() {
             let name = f.remote.rsplit('/').next().unwrap_or(&f.remote);
-            ui.horizontal(|ui| {
-                if f.changed {
-                    ui.label(RichText::new(format!("✎ {name}")).color(ui.visuals().warn_fg_color))
-                        .on_hover_text("Edited locally — upload to send changes back");
-                } else {
-                    ui.label(format!("📄 {name}"));
+            let label = if f.changed {
+                RichText::new(format!("✎ {name}")).color(ui.visuals().warn_fg_color)
+            } else {
+                RichText::new(format!("📄 {name}"))
+            };
+            let hover = if f.changed {
+                "Edited locally — right-click to upload"
+            } else {
+                "Right-click for actions"
+            };
+            ui.label(label).on_hover_text(hover).context_menu(|ui| {
+                if ui.add_enabled(f.changed, egui::Button::new("Upload changes")).clicked() {
+                    act = Some(Act::Upload(i));
+                    ui.close();
                 }
-                if ui
-                    .add_enabled(f.changed, egui::Button::new("Upload"))
-                    .on_hover_text("Upload the edited file back to the server")
-                    .clicked()
-                {
-                    upload = Some(i);
+                if ui.button("Delete local copy").clicked() {
+                    act = Some(Act::DeleteLocal(i));
+                    ui.close();
                 }
-                if ui.button("Close").on_hover_text("Stop watching this file").clicked() {
-                    close = Some(i);
+                if ui.button("Stop watching").clicked() {
+                    act = Some(Act::Close(i));
+                    ui.close();
                 }
             });
         }
-        if let Some(i) = upload {
-            let (remote, local) =
-                (self.open_files[i].remote.clone(), self.open_files[i].local.clone());
-            self.open_files[i].seen = mtime(&local);
-            self.open_files[i].changed = false;
-            self.spawn(ctx, move |sftp| {
-                sftp.upload(local, &remote)?;
-                Ok(JobOutcome::Noop)
-            });
-        } else if let Some(i) = close {
-            self.open_files.remove(i);
+        match act {
+            Some(Act::Upload(i)) => {
+                let (remote, local) =
+                    (self.open_files[i].remote.clone(), self.open_files[i].local.clone());
+                self.open_files[i].seen = mtime(&local);
+                self.open_files[i].changed = false;
+                self.spawn(ctx, move |sftp| {
+                    sftp.upload(local, &remote)?;
+                    Ok(JobOutcome::Noop)
+                });
+            }
+            Some(Act::DeleteLocal(i)) => {
+                let _ = std::fs::remove_file(&self.open_files[i].local);
+                self.open_files.remove(i);
+            }
+            Some(Act::Close(i)) => {
+                self.open_files.remove(i);
+            }
+            Some(Act::DeleteAll) => {
+                let _ = std::fs::remove_dir_all(&self.temp_dir);
+                self.open_files.clear();
+            }
+            None => {}
         }
     }
 
@@ -450,6 +524,21 @@ impl FileBrowser {
         let remote = join(&self.cwd, name);
         self.spawn(ctx, move |sftp| {
             sftp.remove(&remote, is_dir)?;
+            Ok(JobOutcome::Acted)
+        });
+    }
+
+    /// Copies the selected remote file to a new name in the current directory.
+    fn do_duplicate(&mut self, ctx: &Context) {
+        let Some((src, new_name)) = self.duplicate.take() else { return };
+        let new_name = new_name.trim().to_owned();
+        if new_name.is_empty() || new_name == src {
+            return;
+        }
+        let from = join(&self.cwd, &src);
+        let to = join(&self.cwd, &new_name);
+        self.spawn(ctx, move |sftp| {
+            sftp.copy(&from, &to)?;
             Ok(JobOutcome::Acted)
         });
     }

@@ -51,6 +51,9 @@ pub struct Session {
     /// Optional custom label color, as sRGB `[r, g, b]`.
     #[serde(default)]
     pub color: Option<[u8; 3]>,
+    /// Remembered SFTP auto-refresh state for this session.
+    #[serde(default)]
+    pub sftp_auto_refresh: bool,
 }
 
 fn default_port() -> u16 {
@@ -71,6 +74,7 @@ impl Session {
             legacy: false,
             icon: String::new(),
             color: None,
+            sftp_auto_refresh: false,
         }
     }
 

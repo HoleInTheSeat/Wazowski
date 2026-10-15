@@ -46,6 +46,9 @@ struct Tab {
     /// Terminal id of this tab's own (original) session, so that when it ends,
     /// any sessions borrowed into split panes can be sent back to their tabs.
     origin_term: Option<u64>,
+    /// The saved session this tab connects to (for persisting per-session UI
+    /// state like SFTP auto-refresh). `None` for shells and ad-hoc connects.
+    session_id: Option<String>,
 }
 
 /// How a terminal tab's session can be restarted after it ends.
@@ -532,14 +535,6 @@ pub struct App {
     serial_ports_at: std::time::Instant,
 }
 
-/// Extracts an absolute working directory from a terminal title, as set by the
-/// common `user@host:/path` xterm-title convention. Returns `None` for titles
-/// without an absolute path (e.g. home-relative `~` paths).
-fn cwd_from_title(title: &str) -> Option<String> {
-    let segment = title.rsplit(':').next().unwrap_or(title).trim();
-    segment.starts_with('/').then(|| segment.to_owned())
-}
-
 /// Natural (numeric-aware) comparison of two serial device names, so `ttyUSB2`
 /// sorts before `ttyUSB10`.
 fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
@@ -993,6 +988,7 @@ impl App {
             files,
             restart: None,
             origin_term,
+            session_id: None,
         };
         let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
         let index = if adjacent && !self.tabs.is_empty() {
@@ -1081,8 +1077,9 @@ impl App {
         }
         let mut session = session.clone();
         session.username = username;
+        let session_id = self.saved_session_id(&session);
         let params = self.params_for(&session, resolved.material);
-        self.open_connecting_tab(title.to_owned(), params, ctx);
+        self.open_connecting_tab(title.to_owned(), params, session_id, ctx);
     }
 
     /// Builds connect parameters for a session with resolved auth material.
@@ -1100,7 +1097,14 @@ impl App {
     }
 
     /// Opens a tab that shows connection progress and the handshake log.
-    fn open_connecting_tab(&mut self, title: String, params: ConnectParams, ctx: &egui::Context) {
+    /// `session_id` is the saved session (if any) for persisting per-session UI.
+    fn open_connecting_tab(
+        &mut self,
+        title: String,
+        params: ConnectParams,
+        session_id: Option<String>,
+        ctx: &egui::Context,
+    ) {
         let pending = PendingConnect::spawn(params.clone(), ctx);
         let connecting = Connecting {
             params,
@@ -1111,6 +1115,15 @@ impl App {
             error: None,
         };
         self.push_tab(title, TabContent::Connecting(Box::new(connecting)), None);
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.session_id = session_id;
+        }
+    }
+
+    /// The saved-session id for a session, if it exists in some store (so ad-hoc
+    /// quick connects, whose ids aren't stored, don't persist state).
+    fn saved_session_id(&self, session: &Session) -> Option<String> {
+        self.find_session_anywhere(&session.id).map(|_| session.id.clone())
     }
 
     /// Opens the auth chooser for a quick `user@host[:port]` connection.
@@ -1180,6 +1193,15 @@ impl App {
     fn poll_connections(&mut self, ctx: &egui::Context) {
         let mut any_active = false;
         for index in 0..self.tabs.len() {
+            if !matches!(self.tabs[index].content, TabContent::Connecting(_)) {
+                continue;
+            }
+            // Precompute (needs &self) before taking the &mut Connecting borrow.
+            let auto_refresh = self.tabs[index]
+                .session_id
+                .as_ref()
+                .and_then(|id| self.find_session_anywhere(id))
+                .is_some_and(|(_, s)| s.sftp_auto_refresh);
             let TabContent::Connecting(c) = &mut self.tabs[index].content else { continue };
             let Some(pending) = &c.pending else { continue };
             pending.drain_log(&mut c.log);
@@ -1187,7 +1209,9 @@ impl App {
                 Progress::Waiting => any_active = true,
                 Progress::Ready(Connected { backend, output }) => {
                     // Grab an SFTP handle before the backend is boxed into the terminal.
-                    let files = FileBrowser::new(backend.sftp());
+                    let mut files = FileBrowser::new(backend.sftp());
+                    // Restore this session's remembered SFTP auto-refresh setting.
+                    files.set_auto_refresh(auto_refresh);
                     let params = c.params.clone();
                     let term = Terminal::new(Box::new(backend), output, TermSize::default());
                     let term_id = term.id();
@@ -4520,9 +4544,11 @@ impl App {
                     (prompt.title.clone(), prompt.session.clone(), prompt.material.clone());
                 session.username = username; // in-memory only; not persisted
                 self.dialog = Dialog::None;
+                let session_id = self.saved_session_id(&session);
                 self.open_connecting_tab(
                     title,
                     self.params_for(&session, material),
+                    session_id,
                     ctx,
                 );
             }
@@ -5824,30 +5850,27 @@ impl eframe::App for App {
             self.tabs.get(self.active).map(|t| &t.content),
             Some(TabContent::Terminal(p)) if p.count() == 1
         );
-        // The active terminal's directory (parsed from its title) to optionally
-        // follow in the SFTP pane.
-        let term_cwd = self.tabs.get(self.active).and_then(|t| match &t.content {
-            TabContent::Terminal(p) => p.get(p.focused_id()).and_then(|t| {
-                // Prefer the shell's OSC 7 report; fall back to parsing the title.
-                t.cwd().map(ToOwned::to_owned).or_else(|| cwd_from_title(t.title()))
-            }),
-            _ => None,
-        });
         if single_pane
             && let Some(tab) = self.tabs.get_mut(self.active)
             && tab.show_files
             && let Some(files) = &mut tab.files
         {
-            if files.following()
-                && let Some(cwd) = &term_cwd
-            {
-                files.follow_path(cwd, &ctx);
-            }
             egui::Panel::right("files")
                 .resizable(true)
                 .default_size(300.0)
                 .size_range(220.0..=560.0)
                 .show(ui, |ui| files.ui(ui, &ctx));
+        }
+        // Persist a changed SFTP auto-refresh toggle back to the saved session.
+        let pref = self.tabs.get(self.active).and_then(|t| {
+            Some((t.session_id.clone()?, t.files.as_ref()?.auto_refresh()))
+        });
+        if let Some((sid, current)) = pref
+            && let Some((store, mut session)) = self.find_session_anywhere(&sid)
+            && session.sftp_auto_refresh != current
+        {
+            session.sftp_auto_refresh = current;
+            let _ = self.store_upsert(&store, session);
         }
 
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.central(ui));

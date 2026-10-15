@@ -33,6 +33,7 @@ pub(crate) enum SftpOp {
     Mkdir(String),
     Remove { path: String, is_dir: bool },
     Rename { from: String, to: String },
+    Copy { from: String, to: String },
 }
 
 /// The result of an [`SftpOp`].
@@ -112,6 +113,11 @@ impl Sftp {
 
     pub fn rename(&self, from: &str, to: &str) -> Result<(), String> {
         self.expect_done(SftpOp::Rename { from: from.to_owned(), to: to.to_owned() })
+    }
+
+    /// Server-side copy of a file to a new path (streamed through the connection).
+    pub fn copy(&self, from: &str, to: &str) -> Result<(), String> {
+        self.expect_done(SftpOp::Copy { from: from.to_owned(), to: to.to_owned() })
     }
 
     fn expect_done(&self, op: SftpOp) -> Result<(), String> {

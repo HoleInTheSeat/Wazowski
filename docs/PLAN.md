@@ -105,6 +105,10 @@ Agreed "do next" items (rough order TBD with the user):
 
 ## Later backlog (roadmap, not yet scheduled)
 
+- **SFTP: follow the terminal's working directory** — when the shell changes
+  directory, move the SFTP pane to match. (Removed from beta for now; needs a
+  reliable cwd source — OSC 7 is tracked in `Terminal::cwd`, but the title-based
+  path and some shells don't report it.)
 - **File diff comparison.**
 - **List host hardware.**
 - **Running processes view** — likely `htop` in a tab, or a native list.
