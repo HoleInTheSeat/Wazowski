@@ -10,6 +10,7 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 eframe = "0.36"
 egui = "0.36"
+regex = "1"
 alacritty_terminal = "0.26"
 portable-pty = "0.9"
 serialport = { version = "4", default-features = false }

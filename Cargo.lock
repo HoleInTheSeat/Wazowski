@@ -5911,6 +5911,7 @@ dependencies = [
  "keyring",
  "log",
  "open",
+ "regex",
  "rfd",
  "serde",
  "tempfile",
@@ -5988,6 +5989,7 @@ dependencies = [
  "egui",
  "log",
  "portable-pty",
+ "regex",
  "serialport",
 ]
 

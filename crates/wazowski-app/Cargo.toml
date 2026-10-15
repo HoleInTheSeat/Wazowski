@@ -24,6 +24,7 @@ keyring.workspace = true
 base64 = "0.22"
 open = "5"
 fs2 = "0.4"
+regex.workspace = true
 log.workspace = true
 env_logger.workspace = true
 

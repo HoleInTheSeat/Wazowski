@@ -10,6 +10,7 @@
 use eframe::egui::{
     self, Color32, CursorIcon, Id, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2,
 };
+use regex::Regex;
 use wazowski_term::{SearchQuery, Terminal, TerminalView};
 
 /// Which way a split arranges its two children.
@@ -435,6 +436,7 @@ impl Panes {
         targets: &[SwapTarget],
         origin: Option<u64>,
         font_size: f32,
+        highlights: &[(Regex, egui::Color32)],
         action: &mut Option<PaneAction>,
     ) -> Option<(u64, Vec<u8>)> {
         let area = ui.available_rect_before_wrap();
@@ -453,6 +455,7 @@ impl Panes {
                     targets,
                     origin,
                     font_size,
+                    highlights,
                     new_focus: &mut new_focus,
                     source: &mut source,
                     action,
@@ -478,6 +481,7 @@ struct Ctx<'a> {
     /// The tab's original session terminal id (CloseOthers is offered only there).
     origin: Option<u64>,
     font_size: f32,
+    highlights: &'a [(Regex, egui::Color32)],
     new_focus: &'a mut u64,
     source: &'a mut Option<(u64, Vec<u8>)>,
     action: &'a mut Option<PaneAction>,
@@ -494,6 +498,7 @@ impl Ctx<'_> {
             targets: self.targets,
             origin: self.origin,
             font_size: self.font_size,
+            highlights: self.highlights,
             new_focus: self.new_focus,
             source: self.source,
             action: self.action,
@@ -523,6 +528,7 @@ fn show_pane(mut cx: Ctx, ui: &mut Ui, pane: &mut Pane, area: Rect) {
                         .interactive(cx.interactive)
                         .search(cx.search.cloned())
                         .font_size(cx.font_size)
+                        .highlights(cx.highlights)
                         .show(ui)
                 })
                 .inner;

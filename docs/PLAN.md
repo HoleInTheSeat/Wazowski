@@ -111,6 +111,9 @@ Agreed "do next" items (rough order TBD with the user):
   path and some shells don't report it.)
 - **Web bookmark "sessions"** — save a web URL as a session entry so a device's
   GUI web page can be opened quickly (e.g. in the browser) from the session tree.
+- **Terminal color customization** — editable palette (background, foreground,
+  cursor, 16 ANSI colors) and/or preset themes. (Font size and regex highlights
+  are done; this is the remaining part of "terminal customization".)
 - **File diff comparison.**
 - **List host hardware.**
 - **Running processes view** — likely `htop` in a tab, or a native list.

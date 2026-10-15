@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 egui.workspace = true
+regex.workspace = true
 alacritty_terminal.workspace = true
 portable-pty.workspace = true
 serialport.workspace = true

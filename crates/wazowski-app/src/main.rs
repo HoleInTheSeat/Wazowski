@@ -4,6 +4,7 @@ mod app;
 mod conn_log;
 mod connect;
 mod git;
+mod highlights;
 mod keybinds;
 mod macros;
 mod network;

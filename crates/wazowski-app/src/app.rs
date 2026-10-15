@@ -16,6 +16,7 @@ use wazowski_term::{
 };
 
 use crate::connect::{Connected, PendingConnect, Progress};
+use crate::highlights::{HighlightStore, HighlightRule};
 use crate::keybinds::{Action, Keymap};
 use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
 use crate::network::{self, HostHit, LocalPort, PortHit, ScanHandle};
@@ -541,6 +542,8 @@ pub struct App {
     serial_ports_at: std::time::Instant,
     /// Whether the dark theme is active (the default).
     dark_mode: bool,
+    /// Terminal highlight rules (regex → color).
+    highlights: HighlightStore,
 }
 
 /// Natural (numeric-aware) comparison of two serial device names, so `ttyUSB2`
@@ -750,6 +753,7 @@ impl App {
             serial_ports: sorted_serial_devices(),
             serial_ports_at: std::time::Instant::now(),
             dark_mode: true,
+            highlights: HighlightStore::load_or_default(),
         };
         ctx.set_visuals(egui::Visuals::dark());
         app.open_startup_tab(ctx);
@@ -1735,6 +1739,7 @@ impl App {
             self.sessions.all().iter().map(|s| (s.id.clone(), s.name.clone())).collect();
         let vault_exists = Vault::exists(&self.vault_path);
         let mut changed = false;
+        let mut hl_changed = false;
         let mut backup_now = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(8.0);
@@ -1861,10 +1866,64 @@ impl App {
             if ui.add_enabled(vault_exists, egui::Button::new("Back up now")).clicked() {
                 backup_now = true;
             }
+
+            ui.add_space(10.0);
+            ui.label(RichText::new("Terminal highlights").strong());
+            ui.label(
+                RichText::new("Regex patterns colored in terminal output. Toggle, recolor, or edit any rule.")
+                    .weak(),
+            );
+            let mut remove: Option<usize> = None;
+            egui::Grid::new("highlight-rules").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
+                for (i, rule) in self.highlights.rules.iter_mut().enumerate() {
+                    if ui.checkbox(&mut rule.enabled, "").changed() {
+                        hl_changed = true;
+                    }
+                    let valid = HighlightStore::is_valid(&rule.pattern);
+                    let edit = egui::TextEdit::singleline(&mut rule.pattern)
+                        .desired_width(200.0)
+                        .text_color_opt((!valid).then_some(Color32::from_rgb(230, 80, 80)));
+                    if ui.add(edit).on_hover_text("Regex (red = invalid)").changed() {
+                        hl_changed = true;
+                    }
+                    if ui.color_edit_button_srgb(&mut rule.color).changed() {
+                        hl_changed = true;
+                    }
+                    if ui.button("✕").on_hover_text("Delete rule").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Add rule").clicked() {
+                    self.highlights.rules.push(HighlightRule {
+                        pattern: String::new(),
+                        color: [200, 200, 120],
+                        enabled: true,
+                    });
+                    hl_changed = true;
+                }
+                if ui.button("Restore defaults").on_hover_text("Replace with the built-in rules").clicked()
+                {
+                    self.highlights.rules = crate::highlights::default_rules();
+                    hl_changed = true;
+                }
+            });
+            if let Some(i) = remove {
+                self.highlights.rules.remove(i);
+                hl_changed = true;
+            }
         });
 
         if changed && let Err(e) = self.settings.save() {
             self.error = Some(format!("Could not save settings: {e:#}"));
+        }
+        if hl_changed {
+            self.highlights.recompile();
+            if let Err(e) = self.highlights.save() {
+                self.error = Some(format!("Could not save highlights: {e:#}"));
+            }
         }
         if backup_now {
             self.run_vault_backup(true);
@@ -2761,6 +2820,7 @@ impl App {
             .collect();
         let mut pane_action: Option<PaneAction> = None;
         let font_size = self.settings.terminal_font_size;
+        let highlights = self.highlights.compiled();
         match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
                 TabContent::Terminal(panes) => {
@@ -2773,6 +2833,7 @@ impl App {
                         &targets,
                         origin,
                         font_size,
+                        highlights,
                         &mut pane_action,
                     );
                 }
@@ -3006,7 +3067,7 @@ impl App {
             && let TabContent::Terminal(panes) = &mut tab.content
         {
             let fs = self.settings.terminal_font_size;
-            panes.show(ui, false, false, None, &[], None, fs, &mut None);
+            panes.show(ui, false, false, None, &[], None, fs, &[], &mut None);
         }
         match act {
             Some(EndAct::Restart) => {

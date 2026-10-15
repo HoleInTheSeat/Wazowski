@@ -27,6 +27,7 @@ pub struct TerminalView<'a> {
     font: FontId,
     interactive: bool,
     search: Option<SearchQuery>,
+    highlights: &'a [(regex::Regex, Color32)],
 }
 
 /// A find query to highlight on the terminal's visible screen.
@@ -65,7 +66,19 @@ impl Grid {
 
 impl<'a> TerminalView<'a> {
     pub fn new(terminal: &'a mut Terminal) -> Self {
-        Self { terminal, font: FontId::monospace(14.0), interactive: true, search: None }
+        Self {
+            terminal,
+            font: FontId::monospace(14.0),
+            interactive: true,
+            search: None,
+            highlights: &[],
+        }
+    }
+
+    /// Sets regex highlight rules (pattern → color) applied to the output text.
+    pub fn highlights(mut self, highlights: &'a [(regex::Regex, Color32)]) -> Self {
+        self.highlights = highlights;
+        self
     }
 
     pub fn font_size(mut self, size: f32) -> Self {
@@ -87,7 +100,7 @@ impl<'a> TerminalView<'a> {
     }
 
     pub fn show(self, ui: &mut Ui) -> Response {
-        let Self { terminal: t, font, interactive, search } = self;
+        let Self { terminal: t, font, interactive, search, highlights } = self;
         t.process(ui.ctx());
 
         let rect = ui.available_rect_before_wrap();
@@ -114,7 +127,7 @@ impl<'a> TerminalView<'a> {
             if response.has_focus() {
                 response.surrender_focus();
             }
-            paint(ui, t, rect, &grid, &font, false, search.as_ref());
+            paint(ui, t, rect, &grid, &font, false, search.as_ref(), highlights);
             return response;
         }
 
@@ -136,7 +149,7 @@ impl<'a> TerminalView<'a> {
             ui.ctx().set_cursor_icon(CursorIcon::Text);
         }
 
-        paint(ui, t, rect, &grid, &font, focused, search.as_ref());
+        paint(ui, t, rect, &grid, &font, focused, search.as_ref(), highlights);
         response
     }
 }
@@ -303,6 +316,7 @@ struct TextRun {
     text: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint(
     ui: &Ui,
     t: &Terminal,
@@ -311,34 +325,71 @@ fn paint(
     font: &FontId,
     focused: bool,
     search: Option<&SearchQuery>,
+    highlights: &[(regex::Regex, Color32)],
 ) {
     let painter = ui.painter_at(rect);
     let palette = &t.palette;
     painter.rect_filled(rect, 0.0, palette.background);
 
-    // Per visible row, the (column, char) of each cell, to map find matches to
-    // screen positions after the cell loop.
-    let searching = search.is_some_and(|q| !q.needle.is_empty());
-    let mut row_chars: Vec<Vec<(usize, char)>> = if searching {
-        vec![Vec::new(); grid.rows]
-    } else {
-        Vec::new()
-    };
-
     let content = t.term.renderable_content();
     let colors = content.colors;
     let offset = content.display_offset as i32;
+    let selection = content.selection;
     let cursor = content.cursor;
     let cursor_row = cursor.point.line.0 + offset;
     let cursor_col = cursor.point.column.0;
     let cursor_color = palette.resolve(Color::Named(NamedColor::Cursor), colors);
     let block_cursor = focused && cursor.shape == CursorShape::Block;
 
+    // Collect the visible cells so we can build per-row text (for search and
+    // highlight matching) before painting.
+    let cells: Vec<_> = content.display_iter.collect();
+
+    // Per visible row, the (column, char) of each non-spacer cell.
+    let searching = search.is_some_and(|q| !q.needle.is_empty());
+    let want_rows = searching || !highlights.is_empty();
+    let mut row_chars: Vec<Vec<(usize, char)>> =
+        if want_rows { vec![Vec::new(); grid.rows] } else { Vec::new() };
+    if want_rows {
+        for indexed in &cells {
+            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let row = indexed.point.line.0 + offset;
+            let col = indexed.point.column.0;
+            if row >= 0
+                && let Some(r) = row_chars.get_mut(row as usize)
+            {
+                r.push((col, indexed.cell.c));
+            }
+        }
+    }
+
+    // Highlight foreground overrides, keyed by (row, column).
+    let mut highlight_fg: std::collections::HashMap<(i32, usize), Color32> =
+        std::collections::HashMap::new();
+    if !highlights.is_empty() {
+        for (ri, cols) in row_chars.iter().enumerate() {
+            let text: String = cols.iter().map(|(_, c)| *c).collect();
+            for (re, color) in highlights {
+                for m in re.find_iter(&text) {
+                    let start = text[..m.start()].chars().count();
+                    let len = text[m.start()..m.end()].chars().count();
+                    for k in start..start + len {
+                        if let Some((col, _)) = cols.get(k) {
+                            highlight_fg.insert((ri as i32, *col), *color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut backgrounds = Vec::new();
     let mut lines = Vec::new();
     let mut runs: Vec<TextRun> = Vec::new();
 
-    for indexed in content.display_iter {
+    for indexed in &cells {
         let cell = indexed.cell;
         let flags = cell.flags;
         if flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -347,19 +398,15 @@ fn paint(
         let row = indexed.point.line.0 + offset;
         let col = indexed.point.column.0;
 
-        if searching
-            && row >= 0
-            && let Some(cells) = row_chars.get_mut(row as usize)
-        {
-            cells.push((col, cell.c));
-        }
-
         let mut fg = foreground(cell, palette, colors);
         let mut bg = palette.resolve(cell.bg, colors);
         if flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
         }
-        if content.selection.is_some_and(|s| s.contains(indexed.point)) {
+        if let Some(color) = highlight_fg.get(&(row, col)) {
+            fg = *color;
+        }
+        if selection.is_some_and(|s| s.contains(indexed.point)) {
             bg = palette.selection;
         }
         if block_cursor && row == cursor_row && col == cursor_col {
