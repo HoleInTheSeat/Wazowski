@@ -1824,17 +1824,21 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.sidebar_view, SidebarView::Sessions, "Sessions");
-            ui.selectable_value(&mut self.sidebar_view, SidebarView::Macros, "Macros");
-            ui.selectable_value(&mut self.sidebar_view, SidebarView::Files, "Files");
+        // A vertical icon rail to switch views, beside the view's content.
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                let view = &mut self.sidebar_view;
+                ui.selectable_value(view, SidebarView::Sessions, "🖥").on_hover_text("Sessions");
+                ui.selectable_value(view, SidebarView::Macros, "⚙").on_hover_text("Macros");
+                ui.selectable_value(view, SidebarView::Files, "📁").on_hover_text("Files (SFTP)");
+            });
+            ui.separator();
+            ui.vertical(|ui| match self.sidebar_view {
+                SidebarView::Sessions => self.sidebar_sessions(ui, ctx),
+                SidebarView::Macros => self.sidebar_macros(ui),
+                SidebarView::Files => self.sidebar_files(ui, ctx),
+            });
         });
-        ui.separator();
-        match self.sidebar_view {
-            SidebarView::Sessions => self.sidebar_sessions(ui, ctx),
-            SidebarView::Macros => self.sidebar_macros(ui),
-            SidebarView::Files => self.sidebar_files(ui, ctx),
-        }
     }
 
     /// The Files view: the SFTP browser for the active single-pane SSH tab.

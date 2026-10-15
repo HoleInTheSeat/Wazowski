@@ -211,6 +211,36 @@ impl FileBrowser {
                 ui.spinner();
             }
         });
+        // Toolbar: icon buttons with tooltips.
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!self.busy(), |ui| {
+                if ui.button("⬆").on_hover_text("Parent directory").clicked() {
+                    self.go_up(ctx);
+                }
+                if ui.button("⟳").on_hover_text("Refresh").clicked() {
+                    self.refresh(ctx);
+                }
+                if ui.button("📤").on_hover_text("Upload a file here").clicked() {
+                    self.upload(ctx);
+                }
+                let can_download = self
+                    .selected
+                    .and_then(|i| self.entries.get(i))
+                    .is_some_and(|e| !e.is_dir);
+                if ui
+                    .add_enabled(can_download, egui::Button::new("📥"))
+                    .on_hover_text("Download the selected file…")
+                    .clicked()
+                    && let Some(name) =
+                        self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone())
+                {
+                    self.download(&name, ctx);
+                }
+                if ui.button("📁").on_hover_text("New folder").clicked() {
+                    self.new_folder = Some(String::new());
+                }
+            });
+        });
         ui.checkbox(&mut self.auto_refresh, "Auto-refresh")
             .on_hover_text("Periodically re-list this directory (only while this tab is visible)");
 
@@ -283,29 +313,7 @@ impl FileBrowser {
                 }
             });
         }
-        // A vertical icon toolbar beside the file list.
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.add_enabled_ui(!self.busy(), |ui| {
-                    if ui.button("⬆").on_hover_text("Parent directory").clicked() {
-                        self.go_up(ctx);
-                    }
-                    if ui.button("⟳").on_hover_text("Refresh").clicked() {
-                        self.refresh(ctx);
-                    }
-                    if ui.button("📤").on_hover_text("Upload a file here").clicked() {
-                        self.upload(ctx);
-                    }
-                    if ui.button("📁").on_hover_text("New folder").clicked() {
-                        self.new_folder = Some(String::new());
-                    }
-                });
-            });
-            ui.separator();
-            ui.vertical(|ui| {
-                self.entry_list(ui, ctx);
-            });
-        });
+        self.entry_list(ui, ctx);
     }
 
     fn entry_list(&mut self, ui: &mut egui::Ui, ctx: &Context) {

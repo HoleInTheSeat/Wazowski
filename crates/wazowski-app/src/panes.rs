@@ -593,6 +593,14 @@ fn title_bar(cx: &mut Ctx, ui: &mut Ui, bar: Rect, leaf: &Leaf, id: u64) {
     ui.scope_builder(UiBuilder::new().max_rect(bar.shrink2(vec2(4.0, 2.0))), |ui| {
         ui.horizontal_centered(|ui| {
             ui.menu_button("▾", |ui| {
+                // The tab's original-session pane only offers collapsing the others.
+                if cx.origin == Some(id) {
+                    if ui.button("Close other panes").clicked() {
+                        *cx.action = Some(PaneAction::CloseOthers(id));
+                        ui.close();
+                    }
+                    return;
+                }
                 if ui.button("New shell here").clicked() {
                     *cx.action = Some(PaneAction::NewShell(id));
                     ui.close();
@@ -603,11 +611,6 @@ fn title_bar(cx: &mut Ctx, ui: &mut Ui, bar: Rect, leaf: &Leaf, id: u64) {
                 }
                 if ui.button("Close this pane").clicked() {
                     *cx.action = Some(PaneAction::ClosePane(id));
-                    ui.close();
-                }
-                // Offered only on the tab's original session pane, where it's safe.
-                if cx.origin == Some(id) && ui.button("Close other panes").clicked() {
-                    *cx.action = Some(PaneAction::CloseOthers(id));
                     ui.close();
                 }
                 if !cx.targets.is_empty() {

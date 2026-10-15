@@ -109,6 +109,8 @@ Agreed "do next" items (rough order TBD with the user):
   directory, move the SFTP pane to match. (Removed from beta for now; needs a
   reliable cwd source — OSC 7 is tracked in `Terminal::cwd`, but the title-based
   path and some shells don't report it.)
+- **Web bookmark "sessions"** — save a web URL as a session entry so a device's
+  GUI web page can be opened quickly (e.g. in the browser) from the session tree.
 - **File diff comparison.**
 - **List host hardware.**
 - **Running processes view** — likely `htop` in a tab, or a native list.
