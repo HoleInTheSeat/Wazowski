@@ -140,6 +140,49 @@ enum TabAct {
     CloseOthers(usize),
 }
 
+/// An Extras-settings action, applied after the settings page is drawn.
+enum ExtrasAction {
+    GrantLowPort,
+    InstallIperf,
+    Recheck,
+}
+
+/// Whether an executable named `name` is on the PATH.
+fn has_bin(name: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else { return false };
+    for dir in std::env::split_paths(&path) {
+        if dir.join(name).is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        if dir.join(format!("{name}.exe")).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether this binary already has the `cap_net_bind_service` capability (Linux).
+#[cfg(target_os = "linux")]
+fn low_port_granted() -> Option<bool> {
+    let exe = std::env::current_exe().ok()?;
+    let out = std::process::Command::new("getcap").arg(&exe).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).contains("cap_net_bind_service"))
+}
+#[cfg(not(target_os = "linux"))]
+fn low_port_granted() -> Option<bool> {
+    None
+}
+
+/// Runs the Extras environment checks.
+fn compute_env_checks() -> EnvChecks {
+    EnvChecks {
+        iperf3: has_bin("iperf3"),
+        printing: has_bin("lp") || has_bin("lpr"),
+        low_port: low_port_granted(),
+    }
+}
+
 /// State of a connecting tab.
 struct Connecting {
     /// Parameters, kept so the attempt can be retried (e.g. after trusting a host).
@@ -506,6 +549,7 @@ struct ConnectCredsForm {
     /// When saved, also rebind the session to the new vault entry (blank-password
     /// case only, not a one-off "Connect as").
     rebind: bool,
+    error: Option<String>,
 }
 
 /// Prompt to create a missing named credential, then continue connecting.
@@ -564,6 +608,10 @@ pub struct App {
     dark_mode: bool,
     /// Terminal highlight rules (regex → color).
     highlights: HighlightStore,
+    /// Which settings category is shown.
+    settings_category: SettingsCategory,
+    /// Cached Extras environment checks; recomputed on demand.
+    env_checks: Option<EnvChecks>,
 }
 
 /// Natural (numeric-aware) comparison of two serial device names, so `ttyUSB2`
@@ -614,6 +662,26 @@ enum SidebarView {
     Sessions,
     Macros,
     Files,
+}
+
+/// A settings page category (left-rail selection).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsCategory {
+    #[default]
+    General,
+    Tabs,
+    Vault,
+    Terminal,
+    Extras,
+}
+
+/// Cached results of the Extras environment checks.
+#[derive(Clone, Copy, Default)]
+struct EnvChecks {
+    iperf3: bool,
+    printing: bool,
+    /// `Some(granted)` on Linux; `None` where not applicable.
+    low_port: Option<bool>,
 }
 
 /// State of the find-in-terminals bar.
@@ -774,6 +842,8 @@ impl App {
             serial_ports_at: std::time::Instant::now(),
             dark_mode: true,
             highlights: HighlightStore::load_or_default(),
+            settings_category: SettingsCategory::General,
+            env_checks: None,
         };
         ctx.set_visuals(egui::Visuals::dark());
         app.open_startup_tab(ctx);
@@ -1165,6 +1235,7 @@ impl App {
                     save: false,
                     save_name: self.default_secret_name(&session.name, &session.host),
                     rebind: true,
+                    error: None,
                     title: session.name.clone(),
                     session: session.clone(),
                 }));
@@ -1181,6 +1252,7 @@ impl App {
             save: false,
             save_name: self.default_secret_name(&session.name, &session.host),
             rebind: false,
+            error: None,
             title: format!("{} (connect as…)", session.name),
             session: session.clone(),
         }));
@@ -1781,187 +1853,43 @@ impl App {
         }
     }
 
-    /// Renders the global settings page.
+    /// Renders the global settings page with a category rail on the left.
     fn render_settings(&mut self, ui: &mut egui::Ui) {
-        let sessions: Vec<(String, String)> =
-            self.sessions.all().iter().map(|s| (s.id.clone(), s.name.clone())).collect();
-        let vault_exists = Vault::exists(&self.vault_path);
         let mut changed = false;
         let mut hl_changed = false;
         let mut backup_now = false;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.heading("Settings");
+        let mut extras_action: Option<ExtrasAction> = None;
+
+        ui.add_space(8.0);
+        ui.heading("Settings");
+        ui.separator();
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(104.0);
+                for (cat, label) in [
+                    (SettingsCategory::General, "General"),
+                    (SettingsCategory::Tabs, "Tabs"),
+                    (SettingsCategory::Vault, "Vault"),
+                    (SettingsCategory::Terminal, "Terminal"),
+                    (SettingsCategory::Extras, "Extras"),
+                ] {
+                    ui.selectable_value(&mut self.settings_category, cat, label);
+                }
+            });
             ui.separator();
-
-            ui.label(RichText::new("General").strong());
-            if ui
-                .checkbox(&mut self.settings.allow_multiple_instances, "Allow multiple instances")
-                .on_hover_text("Takes effect at the next launch")
-                .changed()
-            {
-                changed = true;
-            }
-
-            ui.add_space(10.0);
-            ui.label(RichText::new("Startup").strong());
-            let current = match &self.settings.startup_tab {
-                StartupTab::None => "Nothing".to_owned(),
-                StartupTab::LocalShell => "New local shell".to_owned(),
-                StartupTab::Session(id) => sessions
-                    .iter()
-                    .find(|(sid, _)| sid == id)
-                    .map(|(_, n)| n.clone())
-                    .unwrap_or_else(|| "(missing session)".to_owned()),
-            };
-            egui::ComboBox::from_label("Open at startup").selected_text(current).show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(matches!(self.settings.startup_tab, StartupTab::None), "Nothing")
-                    .clicked()
-                {
-                    self.settings.startup_tab = StartupTab::None;
-                    changed = true;
-                }
-                if ui
-                    .selectable_label(
-                        matches!(self.settings.startup_tab, StartupTab::LocalShell),
-                        "New local shell",
-                    )
-                    .clicked()
-                {
-                    self.settings.startup_tab = StartupTab::LocalShell;
-                    changed = true;
-                }
-                for (id, name) in &sessions {
-                    let selected =
-                        matches!(&self.settings.startup_tab, StartupTab::Session(s) if s == id);
-                    if ui.selectable_label(selected, name).clicked() {
-                        self.settings.startup_tab = StartupTab::Session(id.clone());
-                        changed = true;
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                match self.settings_category {
+                    SettingsCategory::General => self.settings_general(ui, &mut changed),
+                    SettingsCategory::Tabs => self.settings_tabs(ui, &mut changed),
+                    SettingsCategory::Vault => {
+                        self.settings_vault(ui, &mut changed, &mut backup_now)
                     }
+                    SettingsCategory::Terminal => {
+                        self.settings_terminal(ui, &mut changed, &mut hl_changed)
+                    }
+                    SettingsCategory::Extras => self.settings_extras(ui, &mut extras_action),
                 }
             });
-
-            ui.add_space(10.0);
-            ui.label(RichText::new("New tab placement").strong());
-            for (value, label) in [
-                (NewTabPlacement::Never, "Never — open at the far right"),
-                (NewTabPlacement::WhenDuplicating, "Only when duplicating a tab"),
-                (NewTabPlacement::Always, "Always next to the current tab"),
-            ] {
-                if ui.radio_value(&mut self.settings.new_tab_placement, value, label).changed() {
-                    changed = true;
-                }
-            }
-
-            ui.add_space(10.0);
-            ui.label(RichText::new("Terminal").strong());
-            ui.horizontal(|ui| {
-                ui.label("Font size:");
-                if ui
-                    .add(egui::DragValue::new(&mut self.settings.terminal_font_size).range(8.0..=40.0))
-                    .on_hover_text("Also: Ctrl+scroll in a terminal, or Ctrl+= / Ctrl+-")
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.label("pt");
-            });
-            ui.label(
-                RichText::new("Highlights are configured below in \"Terminal highlights\".").weak(),
-            );
-
-            ui.add_space(10.0);
-            ui.label(RichText::new("Automatic vault backup").strong());
-            if !vault_exists {
-                ui.label(RichText::new("No vault exists yet.").weak());
-            }
-            if ui
-                .checkbox(&mut self.settings.vault_backup.enabled, "Back up the vault automatically")
-                .changed()
-            {
-                changed = true;
-            }
-            ui.horizontal(|ui| {
-                ui.label("Every");
-                if ui
-                    .add(egui::DragValue::new(&mut self.settings.vault_backup.every_days).range(1..=365))
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.label("day(s)");
-            });
-            ui.horizontal(|ui| {
-                ui.label("Folder:");
-                ui.label(self.settings.backup_dir().display().to_string());
-                if ui.button("Choose…").clicked()
-                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.settings.vault_backup.dir = Some(dir);
-                    changed = true;
-                }
-                if ui.button("Open directory").clicked() {
-                    let dir = self.settings.backup_dir();
-                    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| open::that(&dir)) {
-                        self.error = Some(format!("Could not open the backup folder: {e}"));
-                    }
-                }
-            });
-            if let Some(when) = self.settings.vault_backup.last_backup {
-                ui.label(RichText::new(format!("Last backup: {}", time_ago(when))).weak());
-            }
-            if ui.add_enabled(vault_exists, egui::Button::new("Back up now")).clicked() {
-                backup_now = true;
-            }
-
-            ui.add_space(10.0);
-            ui.label(RichText::new("Terminal highlights").strong());
-            ui.label(
-                RichText::new("Regex patterns colored in terminal output. Toggle, recolor, or edit any rule.")
-                    .weak(),
-            );
-            let mut remove: Option<usize> = None;
-            egui::Grid::new("highlight-rules").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
-                for (i, rule) in self.highlights.rules.iter_mut().enumerate() {
-                    if ui.checkbox(&mut rule.enabled, "").changed() {
-                        hl_changed = true;
-                    }
-                    let valid = HighlightStore::is_valid(&rule.pattern);
-                    let edit = egui::TextEdit::singleline(&mut rule.pattern)
-                        .desired_width(200.0)
-                        .text_color_opt((!valid).then_some(Color32::from_rgb(230, 80, 80)));
-                    if ui.add(edit).on_hover_text("Regex (red = invalid)").changed() {
-                        hl_changed = true;
-                    }
-                    if ui.color_edit_button_srgb(&mut rule.color).changed() {
-                        hl_changed = true;
-                    }
-                    if ui.button("✕").on_hover_text("Delete rule").clicked() {
-                        remove = Some(i);
-                    }
-                    ui.end_row();
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Add rule").clicked() {
-                    self.highlights.rules.push(HighlightRule {
-                        pattern: String::new(),
-                        color: [200, 200, 120],
-                        enabled: true,
-                    });
-                    hl_changed = true;
-                }
-                if ui.button("Restore defaults").on_hover_text("Replace with the built-in rules").clicked()
-                {
-                    self.highlights.rules = crate::highlights::default_rules();
-                    hl_changed = true;
-                }
-            });
-            if let Some(i) = remove {
-                self.highlights.rules.remove(i);
-                hl_changed = true;
-            }
         });
 
         if changed && let Err(e) = self.settings.save() {
@@ -1975,6 +1903,244 @@ impl App {
         }
         if backup_now {
             self.run_vault_backup(true);
+        }
+        match extras_action {
+            Some(ExtrasAction::GrantLowPort) => {
+                if let Some(cmd) = wazowski_servers::low_port_setcap_command() {
+                    self.run_admin("Grant low-port permission".into(), cmd, None, true);
+                }
+                self.env_checks = None;
+            }
+            Some(ExtrasAction::InstallIperf) => {
+                if let Some(cmd) = wazowski_servers::iperf_install_command() {
+                    self.run_admin("Install iperf3".into(), cmd, None, false);
+                }
+                self.env_checks = None;
+            }
+            Some(ExtrasAction::Recheck) => self.env_checks = None,
+            None => {}
+        }
+    }
+
+    fn settings_general(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        ui.label(RichText::new("General").strong());
+        if ui
+            .checkbox(&mut self.settings.allow_multiple_instances, "Allow multiple instances")
+            .on_hover_text("Takes effect at the next launch")
+            .changed()
+        {
+            *changed = true;
+        }
+        let mut shell_on_startup = matches!(self.settings.startup_tab, StartupTab::LocalShell);
+        if ui
+            .checkbox(&mut shell_on_startup, "Open a local shell on startup")
+            .changed()
+        {
+            self.settings.startup_tab =
+                if shell_on_startup { StartupTab::LocalShell } else { StartupTab::None };
+            *changed = true;
+        }
+    }
+
+    fn settings_tabs(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        ui.label(RichText::new("Tabs").strong());
+        ui.horizontal(|ui| {
+            ui.label("New tab opens:");
+            let text = match self.settings.new_tab_placement {
+                NewTabPlacement::Never => "At the far right",
+                NewTabPlacement::WhenDuplicating => "Next to current when duplicating",
+                NewTabPlacement::Always => "Always next to current",
+            };
+            egui::ComboBox::from_id_salt("new-tab-placement").selected_text(text).show_ui(ui, |ui| {
+                for (value, label) in [
+                    (NewTabPlacement::Never, "At the far right"),
+                    (NewTabPlacement::WhenDuplicating, "Next to current when duplicating"),
+                    (NewTabPlacement::Always, "Always next to current"),
+                ] {
+                    if ui
+                        .selectable_value(&mut self.settings.new_tab_placement, value, label)
+                        .changed()
+                    {
+                        *changed = true;
+                    }
+                }
+            });
+        });
+    }
+
+    fn settings_vault(&mut self, ui: &mut egui::Ui, changed: &mut bool, backup_now: &mut bool) {
+        let vault_exists = Vault::exists(&self.vault_path);
+        ui.label(RichText::new("Automatic vault backup").strong());
+        if !vault_exists {
+            ui.label(RichText::new("No vault exists yet.").weak());
+        }
+        if ui
+            .checkbox(&mut self.settings.vault_backup.enabled, "Back up the vault automatically")
+            .changed()
+        {
+            *changed = true;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Every");
+            if ui
+                .add(egui::DragValue::new(&mut self.settings.vault_backup.every_days).range(1..=365))
+                .changed()
+            {
+                *changed = true;
+            }
+            ui.label("day(s)");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Folder:");
+            ui.label(self.settings.backup_dir().display().to_string());
+            if ui.button("Choose…").clicked()
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                self.settings.vault_backup.dir = Some(dir);
+                *changed = true;
+            }
+            if ui.button("Open directory").clicked() {
+                let dir = self.settings.backup_dir();
+                if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| open::that(&dir)) {
+                    self.error = Some(format!("Could not open the backup folder: {e}"));
+                }
+            }
+        });
+        if let Some(when) = self.settings.vault_backup.last_backup {
+            ui.label(RichText::new(format!("Last backup: {}", time_ago(when))).weak());
+        }
+        if ui.add_enabled(vault_exists, egui::Button::new("Back up now")).clicked() {
+            *backup_now = true;
+        }
+    }
+
+    fn settings_terminal(&mut self, ui: &mut egui::Ui, changed: &mut bool, hl_changed: &mut bool) {
+        ui.label(RichText::new("Terminal").strong());
+        ui.horizontal(|ui| {
+            ui.label("Font size:");
+            if ui
+                .add(egui::DragValue::new(&mut self.settings.terminal_font_size).range(8.0..=40.0))
+                .on_hover_text("Also: Ctrl+scroll in a terminal, or Ctrl+= / Ctrl+- / Ctrl+0")
+                .changed()
+            {
+                *changed = true;
+            }
+            ui.label("pt");
+        });
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("Highlights").strong());
+        ui.label(
+            RichText::new("Regex patterns colored in terminal output. Toggle, recolor, or edit any rule.")
+                .weak(),
+        );
+        let mut remove: Option<usize> = None;
+        for (i, rule) in self.highlights.rules.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut rule.enabled, "")
+                    .on_hover_text("Enable or disable this highlight rule")
+                    .changed()
+                {
+                    *hl_changed = true;
+                }
+                if ui.button("✕").on_hover_text("Delete rule").clicked() {
+                    remove = Some(i);
+                }
+                if ui.color_edit_button_srgb(&mut rule.color).changed() {
+                    *hl_changed = true;
+                }
+                let valid = HighlightStore::is_valid(&rule.pattern);
+                let edit = egui::TextEdit::singleline(&mut rule.pattern)
+                    .desired_width(ui.available_width())
+                    .hint_text("regex, e.g. .*error.*")
+                    .text_color_opt((!valid).then_some(Color32::from_rgb(230, 80, 80)));
+                if ui.add(edit).on_hover_text("Regex pattern (red text = invalid)").changed() {
+                    *hl_changed = true;
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Add rule").clicked() {
+                self.highlights.rules.push(HighlightRule {
+                    pattern: String::new(),
+                    color: [200, 200, 120],
+                    enabled: true,
+                });
+                *hl_changed = true;
+            }
+            if ui
+                .button("Restore defaults")
+                .on_hover_text("Replace with the built-in rules")
+                .clicked()
+            {
+                self.highlights.rules = crate::highlights::default_rules();
+                *hl_changed = true;
+            }
+        });
+        if let Some(i) = remove {
+            self.highlights.rules.remove(i);
+            *hl_changed = true;
+        }
+    }
+
+    fn settings_extras(&mut self, ui: &mut egui::Ui, action: &mut Option<ExtrasAction>) {
+        if self.env_checks.is_none() {
+            self.env_checks = Some(compute_env_checks());
+        }
+        let checks = self.env_checks.unwrap_or_default();
+        ui.label(RichText::new("Environment").strong());
+        ui.label(RichText::new("Checks for optional tools and permissions Wazowski can use.").weak());
+        ui.add_space(6.0);
+
+        let status = |ui: &mut egui::Ui, label: &str, ok: bool| {
+            let (mark, color) = if ok {
+                ("✔", Color32::from_rgb(120, 200, 120))
+            } else {
+                ("✘", Color32::from_rgb(230, 120, 120))
+            };
+            ui.label(RichText::new(mark).color(color));
+            ui.label(label);
+        };
+
+        egui::Grid::new("extras-checks").num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
+            // Low-port permission (Linux).
+            if let Some(granted) = checks.low_port {
+                status(ui, "Low-port permission (bind < 1024)", granted);
+                if !granted
+                    && wazowski_servers::low_port_setcap_command().is_some()
+                    && ui.button("Grant").clicked()
+                {
+                    *action = Some(ExtrasAction::GrantLowPort);
+                } else {
+                    ui.label("");
+                }
+                ui.end_row();
+            }
+            // iperf3.
+            status(ui, "iperf3 (bandwidth server)", checks.iperf3);
+            if !checks.iperf3
+                && wazowski_servers::iperf_install_command().is_some()
+                && ui.button("Install").clicked()
+            {
+                *action = Some(ExtrasAction::InstallIperf);
+            } else {
+                ui.label("");
+            }
+            ui.end_row();
+            // Printing.
+            status(ui, "Printing service (lp / lpr)", checks.printing);
+            if checks.printing {
+                ui.label("");
+            } else {
+                ui.label(RichText::new("install CUPS to enable Print output").weak());
+            }
+            ui.end_row();
+        });
+
+        ui.add_space(6.0);
+        if ui.button("Re-check").clicked() {
+            *action = Some(ExtrasAction::Recheck);
         }
     }
 
@@ -3671,6 +3837,9 @@ impl App {
                         ui.text_edit_singleline(&mut form.save_name);
                     });
                 }
+                if let Some(err) = &form.error {
+                    ui.colored_label(ui.visuals().error_fg_color, err);
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     connect |= ui.button("Connect").clicked();
@@ -3679,11 +3848,16 @@ impl App {
             });
         }
         if connect
-            && let Dialog::ConnectCreds(form) = &self.dialog
+            && let Dialog::ConnectCreds(form) = &mut self.dialog
         {
-            let form = form.clone();
-            self.dialog = Dialog::None;
-            self.connect_with_creds(*form, ctx);
+            // A save requires a name.
+            if form.save && form.save_name.trim().is_empty() {
+                form.error = Some("Enter a name for the vault entry, or uncheck \"Save to vault\".".into());
+            } else {
+                let form = form.clone();
+                self.dialog = Dialog::None;
+                self.connect_with_creds(*form, ctx);
+            }
         } else if cancel {
             self.dialog = Dialog::None;
         }
