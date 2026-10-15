@@ -115,8 +115,6 @@ Agreed "do next" items (rough order TBD with the user):
 - **List host hardware.**
 - **Running processes view** — likely `htop` in a tab, or a native list.
 - **Auto-updater** — best-practice update flow with a "Check for updates" button.
-- **Icons & colors for shared sessions / folders** — e.g. a switch clip-art icon
-  and custom color for a folder of switch sessions.
 - **Visual polish / "make the UI cooler"** — themes, fonts, animations; done last.
 
 ## Portability goals
