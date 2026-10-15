@@ -33,10 +33,11 @@ pub enum Action {
     ViewFiles,
     FontSizeUp,
     FontSizeDown,
+    FontSizeReset,
 }
 
 impl Action {
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 18] = [
         Action::NewShell,
         Action::CloseTab,
         Action::NextTab,
@@ -54,6 +55,7 @@ impl Action {
         Action::ViewFiles,
         Action::FontSizeUp,
         Action::FontSizeDown,
+        Action::FontSizeReset,
     ];
 
     /// Human-readable name shown in the Settings dialog and menus.
@@ -76,6 +78,7 @@ impl Action {
             Action::ViewFiles => "Left pane: Files",
             Action::FontSizeUp => "Terminal: larger font",
             Action::FontSizeDown => "Terminal: smaller font",
+            Action::FontSizeReset => "Terminal: reset font size",
         }
     }
 
@@ -102,6 +105,7 @@ impl Action {
             Action::ViewFiles => KeyboardShortcut::new(ctrl_shift, Key::Num3),
             Action::FontSizeUp => KeyboardShortcut::new(ctrl, Key::Equals),
             Action::FontSizeDown => KeyboardShortcut::new(ctrl, Key::Minus),
+            Action::FontSizeReset => KeyboardShortcut::new(ctrl, Key::Num0),
         }
     }
 }

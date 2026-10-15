@@ -219,6 +219,8 @@ enum Dialog {
     ConfirmMacro { index: usize, target: MacroTarget },
     /// Program info and links.
     About,
+    /// Prompt for a username/password at connect time.
+    ConnectCreds(Box<ConnectCredsForm>),
 }
 
 /// Fields for the macro editor dialog.
@@ -484,8 +486,26 @@ enum AuthProblem {
     /// The referenced vault entry does not exist yet; prompt to create it
     /// (MobaXterm-style placeholder: created on first use).
     Missing { name: String, kind: AuthMethod },
+    /// The session has no stored password (blank): prompt for it each connect.
+    NeedPassword,
     /// Any other problem, already phrased for display.
     Message(String),
+}
+
+/// Prompt for a username/password at connect time (blank-password sessions and
+/// the "Connect as…" one-off).
+#[derive(Clone)]
+struct ConnectCredsForm {
+    session: Session,
+    title: String,
+    username: String,
+    password: String,
+    /// Whether to save the entered credential to the vault.
+    save: bool,
+    save_name: String,
+    /// When saved, also rebind the session to the new vault entry (blank-password
+    /// case only, not a one-off "Connect as").
+    rebind: bool,
 }
 
 /// Prompt to create a missing named credential, then continue connecting.
@@ -1138,8 +1158,32 @@ impl App {
                     then_connect: session.clone(),
                 });
             }
+            Err(AuthProblem::NeedPassword) => {
+                self.dialog = Dialog::ConnectCreds(Box::new(ConnectCredsForm {
+                    username: session.username.clone(),
+                    password: String::new(),
+                    save: false,
+                    save_name: self.default_secret_name(&session.name, &session.host),
+                    rebind: true,
+                    title: session.name.clone(),
+                    session: session.clone(),
+                }));
+            }
             Err(AuthProblem::Message(m)) => self.error = Some(m),
         }
+    }
+
+    /// Opens the "Connect as…" one-off credential prompt for a session.
+    fn connect_as(&mut self, session: &Session) {
+        self.dialog = Dialog::ConnectCreds(Box::new(ConnectCredsForm {
+            username: String::new(),
+            password: String::new(),
+            save: false,
+            save_name: self.default_secret_name(&session.name, &session.host),
+            rebind: false,
+            title: format!("{} (connect as…)", session.name),
+            session: session.clone(),
+        }));
     }
 
     /// Spawns a connection to `session` with already-resolved credentials,
@@ -1260,6 +1304,7 @@ impl App {
             Auth::Agent => {
                 return Ok(ResolvedAuth { material: AuthMaterial::Agent, username: None });
             }
+            Auth::Password { secret } if secret.is_empty() => return Err(AuthProblem::NeedPassword),
             Auth::Password { secret } => (secret, AuthMethod::Password),
             Auth::Key { secret } => (secret, AuthMethod::Key),
         };
@@ -1581,6 +1626,9 @@ impl App {
         }
         if triggered(Action::FontSizeDown, ctx, &self.keymap) {
             self.set_font_size(self.settings.terminal_font_size - 1.0);
+        }
+        if triggered(Action::FontSizeReset, ctx, &self.keymap) {
+            self.set_font_size(14.0);
         }
         // Action::RunMacro is handled (and consumed) by the macros feature.
         self.macro_shortcut(ctx);
@@ -2301,6 +2349,12 @@ impl App {
                 }
                 Ok(())
             }
+            TreeAction::ConnectAs(store, id) => {
+                if let Some(session) = self.session_in(&store, &id) {
+                    self.connect_as(&session);
+                }
+                Ok(())
+            }
             TreeAction::Edit(store, id) => {
                 if let Some(session) = self.session_in(&store, &id) {
                     let mut form = SessionForm::from_session(&session);
@@ -2660,35 +2714,48 @@ impl App {
         egui::containers::Sides::new().shrink_left().spacing(6.0).show(
             ui,
             |ui| {
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for (i, label) in labels.iter().enumerate() {
-                            let resp = ui.selectable_label(i == active, label);
-                            if resp.clicked() {
-                                clicked_tab = Some(i);
-                            }
-                            delayed_tooltip(ui, &resp, &hints[i]);
-                            resp.context_menu(|ui| {
-                                if ui.button("Duplicate").clicked() {
-                                    tab_action = Some(TabAct::Duplicate(i));
-                                    ui.close();
+                // A solid (non-floating) bar that shows when the tabs overflow,
+                // drawn under the tabs rather than over them.
+                ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                egui::ScrollArea::horizontal()
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (i, label) in labels.iter().enumerate() {
+                                let resp = ui.selectable_label(i == active, label);
+                                if resp.clicked() {
+                                    clicked_tab = Some(i);
                                 }
-                                if ui.button("Close").clicked() {
+                                delayed_tooltip(ui, &resp, &hints[i]);
+                                resp.context_menu(|ui| {
+                                    if ui.button("Duplicate").clicked() {
+                                        tab_action = Some(TabAct::Duplicate(i));
+                                        ui.close();
+                                    }
+                                    if ui.button("Close").clicked() {
+                                        close = Some(i);
+                                        ui.close();
+                                    }
+                                    if tab_count > 1 && ui.button("Close others").clicked() {
+                                        tab_action = Some(TabAct::CloseOthers(i));
+                                        ui.close();
+                                    }
+                                });
+                                if ui.small_button("×").on_hover_text("Close tab").clicked() {
                                     close = Some(i);
-                                    ui.close();
                                 }
-                                if tab_count > 1 && ui.button("Close others").clicked() {
-                                    tab_action = Some(TabAct::CloseOthers(i));
-                                    ui.close();
-                                }
-                            });
-                            if ui.small_button("×").on_hover_text("Close tab").clicked() {
-                                close = Some(i);
+                                ui.separator();
                             }
-                            ui.separator();
-                        }
+                            // New-tab button at the end of the tab list.
+                            if ui
+                                .button("+")
+                                .on_hover_text("New local shell (Ctrl+Shift+T)")
+                                .clicked()
+                            {
+                                new_shell = true;
+                            }
+                        });
                     });
-                });
             },
             |ui| {
                 // Sides adds right widgets right-to-left, so add in reverse order.
@@ -2715,10 +2782,14 @@ impl App {
                         pane_action = Some(SplitButton::Split(SplitDir::Horizontal));
                     }
                 }
-                ui.toggle_value(&mut broadcast, "⇉")
-                    .on_hover_text("Broadcast (multi-exec): send typing to every terminal");
-                if ui.button("+").on_hover_text("New local shell").clicked() {
-                    new_shell = true;
+                // Broadcast is a plain button that shows its on/off state, so it
+                // looks the same as the split buttons.
+                if ui
+                    .add(egui::Button::new("⇉").selected(broadcast))
+                    .on_hover_text("Broadcast (multi-exec): send typing to every terminal")
+                    .clicked()
+                {
+                    broadcast = !broadcast;
                 }
             },
         );
@@ -3566,7 +3637,90 @@ impl App {
             Dialog::MacroEdit(_) => self.show_macro_edit(ctx),
             Dialog::ConfirmMacro { .. } => self.show_confirm_macro(ctx),
             Dialog::About => self.show_about(ctx),
+            Dialog::ConnectCreds(_) => self.show_connect_creds(ctx),
         }
+    }
+
+    /// The connect-time username/password prompt (blank-password sessions and
+    /// "Connect as…"), with an optional save-to-vault.
+    fn show_connect_creds(&mut self, ctx: &egui::Context) {
+        let mut connect = false;
+        let mut cancel = false;
+        if let Dialog::ConnectCreds(form) = &mut self.dialog {
+            let title = form.title.clone();
+            egui::Modal::new(egui::Id::new("connect-creds")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading("Connect");
+                ui.label(RichText::new(title).weak());
+                ui.add_space(6.0);
+                egui::Grid::new("connect-creds-fields").num_columns(2).show(ui, |ui| {
+                    ui.label("Username");
+                    ui.text_edit_singleline(&mut form.username);
+                    ui.end_row();
+                    ui.label("Password");
+                    let pw = ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
+                    if pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        connect = true;
+                    }
+                    ui.end_row();
+                });
+                ui.checkbox(&mut form.save, "Save to vault");
+                if form.save {
+                    ui.horizontal(|ui| {
+                        ui.label("Save as:");
+                        ui.text_edit_singleline(&mut form.save_name);
+                    });
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    connect |= ui.button("Connect").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if connect
+            && let Dialog::ConnectCreds(form) = &self.dialog
+        {
+            let form = form.clone();
+            self.dialog = Dialog::None;
+            self.connect_with_creds(*form, ctx);
+        } else if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// Connects using credentials from the prompt, optionally saving them.
+    fn connect_with_creds(&mut self, form: ConnectCredsForm, ctx: &egui::Context) {
+        let username = form.username.trim().to_owned();
+        let mut session = form.session;
+        if !username.is_empty() {
+            session.username = username.clone();
+        }
+        // Optionally store the credential in the vault (and rebind the session).
+        if form.save && !form.save_name.trim().is_empty() {
+            let name = form.save_name.trim().to_owned();
+            let secret = Secret::Password {
+                username: (!username.is_empty()).then(|| username.clone()),
+                password: form.password.clone(),
+            };
+            if let Err(e) = self.store_secret(&name, secret) {
+                self.error = Some(e);
+                return;
+            }
+            if form.rebind {
+                session.auth = Auth::Password { secret: name };
+                let store = self
+                    .find_session_anywhere(&session.id)
+                    .map(|(s, _)| s)
+                    .unwrap_or(StoreId::Local);
+                let _ = self.store_upsert(&store, session.clone());
+            }
+        }
+        let resolved = ResolvedAuth {
+            material: AuthMaterial::Password(form.password),
+            username: (!username.is_empty()).then_some(username),
+        };
+        self.connect_with(&session.name.clone(), &session, resolved, ctx);
     }
 
     /// Program info: version and links.
@@ -5392,47 +5546,59 @@ impl App {
         session.icon = icon;
         session.color = color;
 
-        // Resolve the vault entry name this session should reference.
-        let secret_name = match source {
-            SecretSource::Existing => match existing_name {
-                Some(n) => n,
-                None => return self.set_form_error("Choose a vault entry, or switch to New."),
-            },
-            SecretSource::New => {
-                let secret_name = if new_name.is_empty() {
-                    self.default_secret_name(&name, &host)
-                } else {
-                    new_name
-                };
-                // Store the typed value under that name (blank keeps any existing one).
-                if !secret_input.is_empty() {
-                    // Store the session's username with the credential so it is self-contained.
-                    let cred_user = (!username.is_empty()).then(|| username.clone());
-                    let secret = match method {
-                        AuthMethod::Password => {
-                            Secret::Password { username: cred_user, password: secret_input }
-                        }
-                        AuthMethod::Key => Secret::PrivateKey {
-                            pem: secret_input,
-                            passphrase: (!key_passphrase.is_empty()).then_some(key_passphrase),
-                            username: cred_user,
-                        },
-                        AuthMethod::Agent => unreachable!("agent has no secret"),
+        // Agent auth needs no stored secret.
+        session.auth = if method == AuthMethod::Agent {
+            Auth::Agent
+        } else {
+            // Resolve the vault entry name this session should reference. An empty
+            // name (blank password, no existing entry) means "prompt every time".
+            let secret_name = match source {
+                SecretSource::Existing => match existing_name {
+                    Some(n) => n,
+                    None => return self.set_form_error("Choose a vault entry, or switch to New."),
+                },
+                SecretSource::New => {
+                    let secret_name = if new_name.is_empty() {
+                        self.default_secret_name(&name, &host)
+                    } else {
+                        new_name
                     };
-                    if let Err(e) = self.store_secret(&secret_name, secret) {
-                        return self.set_form_error(&e);
+                    if !secret_input.is_empty() {
+                        // Store the session's username with the credential.
+                        let cred_user = (!username.is_empty()).then(|| username.clone());
+                        let secret = match method {
+                            AuthMethod::Password => {
+                                Secret::Password { username: cred_user, password: secret_input }
+                            }
+                            AuthMethod::Key => Secret::PrivateKey {
+                                pem: secret_input,
+                                passphrase: (!key_passphrase.is_empty()).then_some(key_passphrase),
+                                username: cred_user,
+                            },
+                            AuthMethod::Agent => unreachable!("agent handled above"),
+                        };
+                        if let Err(e) = self.store_secret(&secret_name, secret) {
+                            return self.set_form_error(&e);
+                        }
+                        secret_name
+                    } else if self.vault.unlocked().and_then(|v| v.get(&secret_name)).is_some() {
+                        // Keep referencing the existing entry.
+                        secret_name
+                    } else if method == AuthMethod::Password {
+                        // Blank password with no entry: prompt at connect time.
+                        String::new()
+                    } else {
+                        return self.set_form_error(
+                            "Enter the private key, or choose an existing vault entry.",
+                        );
                     }
-                } else if self.vault.unlocked().and_then(|v| v.get(&secret_name)).is_none() {
-                    return self.set_form_error("Enter the credential value.");
                 }
-                secret_name
+            };
+            match method {
+                AuthMethod::Password => Auth::Password { secret: secret_name },
+                AuthMethod::Key => Auth::Key { secret: secret_name },
+                AuthMethod::Agent => unreachable!("agent handled above"),
             }
-        };
-
-        session.auth = match method {
-            AuthMethod::Agent => Auth::Agent,
-            AuthMethod::Password => Auth::Password { secret: secret_name },
-            AuthMethod::Key => Auth::Key { secret: secret_name },
         };
 
         if let Err(e) = self.store_upsert(&target, session) {
@@ -6207,7 +6373,7 @@ impl SessionForm {
             host: String::new(),
             port: "22".into(),
             username: String::new(),
-            method: AuthMethod::Agent,
+            method: AuthMethod::Password,
             source: SecretSource::New,
             existing_name: None,
             new_name: String::new(),
@@ -6266,6 +6432,7 @@ fn initial_vault_state(path: &std::path::Path) -> VaultState {
 #[derive(Clone)]
 enum TreeAction {
     Connect(StoreId, String),
+    ConnectAs(StoreId, String),
     Edit(StoreId, String),
     Delete(StoreId, String),
     Duplicate(StoreId, String),
@@ -6579,6 +6746,10 @@ fn session_row(
     resp.context_menu(|ui| {
         if ui.button("Connect").clicked() {
             *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
+            ui.close();
+        }
+        if ui.button("Connect as…").clicked() {
+            *action = Some(TreeAction::ConnectAs(store.clone(), id.to_owned()));
             ui.close();
         }
         if editable {

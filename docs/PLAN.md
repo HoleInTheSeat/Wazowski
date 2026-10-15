@@ -118,6 +118,22 @@ Agreed "do next" items (rough order TBD with the user):
 - **List host hardware.**
 - **Running processes view** — likely `htop` in a tab, or a native list.
 - **Auto-updater** — best-practice update flow with a "Check for updates" button.
+- **Settings categories** — left-side category buttons (General / Tabs / Vault /
+  Terminal / Extras). General: single-instance + "open a local shell on startup"
+  checkbox. Tabs: new-tab placement as a dropdown. Extras: environment checks with
+  fix buttons (low-port permission/setcap, iperf3 install, printing service).
+- **Per-session network tools** — right-click a session → Network tools (ping,
+  port scan, …) targeting its host (prefill + run the Network tab).
+- **OpenVPN quick server** — add an OpenVPN server to Quick servers, ideally with
+  NAT punch-through / UPnP / proxy to spin up a reachable VPN quickly.
+- **App VPN routing** — route only Wazowski's traffic through a chosen VPN, with an
+  optional "force" toggle: while forcing + connecting, open the VPN settings with a
+  loading indicator and block other use until connected or the toggle is cleared;
+  on failure, require fixing it or clearing force.
+- **Wireshark quick launch** — a Network-tools button to start a Wireshark capture.
+- **RDP via external client** — rather than bundling an RDP stack, launch saved RDP
+  sessions in the user's installed client (e.g. Remmina), with the client
+  configurable; prompt to install it if missing. (See design note below.)
 - **Visual polish / "make the UI cooler"** — themes, fonts, animations; done last.
 
 ## Portability goals
