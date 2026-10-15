@@ -433,6 +433,7 @@ impl Panes {
         broadcast_active: bool,
         search: Option<&SearchQuery>,
         targets: &[SwapTarget],
+        origin: Option<u64>,
         action: &mut Option<PaneAction>,
     ) -> Option<(u64, Vec<u8>)> {
         let area = ui.available_rect_before_wrap();
@@ -449,6 +450,7 @@ impl Panes {
                     focused,
                     search,
                     targets,
+                    origin,
                     new_focus: &mut new_focus,
                     source: &mut source,
                     action,
@@ -471,6 +473,8 @@ struct Ctx<'a> {
     focused: u64,
     search: Option<&'a SearchQuery>,
     targets: &'a [SwapTarget],
+    /// The tab's original session terminal id (CloseOthers is offered only there).
+    origin: Option<u64>,
     new_focus: &'a mut u64,
     source: &'a mut Option<(u64, Vec<u8>)>,
     action: &'a mut Option<PaneAction>,
@@ -485,6 +489,7 @@ impl Ctx<'_> {
             focused: self.focused,
             search: self.search,
             targets: self.targets,
+            origin: self.origin,
             new_focus: self.new_focus,
             source: self.source,
             action: self.action,
@@ -600,7 +605,8 @@ fn title_bar(cx: &mut Ctx, ui: &mut Ui, bar: Rect, leaf: &Leaf, id: u64) {
                     *cx.action = Some(PaneAction::ClosePane(id));
                     ui.close();
                 }
-                if ui.button("Close other panes").clicked() {
+                // Offered only on the tab's original session pane, where it's safe.
+                if cx.origin == Some(id) && ui.button("Close other panes").clicked() {
                     *cx.action = Some(PaneAction::CloseOthers(id));
                     ui.close();
                 }

@@ -34,6 +34,10 @@ pub struct Terminal {
     broadcast_buf: Vec<u8>,
     /// When set, this terminal is skipped while multi-exec broadcast is on.
     exclude_broadcast: bool,
+    /// Working directory reported by the shell via OSC 7, if any.
+    cwd: Option<String>,
+    /// Rolling tail of recent output, scanned for OSC 7 sequences.
+    osc_buf: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -80,8 +84,15 @@ impl Terminal {
             scroll_remainder: 0.0,
             broadcast_buf: Vec::new(),
             exclude_broadcast: false,
+            cwd: None,
+            osc_buf: Vec::new(),
             paste_requested: false,
         }
+    }
+
+    /// The working directory last reported by the shell via OSC 7, if any.
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
     }
 
     pub fn id(&self) -> u64 {
@@ -114,7 +125,10 @@ impl Terminal {
     pub fn process(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.output.try_recv() {
             match event {
-                BackendEvent::Output(bytes) => self.parser.advance(&mut self.term, &bytes),
+                BackendEvent::Output(bytes) => {
+                    self.scan_cwd(&bytes);
+                    self.parser.advance(&mut self.term, &bytes);
+                }
                 BackendEvent::Exited => self.exited = true,
             }
         }
@@ -157,6 +171,41 @@ impl Terminal {
                 log::warn!("could not change baud rate: {e}");
                 false
             }
+        }
+    }
+
+    /// Scans recent output for OSC 7 (`ESC ] 7 ; file://host/path ST|BEL`) and
+    /// updates the tracked working directory. Keeps a bounded rolling buffer so a
+    /// sequence split across output chunks is still caught.
+    fn scan_cwd(&mut self, bytes: &[u8]) {
+        const MAX: usize = 4096;
+        self.osc_buf.extend_from_slice(bytes);
+        if self.osc_buf.len() > MAX {
+            let cut = self.osc_buf.len() - MAX;
+            self.osc_buf.drain(..cut);
+        }
+        let buf = self.osc_buf.clone();
+        let mut from = 0;
+        let mut found = None;
+        let mut consumed = 0;
+        while let Some(rel) = find(&buf[from..], b"\x1b]7;") {
+            let start = from + rel + 4;
+            match osc_terminator(&buf[start..]) {
+                Some((end, after)) => {
+                    if let Some(path) = parse_osc7(&buf[start..start + end]) {
+                        found = Some(path);
+                    }
+                    consumed = start + after;
+                    from = start + after;
+                }
+                None => break, // incomplete sequence; keep it for next time
+            }
+        }
+        if consumed > 0 {
+            self.osc_buf.drain(..consumed.min(self.osc_buf.len()));
+        }
+        if let Some(path) = found {
+            self.cwd = Some(path);
         }
     }
 
@@ -239,6 +288,55 @@ impl Terminal {
     }
 }
 
+/// Finds the first occurrence of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Finds an OSC terminator (BEL or ESC `\`) in `buf`, returning the index where
+/// the payload ends and the index just past the terminator.
+fn osc_terminator(buf: &[u8]) -> Option<(usize, usize)> {
+    for (i, &b) in buf.iter().enumerate() {
+        if b == 0x07 {
+            return Some((i, i + 1));
+        }
+        if b == 0x1b && buf.get(i + 1) == Some(&b'\\') {
+            return Some((i, i + 2));
+        }
+    }
+    None
+}
+
+/// Parses an OSC 7 payload (`file://host/path`, percent-encoded) into a path.
+fn parse_osc7(payload: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let rest = text.strip_prefix("file://")?;
+    // Drop the host component (up to the first '/'), keeping the path.
+    let path = &rest[rest.find('/')?..];
+    let decoded = percent_decode(path);
+    (!decoded.is_empty()).then_some(decoded)
+}
+
+/// Decodes `%XX` escapes in a percent-encoded string (UTF-8 aware, lenient).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -285,6 +383,18 @@ mod tests {
         tx.send(BackendEvent::Output(b"\x1b[c".to_vec())).unwrap();
         term.process(&egui::Context::default());
         assert!(written.lock().unwrap().starts_with(b"\x1b[?"));
+    }
+
+    #[test]
+    fn tracks_cwd_from_osc7() {
+        let (mut term, tx, _) = fake_terminal();
+        tx.send(BackendEvent::Output(b"\x1b]7;file://host/var/log\x07ls\r\n".to_vec())).unwrap();
+        term.process(&egui::Context::default());
+        assert_eq!(term.cwd(), Some("/var/log"));
+        // A later update (ESC-\ terminator, percent-encoded space) replaces it.
+        tx.send(BackendEvent::Output(b"\x1b]7;file://host/tmp/a%20b\x1b\\".to_vec())).unwrap();
+        term.process(&egui::Context::default());
+        assert_eq!(term.cwd(), Some("/tmp/a b"));
     }
 
     #[test]

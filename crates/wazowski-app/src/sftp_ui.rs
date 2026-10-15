@@ -246,19 +246,24 @@ impl FileBrowser {
             ui.separator();
         }
 
-        self.entry_list(ui, ctx);
-
-        // Watch opened files for local edits and offer to upload changes back.
+        // Watch opened files for local edits, and keep polling while any are open.
         self.watch_open_files();
-        self.open_files_panel(ui, ctx);
         if !self.open_files.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
-        if !self.status.is_empty() {
-            ui.separator();
-            ui.label(RichText::new(&self.status).color(ui.visuals().warn_fg_color));
+        // Opened-files list and status live in a bottom strip so they stay visible
+        // regardless of how long the file list is; the list fills the space above.
+        if !self.open_files.is_empty() || !self.status.is_empty() {
+            egui::Panel::bottom("sftp-bottom").show(ui, |ui| {
+                self.open_files_panel(ui, ctx);
+                if !self.status.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new(&self.status).color(ui.visuals().warn_fg_color));
+                }
+            });
         }
+        self.entry_list(ui, ctx);
     }
 
     fn entry_list(&mut self, ui: &mut egui::Ui, ctx: &Context) {

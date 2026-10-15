@@ -1989,7 +1989,7 @@ impl App {
                     }
                     egui::CollapsingHeader::new(kind.label())
                         .id_salt(("serial-kind", kind.label()))
-                        .default_open(true)
+                        .default_open(false)
                         .show(ui, |ui| {
                             for dev in group {
                                 let short = dev.name.rsplit(['/', '\\']).next().unwrap_or(&dev.name);
@@ -2529,12 +2529,14 @@ impl App {
         match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
                 TabContent::Terminal(panes) => {
+                    let origin = tab.origin_term;
                     broadcast_src = panes.show(
                         ui,
                         interactive,
                         broadcast,
                         search.as_ref(),
                         &targets,
+                        origin,
                         &mut pane_action,
                     );
                 }
@@ -2750,7 +2752,7 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(active)
             && let TabContent::Terminal(panes) = &mut tab.content
         {
-            panes.show(ui, false, false, None, &[], &mut None);
+            panes.show(ui, false, false, None, &[], None, &mut None);
         }
         match act {
             Some(EndAct::Restart) => {
@@ -5825,7 +5827,10 @@ impl eframe::App for App {
         // The active terminal's directory (parsed from its title) to optionally
         // follow in the SFTP pane.
         let term_cwd = self.tabs.get(self.active).and_then(|t| match &t.content {
-            TabContent::Terminal(p) => p.get(p.focused_id()).and_then(|t| cwd_from_title(t.title())),
+            TabContent::Terminal(p) => p.get(p.focused_id()).and_then(|t| {
+                // Prefer the shell's OSC 7 report; fall back to parsing the title.
+                t.cwd().map(ToOwned::to_owned).or_else(|| cwd_from_title(t.title()))
+            }),
             _ => None,
         });
         if single_pane
