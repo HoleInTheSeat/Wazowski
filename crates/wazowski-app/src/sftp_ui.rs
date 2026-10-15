@@ -35,6 +35,33 @@ struct OpenFile {
     changed: bool,
 }
 
+/// An action chosen from an opened-file's menu.
+#[derive(Clone, Copy)]
+enum RowItem {
+    Upload,
+    DeleteLocal,
+    Close,
+}
+
+/// Renders the opened-file action menu (shared by left- and right-click),
+/// returning the chosen item.
+fn open_file_menu(ui: &mut egui::Ui, changed: bool) -> Option<RowItem> {
+    let mut chosen = None;
+    if ui.add_enabled(changed, egui::Button::new("Upload changes")).clicked() {
+        chosen = Some(RowItem::Upload);
+        ui.close();
+    }
+    if ui.button("Delete local copy").clicked() {
+        chosen = Some(RowItem::DeleteLocal);
+        ui.close();
+    }
+    if ui.button("Stop watching").clicked() {
+        chosen = Some(RowItem::Close);
+        ui.close();
+    }
+    chosen
+}
+
 /// A local file's (modified time, size), for change detection.
 fn mtime(path: &std::path::Path) -> (Option<SystemTime>, u64) {
     match std::fs::metadata(path) {
@@ -470,6 +497,11 @@ impl FileBrowser {
             DeleteAll,
         }
         let mut act = None;
+        let map = |item: RowItem, i: usize| match item {
+            RowItem::Upload => Act::Upload(i),
+            RowItem::DeleteLocal => Act::DeleteLocal(i),
+            RowItem::Close => Act::Close(i),
+        };
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(RichText::new("Opened files").strong());
@@ -488,25 +520,19 @@ impl FileBrowser {
             } else {
                 RichText::new(format!("📄 {name}"))
             };
-            let hover = if f.changed {
-                "Edited locally — right-click to upload"
-            } else {
-                "Right-click for actions"
-            };
-            ui.selectable_label(false, label).on_hover_text(hover).context_menu(|ui| {
-                if ui.add_enabled(f.changed, egui::Button::new("Upload changes")).clicked() {
-                    act = Some(Act::Upload(i));
-                    ui.close();
-                }
-                if ui.button("Delete local copy").clicked() {
-                    act = Some(Act::DeleteLocal(i));
-                    ui.close();
-                }
-                if ui.button("Stop watching").clicked() {
-                    act = Some(Act::Close(i));
-                    ui.close();
-                }
-            });
+            let changed = f.changed;
+            // Left-click opens the same menu (via menu_button); right-click too.
+            let mb = ui.menu_button(label, |ui| open_file_menu(ui, changed));
+            if let Some(item) = mb.inner.flatten() {
+                act = Some(map(item, i));
+            }
+            mb.response
+                .on_hover_text("Left- or right-click for actions")
+                .context_menu(|ui| {
+                    if let Some(item) = open_file_menu(ui, changed) {
+                        act = Some(map(item, i));
+                    }
+                });
         }
         match act {
             Some(Act::Upload(i)) => {

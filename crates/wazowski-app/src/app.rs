@@ -539,6 +539,8 @@ pub struct App {
     /// sidebar's "Serial connections" group.
     serial_ports: Vec<SerialDevice>,
     serial_ports_at: std::time::Instant,
+    /// Whether the dark theme is active (the default).
+    dark_mode: bool,
 }
 
 /// Natural (numeric-aware) comparison of two serial device names, so `ttyUSB2`
@@ -747,7 +749,9 @@ impl App {
             network: NetworkState::default(),
             serial_ports: sorted_serial_devices(),
             serial_ports_at: std::time::Instant::now(),
+            dark_mode: true,
         };
+        ctx.set_visuals(egui::Visuals::dark());
         app.open_startup_tab(ctx);
         app
     }
@@ -1647,6 +1651,23 @@ impl App {
                     }
                 }
             });
+            // Far-right theme toggle.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (icon, hint) = if self.dark_mode {
+                    ("☀", "Switch to light mode")
+                } else {
+                    ("🌙", "Switch to dark mode")
+                };
+                if ui.button(icon).on_hover_text(hint).clicked() {
+                    self.dark_mode = !self.dark_mode;
+                    let visuals = if self.dark_mode {
+                        egui::Visuals::dark()
+                    } else {
+                        egui::Visuals::light()
+                    };
+                    ui.ctx().set_visuals(visuals);
+                }
+            });
         });
     }
 
@@ -2518,54 +2539,19 @@ impl App {
         let mut tab_action: Option<TabAct> = None;
         // Precompute tooltips to avoid borrowing self inside the tab loop.
         let hints: Vec<String> = self.tabs.iter().map(|t| self.tab_hint(t)).collect();
-        egui::ScrollArea::horizontal().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let tab_count = self.tabs.len();
-                for (i, tab) in self.tabs.iter().enumerate() {
-                    let name: String = tab.label.chars().take(28).collect();
-                    let label = match &tab.content {
-                        TabContent::Connecting(c) if c.error.is_some() => format!("⚠ {name}"),
-                        TabContent::Connecting(_) => format!("⏳ {name}"),
-                        TabContent::Terminal(_) => name,
-                        TabContent::Servers => format!("🖧 {name}"),
-                        TabContent::Settings => format!("⚙ {name}"),
-                        TabContent::Network => format!("🖧 {name}"),
-                        TabContent::Detached { .. } => format!("⇄ {name}"),
-                    };
-                    let resp = ui.selectable_label(i == self.active, label);
-                    if resp.clicked() {
-                        self.active = i;
-                    }
-                    delayed_tooltip(ui, &resp, &hints[i]);
-                    resp.context_menu(|ui| {
-                        if ui.button("Duplicate").clicked() {
-                            tab_action = Some(TabAct::Duplicate(i));
-                            ui.close();
-                        }
-                        if ui.button("Close").clicked() {
-                            close = Some(i);
-                            ui.close();
-                        }
-                        if tab_count > 1 && ui.button("Close others").clicked() {
-                            tab_action = Some(TabAct::CloseOthers(i));
-                            ui.close();
-                        }
-                    });
-                    if ui.small_button("×").on_hover_text("Close tab").clicked() {
-                        close = Some(i);
-                    }
-                    ui.separator();
-                }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Control cluster, pinned to the right and drawn over the tab list so
+            // it stays reachable no matter how many tabs there are.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 if ui.button("+").on_hover_text("New local shell").clicked() {
                     self.open_local_shell(ui.ctx());
                 }
-                ui.toggle_value(&mut self.broadcast, "⇉ Broadcast")
-                    .on_hover_text("Multi-exec: send typing to every terminal at once");
+                ui.toggle_value(&mut self.broadcast, "⇉")
+                    .on_hover_text("Broadcast (multi-exec): send typing to every terminal");
                 // Split-pane controls, for the active terminal tab.
                 if let Some(tab) = self.tabs.get(self.active)
                     && let TabContent::Terminal(panes) = &tab.content
                 {
-                    ui.separator();
                     if ui.button("⇥").on_hover_text("Split pane right").clicked() {
                         pane_action = Some(SplitButton::Split(SplitDir::Horizontal));
                     }
@@ -2589,6 +2575,48 @@ impl App {
                         baud_delta = Some(1);
                     }
                 }
+            });
+            ui.separator();
+            // The tab list fills the remaining space on the left and scrolls.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    let tab_count = self.tabs.len();
+                    for (i, tab) in self.tabs.iter().enumerate() {
+                        let name: String = tab.label.chars().take(28).collect();
+                        let label = match &tab.content {
+                            TabContent::Connecting(c) if c.error.is_some() => format!("⚠ {name}"),
+                            TabContent::Connecting(_) => format!("⏳ {name}"),
+                            TabContent::Terminal(_) => name,
+                            TabContent::Servers => format!("🖧 {name}"),
+                            TabContent::Settings => format!("⚙ {name}"),
+                            TabContent::Network => format!("🖧 {name}"),
+                            TabContent::Detached { .. } => format!("⇄ {name}"),
+                        };
+                        let resp = ui.selectable_label(i == self.active, label);
+                        if resp.clicked() {
+                            self.active = i;
+                        }
+                        delayed_tooltip(ui, &resp, &hints[i]);
+                        resp.context_menu(|ui| {
+                            if ui.button("Duplicate").clicked() {
+                                tab_action = Some(TabAct::Duplicate(i));
+                                ui.close();
+                            }
+                            if ui.button("Close").clicked() {
+                                close = Some(i);
+                                ui.close();
+                            }
+                            if tab_count > 1 && ui.button("Close others").clicked() {
+                                tab_action = Some(TabAct::CloseOthers(i));
+                                ui.close();
+                            }
+                        });
+                        if ui.small_button("×").on_hover_text("Close tab").clicked() {
+                            close = Some(i);
+                        }
+                        ui.separator();
+                    }
+                });
             });
         });
         match pane_action {
