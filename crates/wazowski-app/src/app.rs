@@ -99,6 +99,8 @@ struct NetworkState {
     port_scan: Option<ScanHandle<PortHit>>,
     port_open: Vec<(u16, &'static str)>,
     port_error: Option<String>,
+    ping: Option<ScanHandle<String>>,
+    ping_status: Option<String>,
     subnet_cidr: String,
     subnet_scan: Option<ScanHandle<HostHit>>,
     subnet_hosts: Vec<HostHit>,
@@ -117,6 +119,8 @@ impl Default for NetworkState {
             port_scan: None,
             port_open: Vec::new(),
             port_error: None,
+            ping: None,
+            ping_status: None,
             subnet_cidr: String::new(),
             subnet_scan: None,
             subnet_hosts: Vec::new(),
@@ -147,6 +151,16 @@ enum ExtrasAction {
     Recheck,
 }
 
+/// A per-session network tool, launched from the session context menu against
+/// the session's host.
+#[derive(Clone, Copy)]
+enum NetTool {
+    Ping,
+    PortScanCommon,
+    PortScanWellKnown,
+    SubnetScan,
+}
+
 /// Whether an executable named `name` is on the PATH.
 fn has_bin(name: &str) -> bool {
     let Ok(path) = std::env::var("PATH") else { return false };
@@ -174,12 +188,49 @@ fn low_port_granted() -> Option<bool> {
     None
 }
 
+/// The common RDP clients Wazowski can launch, most-preferred first.
+const RDP_CLIENTS: &[&str] = if cfg!(windows) {
+    &["mstsc", "xfreerdp", "remmina"]
+} else if cfg!(target_os = "macos") {
+    &["xfreerdp", "remmina"]
+} else {
+    &["xfreerdp3", "xfreerdp", "wlfreerdp", "remmina"]
+};
+
+/// The first installed RDP client on the PATH, if any.
+fn detect_rdp_client() -> Option<String> {
+    RDP_CLIENTS.iter().find(|name| has_bin(name)).map(|name| (*name).to_owned())
+}
+
+/// Best-effort name of the user's default web browser. `None` where it can't
+/// be determined (currently anything but Linux, or a missing `xdg-settings`).
+fn detect_default_browser() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let out = std::process::Command::new("xdg-settings")
+            .args(["get", "default-web-browser"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().trim_end_matches(".desktop").to_owned();
+        (!name.is_empty()).then_some(name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// Runs the Extras environment checks.
 fn compute_env_checks() -> EnvChecks {
     EnvChecks {
         iperf3: has_bin("iperf3"),
         printing: has_bin("lp") || has_bin("lpr"),
         low_port: low_port_granted(),
+        rdp_client: detect_rdp_client(),
+        default_browser: detect_default_browser(),
     }
 }
 
@@ -677,12 +728,16 @@ enum SettingsCategory {
 }
 
 /// Cached results of the Extras environment checks.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct EnvChecks {
     iperf3: bool,
     printing: bool,
     /// `Some(granted)` on Linux; `None` where not applicable.
     low_port: Option<bool>,
+    /// Name of the first detected RDP client, if any (for launching saved RDP sessions).
+    rdp_client: Option<String>,
+    /// Best-effort default web browser name; `None` if it couldn't be determined.
+    default_browser: Option<String>,
 }
 
 /// State of the find-in-terminals bar.
@@ -2080,7 +2135,7 @@ impl App {
         if self.env_checks.is_none() {
             self.env_checks = Some(compute_env_checks());
         }
-        let checks = self.env_checks.unwrap_or_default();
+        let checks = self.env_checks.clone().unwrap_or_default();
         ui.label(RichText::new("Environment").strong());
         ui.label(RichText::new("Checks for optional tools and permissions Wazowski can use.").weak());
         ui.add_space(6.0);
@@ -2127,6 +2182,22 @@ impl App {
             } else {
                 ui.label(RichText::new("install CUPS to enable Print output").weak());
             }
+            ui.end_row();
+            // RDP client (for launching saved RDP sessions).
+            status(ui, "RDP client", checks.rdp_client.is_some());
+            match &checks.rdp_client {
+                Some(name) => ui.label(RichText::new(format!("found: {name}")).weak()),
+                None => ui.label(
+                    RichText::new(format!("install one of: {}", RDP_CLIENTS.join(", "))).weak(),
+                ),
+            };
+            ui.end_row();
+            // Default web browser (used by "Open web GUI").
+            status(ui, "Default web browser", checks.default_browser.is_some());
+            match &checks.default_browser {
+                Some(name) => ui.label(RichText::new(name.as_str()).weak()),
+                None => ui.label(RichText::new("could not determine").weak()),
+            };
             ui.end_row();
         });
 
@@ -2543,6 +2614,12 @@ impl App {
                 } else {
                     Ok(())
                 }
+            }
+            TreeAction::NetworkTool(store, id, tool) => {
+                if let Some(session) = self.session_in(&store, &id) {
+                    self.session_network_tool(&session.host, tool);
+                }
+                Ok(())
             }
             TreeAction::Edit(store, id) => {
                 if let Some(session) = self.session_in(&store, &id) {
@@ -3477,6 +3554,50 @@ impl App {
         n.subnet_scan = Some(network::scan_subnet(hosts, std::time::Duration::from_millis(300)));
     }
 
+    fn start_ping(&mut self) {
+        let host = self.network.port_target.trim().to_owned();
+        if host.is_empty() {
+            self.network.ping_status = Some("Enter a host to ping.".into());
+            return;
+        }
+        self.network.ping_status = Some(format!("Pinging {host}…"));
+        self.network.ping = Some(network::ping_host(host));
+    }
+
+    /// Opens the Network toolbox and runs `tool` against a session's `host`.
+    fn session_network_tool(&mut self, host: &str, tool: NetTool) {
+        self.open_network_tab();
+        let host = host.trim().to_owned();
+        match tool {
+            NetTool::Ping => {
+                self.network.port_target = host;
+                self.start_ping();
+            }
+            NetTool::PortScanCommon => {
+                self.network.port_target = host;
+                self.network.port_mode = PortMode::Common;
+                self.start_port_scan();
+            }
+            NetTool::PortScanWellKnown => {
+                self.network.port_target = host;
+                self.network.port_mode = PortMode::Custom;
+                self.network.port_spec = "1-1024".into();
+                self.start_port_scan();
+            }
+            NetTool::SubnetScan => match network::resolve(&host) {
+                Some(std::net::IpAddr::V4(ip)) => {
+                    let o = ip.octets();
+                    self.network.subnet_cidr = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
+                    self.start_subnet_scan();
+                }
+                _ => {
+                    self.network.subnet_error =
+                        Some(format!("Could not resolve {host} to an IPv4 address."));
+                }
+            },
+        }
+    }
+
     /// The network toolbox: port scan, subnet scan, local ports, Wake-on-LAN.
     fn render_network(&mut self, ui: &mut egui::Ui) {
         // Drain streaming scan results (take the handle out to avoid a borrow clash).
@@ -3492,6 +3613,15 @@ impl App {
                 self.network.port_open.dedup();
             }
         }
+        if let Some(h) = self.network.ping.take() {
+            for msg in h.drain() {
+                self.network.ping_status = Some(msg);
+            }
+            if h.running() {
+                self.network.ping = Some(h);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+            }
+        }
         if let Some(h) = self.network.subnet_scan.take() {
             for hit in h.drain() {
                 self.network.subnet_hosts.push(hit);
@@ -3505,6 +3635,7 @@ impl App {
         }
 
         let mut start_port = false;
+        let mut start_ping = false;
         let mut start_subnet = false;
         let mut scan_host: Option<String> = None;
         let mut refresh_local = false;
@@ -3546,10 +3677,20 @@ impl App {
                         h.cancel();
                     }
                 }
+                let pinging = self.network.ping.is_some();
+                if ui.add_enabled(!pinging, egui::Button::new("Ping")).clicked() {
+                    start_ping = true;
+                }
+                if pinging {
+                    ui.spinner();
+                }
                 if let Some(e) = &self.network.port_error {
                     ui.colored_label(ui.visuals().error_fg_color, e);
                 }
             });
+            if let Some(s) = &self.network.ping_status {
+                ui.label(RichText::new(s).weak());
+            }
             if !self.network.port_open.is_empty() {
                 let list = self
                     .network
@@ -3666,6 +3807,9 @@ impl App {
 
         if start_port {
             self.start_port_scan();
+        }
+        if start_ping {
+            self.start_ping();
         }
         if start_subnet {
             self.start_subnet_scan();
@@ -6636,6 +6780,7 @@ enum TreeAction {
     Connect(StoreId, String),
     ConnectAs(StoreId, String),
     OpenWebGui(StoreId, String),
+    NetworkTool(StoreId, String, NetTool),
     Edit(StoreId, String),
     Delete(StoreId, String),
     Duplicate(StoreId, String),
@@ -6959,6 +7104,19 @@ fn session_row(
             *action = Some(TreeAction::OpenWebGui(store.clone(), id.to_owned()));
             ui.close();
         }
+        ui.menu_button("Network tools", |ui| {
+            for (label, tool) in [
+                ("Ping", NetTool::Ping),
+                ("Port scan (common)", NetTool::PortScanCommon),
+                ("Port scan (1-1024)", NetTool::PortScanWellKnown),
+                ("Scan subnet (/24)", NetTool::SubnetScan),
+            ] {
+                if ui.button(label).clicked() {
+                    *action = Some(TreeAction::NetworkTool(store.clone(), id.to_owned(), tool));
+                    ui.close();
+                }
+            }
+        });
         if editable {
             if ui.button("Edit…").clicked() {
                 *action = Some(TreeAction::Edit(store.clone(), id.to_owned()));

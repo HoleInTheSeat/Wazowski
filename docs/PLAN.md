@@ -124,9 +124,13 @@ Agreed "do next" items (rough order TBD with the user):
 - **Settings categories** — left-side category buttons (General / Tabs / Vault /
   Terminal / Extras). General: single-instance + "open a local shell on startup"
   checkbox. Tabs: new-tab placement as a dropdown. Extras: environment checks with
-  fix buttons (low-port permission/setcap, iperf3 install, printing service).
-- **Per-session network tools** — right-click a session → Network tools (ping,
-  port scan, …) targeting its host (prefill + run the Network tab).
+  fix buttons (low-port permission/setcap, iperf3 install, printing service,
+  detected RDP client, default web browser). ✅ (done; General also has the
+  "Open web GUI with: http/https" scheme setting.)
+- **Per-session network tools** ✅ — right-click a session → Network tools
+  (Ping, Port scan common, Port scan 1-1024, Scan subnet /24) targeting its
+  host; opens the Network toolbox prefilled and runs the chosen tool. (The
+  toolbox also gained a single-host Ping button alongside the port scanner.)
 - **OpenVPN quick server** — add an OpenVPN server to Quick servers, ideally with
   NAT punch-through / UPnP / proxy to spin up a reachable VPN quickly.
 - **App VPN routing** — route only Wazowski's traffic through a chosen VPN, with an

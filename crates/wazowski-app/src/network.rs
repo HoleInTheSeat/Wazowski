@@ -216,7 +216,7 @@ pub fn scan_ports(ip: IpAddr, ports: Vec<u16>, timeout: Duration) -> ScanHandle<
 }
 
 /// Whether `ip` answers a single ICMP echo (via the system `ping`).
-fn ping(ip: Ipv4Addr) -> bool {
+fn ping(ip: IpAddr) -> bool {
     let ip = ip.to_string();
     let mut cmd = Command::new("ping");
     #[cfg(windows)]
@@ -229,6 +229,30 @@ fn ping(ip: Ipv4Addr) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Pings a single host off the UI thread, resolving it first. The streamed
+/// message is a human-readable status line.
+pub fn ping_host(host: String) -> ScanHandle<String> {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let d = done.clone();
+    thread::spawn(move || {
+        let msg = match resolve(&host) {
+            None => format!("Could not resolve {host}"),
+            Some(ip) => {
+                if ping(ip) {
+                    format!("{host} ({ip}) is up")
+                } else {
+                    format!("{host} ({ip}) did not reply")
+                }
+            }
+        };
+        let _ = tx.send(msg);
+        d.store(true, Ordering::Relaxed);
+    });
+    ScanHandle { rx, cancel, done }
 }
 
 /// Pings each host and probes common service ports, streaming reachable hosts.
@@ -247,7 +271,7 @@ pub fn scan_subnet(hosts: Vec<Ipv4Addr>, timeout: Duration) -> ScanHandle<HostHi
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
-                    let pingable = ping(ip);
+                    let pingable = ping(IpAddr::V4(ip));
                     let services: Vec<(u16, &'static str)> = SERVICE_PORTS
                         .iter()
                         .filter(|(p, _)| port_open(IpAddr::V4(ip), *p, timeout))
