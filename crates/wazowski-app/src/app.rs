@@ -2537,88 +2537,107 @@ impl App {
         let mut pane_action: Option<SplitButton> = None;
         let mut baud_delta: Option<i32> = None;
         let mut tab_action: Option<TabAct> = None;
-        // Precompute tooltips to avoid borrowing self inside the tab loop.
+        // Precompute everything the two Sides closures read, so neither needs to
+        // borrow `self` (Sides takes both closures at once).
+        let active = self.active;
+        let tab_count = self.tabs.len();
         let hints: Vec<String> = self.tabs.iter().map(|t| self.tab_hint(t)).collect();
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Control cluster, pinned to the right and drawn over the tab list so
-            // it stays reachable no matter how many tabs there are.
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                if ui.button("+").on_hover_text("New local shell").clicked() {
-                    self.open_local_shell(ui.ctx());
+        let labels: Vec<String> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let name: String = tab.label.chars().take(28).collect();
+                match &tab.content {
+                    TabContent::Connecting(c) if c.error.is_some() => format!("⚠ {name}"),
+                    TabContent::Connecting(_) => format!("⏳ {name}"),
+                    TabContent::Terminal(_) => name,
+                    TabContent::Servers | TabContent::Network => format!("🖧 {name}"),
+                    TabContent::Settings => format!("⚙ {name}"),
+                    TabContent::Detached { .. } => format!("⇄ {name}"),
                 }
-                ui.toggle_value(&mut self.broadcast, "⇉")
-                    .on_hover_text("Broadcast (multi-exec): send typing to every terminal");
-                // Split-pane controls, for the active terminal tab.
-                if let Some(tab) = self.tabs.get(self.active)
-                    && let TabContent::Terminal(panes) = &tab.content
-                {
-                    if ui.button("⇥").on_hover_text("Split pane right").clicked() {
-                        pane_action = Some(SplitButton::Split(SplitDir::Horizontal));
+            })
+            .collect();
+        let serial_baud = self.active_serial_baud();
+        let (show_split, can_close_pane) = match self.tabs.get(self.active).map(|t| &t.content) {
+            Some(TabContent::Terminal(p)) => (true, p.count() > 1),
+            _ => (false, false),
+        };
+        let mut broadcast = self.broadcast;
+        let mut clicked_tab = None;
+        let mut new_shell = false;
+
+        egui::containers::Sides::new().shrink_left().spacing(6.0).show(
+            ui,
+            |ui| {
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (i, label) in labels.iter().enumerate() {
+                            let resp = ui.selectable_label(i == active, label);
+                            if resp.clicked() {
+                                clicked_tab = Some(i);
+                            }
+                            delayed_tooltip(ui, &resp, &hints[i]);
+                            resp.context_menu(|ui| {
+                                if ui.button("Duplicate").clicked() {
+                                    tab_action = Some(TabAct::Duplicate(i));
+                                    ui.close();
+                                }
+                                if ui.button("Close").clicked() {
+                                    close = Some(i);
+                                    ui.close();
+                                }
+                                if tab_count > 1 && ui.button("Close others").clicked() {
+                                    tab_action = Some(TabAct::CloseOthers(i));
+                                    ui.close();
+                                }
+                            });
+                            if ui.small_button("×").on_hover_text("Close tab").clicked() {
+                                close = Some(i);
+                            }
+                            ui.separator();
+                        }
+                    });
+                });
+            },
+            |ui| {
+                // Sides adds right widgets right-to-left, so add in reverse order.
+                if let Some(baud) = serial_baud {
+                    if ui.button("+").on_hover_text("Raise baud (Ctrl+Shift+Up)").clicked() {
+                        baud_delta = Some(1);
                     }
-                    if ui.button("⇩").on_hover_text("Split pane down").clicked() {
-                        pane_action = Some(SplitButton::Split(SplitDir::Vertical));
+                    ui.label(format!("{baud} baud"));
+                    if ui.button("−").on_hover_text("Lower baud (Ctrl+Shift+Down)").clicked() {
+                        baud_delta = Some(-1);
                     }
-                    if panes.count() > 1
+                    ui.separator();
+                }
+                if show_split {
+                    if can_close_pane
                         && ui.button("⊟").on_hover_text("Close focused pane").clicked()
                     {
                         pane_action = Some(SplitButton::Close);
                     }
-                }
-                // Live baud controls, for the active serial terminal.
-                if let Some(baud) = self.active_serial_baud() {
-                    ui.separator();
-                    if ui.button("−").on_hover_text("Lower baud (Ctrl+Shift+Down)").clicked() {
-                        baud_delta = Some(-1);
+                    if ui.button("⇩").on_hover_text("Split pane down").clicked() {
+                        pane_action = Some(SplitButton::Split(SplitDir::Vertical));
                     }
-                    ui.label(format!("{baud} baud"));
-                    if ui.button("+").on_hover_text("Raise baud (Ctrl+Shift+Up)").clicked() {
-                        baud_delta = Some(1);
+                    if ui.button("⇥").on_hover_text("Split pane right").clicked() {
+                        pane_action = Some(SplitButton::Split(SplitDir::Horizontal));
                     }
                 }
-            });
-            ui.separator();
-            // The tab list fills the remaining space on the left and scrolls.
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    let tab_count = self.tabs.len();
-                    for (i, tab) in self.tabs.iter().enumerate() {
-                        let name: String = tab.label.chars().take(28).collect();
-                        let label = match &tab.content {
-                            TabContent::Connecting(c) if c.error.is_some() => format!("⚠ {name}"),
-                            TabContent::Connecting(_) => format!("⏳ {name}"),
-                            TabContent::Terminal(_) => name,
-                            TabContent::Servers => format!("🖧 {name}"),
-                            TabContent::Settings => format!("⚙ {name}"),
-                            TabContent::Network => format!("🖧 {name}"),
-                            TabContent::Detached { .. } => format!("⇄ {name}"),
-                        };
-                        let resp = ui.selectable_label(i == self.active, label);
-                        if resp.clicked() {
-                            self.active = i;
-                        }
-                        delayed_tooltip(ui, &resp, &hints[i]);
-                        resp.context_menu(|ui| {
-                            if ui.button("Duplicate").clicked() {
-                                tab_action = Some(TabAct::Duplicate(i));
-                                ui.close();
-                            }
-                            if ui.button("Close").clicked() {
-                                close = Some(i);
-                                ui.close();
-                            }
-                            if tab_count > 1 && ui.button("Close others").clicked() {
-                                tab_action = Some(TabAct::CloseOthers(i));
-                                ui.close();
-                            }
-                        });
-                        if ui.small_button("×").on_hover_text("Close tab").clicked() {
-                            close = Some(i);
-                        }
-                        ui.separator();
-                    }
-                });
-            });
-        });
+                ui.toggle_value(&mut broadcast, "⇉")
+                    .on_hover_text("Broadcast (multi-exec): send typing to every terminal");
+                if ui.button("+").on_hover_text("New local shell").clicked() {
+                    new_shell = true;
+                }
+            },
+        );
+        self.broadcast = broadcast;
+        if let Some(i) = clicked_tab {
+            self.active = i;
+        }
+        if new_shell {
+            self.open_local_shell(ui.ctx());
+        }
         match pane_action {
             Some(SplitButton::Split(dir)) => self.split_active_pane(dir, ui.ctx()),
             Some(SplitButton::Close) => self.close_active_pane(),
