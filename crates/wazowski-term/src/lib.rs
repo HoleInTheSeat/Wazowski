@@ -17,7 +17,8 @@ pub use backend::{Backend, BackendEvent, TermSize};
 pub use colors::Palette;
 pub use pty::LocalPty;
 pub use serial::{
-    COMMON_BAUDS, SerialBackend, SerialConfig, SerialFlow, SerialParity, available_ports,
+    COMMON_BAUDS, SerialBackend, SerialConfig, SerialDevice, SerialFlow, SerialKind, SerialParity,
+    available_ports, available_ports_detailed,
 };
 pub use terminal::Terminal;
 pub use view::{SearchQuery, TerminalView};

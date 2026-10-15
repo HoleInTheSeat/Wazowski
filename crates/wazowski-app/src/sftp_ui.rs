@@ -28,15 +28,19 @@ enum JobOutcome {
 struct OpenFile {
     remote: String,
     local: PathBuf,
-    /// The temp file's modified time as of the last download/upload, to detect edits.
-    seen_mtime: Option<SystemTime>,
+    /// The temp file's modified time + size as of the last download/upload, to
+    /// detect edits (either changing flags the file).
+    seen: (Option<SystemTime>, u64),
     /// Set once a local edit is detected, until the user uploads or dismisses.
     changed: bool,
 }
 
-/// Modified time of a local file, if available.
-fn mtime(path: &std::path::Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+/// A local file's (modified time, size), for change detection.
+fn mtime(path: &std::path::Path) -> (Option<SystemTime>, u64) {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.modified().ok(), m.len()),
+        Err(_) => (None, 0),
+    }
 }
 
 /// A running background job.
@@ -60,6 +64,8 @@ pub struct FileBrowser {
     temp_dir: PathBuf,
     /// Remote files opened locally, watched for edits.
     open_files: Vec<OpenFile>,
+    /// Whether the panel follows the terminal's current directory.
+    follow: bool,
 }
 
 impl FileBrowser {
@@ -81,7 +87,22 @@ impl FileBrowser {
             new_folder: None,
             temp_dir,
             open_files: Vec::new(),
+            follow: false,
         }
+    }
+
+    /// Whether "follow terminal directory" is enabled.
+    pub fn following(&self) -> bool {
+        self.follow
+    }
+
+    /// Navigates to `path` if it differs from the current directory (used to
+    /// follow the terminal's working directory). No-op while busy.
+    pub fn follow_path(&mut self, path: &str, ctx: &Context) {
+        if self.busy() || path.is_empty() || path == self.cwd {
+            return;
+        }
+        self.list(path.to_owned(), ctx);
     }
 
     /// Spawns a job that lists `path`, resolving it to an absolute path first.
@@ -194,6 +215,8 @@ impl FileBrowser {
                 }
             });
         });
+        ui.checkbox(&mut self.follow, "Follow terminal directory")
+            .on_hover_text("When the shell changes directory (cd), follow it here");
 
         ui.add_space(2.0);
         ui.label(RichText::new(&self.cwd).monospace().weak());
@@ -227,9 +250,9 @@ impl FileBrowser {
 
         // Watch opened files for local edits and offer to upload changes back.
         self.watch_open_files();
-        self.edited_files(ui, ctx);
+        self.open_files_panel(ui, ctx);
         if !self.open_files.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
         if !self.status.is_empty() {
@@ -350,61 +373,71 @@ impl FileBrowser {
         let seen = mtime(&local);
         if let Some(f) = self.open_files.iter_mut().find(|f| f.remote == remote) {
             f.local = local;
-            f.seen_mtime = seen;
+            f.seen = seen;
             f.changed = false;
         } else {
-            self.open_files.push(OpenFile { remote, local, seen_mtime: seen, changed: false });
+            self.open_files.push(OpenFile { remote, local, seen, changed: false });
         }
     }
 
-    /// Flags any opened file whose temp copy has been modified since last seen.
+    /// Flags any opened file whose temp copy has changed (mtime or size) since
+    /// last seen.
     fn watch_open_files(&mut self) {
         for f in &mut self.open_files {
             if f.changed {
                 continue;
             }
             let now = mtime(&f.local);
-            if now != f.seen_mtime && now.is_some() {
+            // Only flag once the file still exists (an atomic save may briefly
+            // remove it) and something differs.
+            if now.0.is_some() && now != f.seen {
                 f.changed = true;
             }
         }
     }
 
-    /// Renders the "edited files" prompts, offering to upload each change back.
-    fn edited_files(&mut self, ui: &mut egui::Ui, ctx: &Context) {
-        if !self.open_files.iter().any(|f| f.changed) {
+    /// Lists files opened locally from this session: edited ones are flagged and
+    /// can be uploaded back; any can be closed (stops watching).
+    fn open_files_panel(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        if self.open_files.is_empty() {
             return;
         }
         ui.separator();
-        ui.label(RichText::new("Edited files").strong());
+        ui.label(RichText::new("Opened files").strong());
         let mut upload: Option<usize> = None;
-        let mut dismiss: Option<usize> = None;
+        let mut close: Option<usize> = None;
         for (i, f) in self.open_files.iter().enumerate() {
-            if !f.changed {
-                continue;
-            }
             let name = f.remote.rsplit('/').next().unwrap_or(&f.remote);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("✎ {name}")).color(ui.visuals().warn_fg_color));
-                if ui.button("Upload").on_hover_text("Upload the edited file back").clicked() {
+                if f.changed {
+                    ui.label(RichText::new(format!("✎ {name}")).color(ui.visuals().warn_fg_color))
+                        .on_hover_text("Edited locally — upload to send changes back");
+                } else {
+                    ui.label(format!("📄 {name}"));
+                }
+                if ui
+                    .add_enabled(f.changed, egui::Button::new("Upload"))
+                    .on_hover_text("Upload the edited file back to the server")
+                    .clicked()
+                {
                     upload = Some(i);
                 }
-                if ui.button("Dismiss").clicked() {
-                    dismiss = Some(i);
+                if ui.button("Close").on_hover_text("Stop watching this file").clicked() {
+                    close = Some(i);
                 }
             });
         }
         if let Some(i) = upload {
-            let (remote, local) = (self.open_files[i].remote.clone(), self.open_files[i].local.clone());
-            self.open_files[i].seen_mtime = mtime(&local);
+            let (remote, local) =
+                (self.open_files[i].remote.clone(), self.open_files[i].local.clone());
+            self.open_files[i].seen = mtime(&local);
             self.open_files[i].changed = false;
             self.spawn(ctx, move |sftp| {
                 sftp.upload(local, &remote)?;
                 Ok(JobOutcome::Noop)
             });
-        } else if let Some(i) = dismiss {
-            self.open_files[i].seen_mtime = mtime(&self.open_files[i].local);
-            self.open_files[i].changed = false;
+        } else if let Some(i) = close {
+            self.open_files.remove(i);
         }
     }
 

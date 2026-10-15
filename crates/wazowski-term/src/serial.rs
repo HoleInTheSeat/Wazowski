@@ -64,6 +64,54 @@ pub fn available_ports() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The kind of connection a serial device is, for grouping in the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SerialKind {
+    Usb,
+    Bluetooth,
+    Pci,
+    Other,
+}
+
+impl SerialKind {
+    /// A short group label.
+    pub fn label(self) -> &'static str {
+        match self {
+            SerialKind::Usb => "USB",
+            SerialKind::Bluetooth => "Bluetooth",
+            SerialKind::Pci => "PCI / onboard",
+            SerialKind::Other => "Other",
+        }
+    }
+}
+
+/// A detected serial device: its port name and what kind of connection it is.
+#[derive(Clone, Debug)]
+pub struct SerialDevice {
+    pub name: String,
+    pub kind: SerialKind,
+}
+
+/// Serial ports currently available, each tagged with its connection kind.
+pub fn available_ports_detailed() -> Vec<SerialDevice> {
+    serialport::available_ports()
+        .map(|ports| {
+            ports
+                .into_iter()
+                .map(|p| {
+                    let kind = match p.port_type {
+                        serialport::SerialPortType::UsbPort(_) => SerialKind::Usb,
+                        serialport::SerialPortType::BluetoothPort => SerialKind::Bluetooth,
+                        serialport::SerialPortType::PciPort => SerialKind::Pci,
+                        serialport::SerialPortType::Unknown => SerialKind::Other,
+                    };
+                    SerialDevice { name: p.port_name, kind }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// An open serial port, usable as a terminal backend.
 pub struct SerialBackend {
     writer: Box<dyn SerialPort>,

@@ -11,8 +11,8 @@ use wazowski_ssh::{
     AuthMaterial, ConnectParams, HostKeyPolicy, UnknownHostKey, trust_host,
 };
 use wazowski_term::{
-    COMMON_BAUDS, LocalPty, SearchQuery, SerialBackend, SerialConfig, SerialFlow, SerialParity,
-    TermSize, Terminal, available_ports,
+    COMMON_BAUDS, LocalPty, SearchQuery, SerialBackend, SerialConfig, SerialDevice, SerialFlow,
+    SerialKind, SerialParity, TermSize, Terminal, available_ports, available_ports_detailed,
 };
 
 use crate::connect::{Connected, PendingConnect, Progress};
@@ -286,6 +286,9 @@ struct SerialForm {
     ports: Vec<String>,
     /// Case-insensitive substring filter for the port list (e.g. "usb").
     filter: String,
+    /// When true the port was chosen by double-clicking a device, so the picker
+    /// is replaced by a read-only label.
+    locked_port: bool,
     path: String,
     baud: String,
     data_bits: u8,
@@ -302,6 +305,7 @@ impl SerialForm {
         Self {
             ports,
             filter: String::new(),
+            locked_port: false,
             path,
             baud: "115200".into(),
             data_bits: 8,
@@ -522,10 +526,59 @@ pub struct App {
     sidebar_view: SidebarView,
     /// The network toolbox state.
     network: NetworkState,
-    /// Serial ports detected on the system, refreshed periodically for the
+    /// Serial devices detected on the system, refreshed periodically for the
     /// sidebar's "Serial connections" group.
-    serial_ports: Vec<String>,
+    serial_ports: Vec<SerialDevice>,
     serial_ports_at: std::time::Instant,
+}
+
+/// Extracts an absolute working directory from a terminal title, as set by the
+/// common `user@host:/path` xterm-title convention. Returns `None` for titles
+/// without an absolute path (e.g. home-relative `~` paths).
+fn cwd_from_title(title: &str) -> Option<String> {
+    let segment = title.rsplit(':').next().unwrap_or(title).trim();
+    segment.starts_with('/').then(|| segment.to_owned())
+}
+
+/// Natural (numeric-aware) comparison of two serial device names, so `ttyUSB2`
+/// sorts before `ttyUSB10`.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut ai, mut bi) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (ai.peek().copied(), bi.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let xn: String = std::iter::from_fn(|| ai.next_if(|c| c.is_ascii_digit())).collect();
+                let yn: String = std::iter::from_fn(|| bi.next_if(|c| c.is_ascii_digit())).collect();
+                // Compare by numeric value, then by length (leading zeros).
+                let ord = xn
+                    .trim_start_matches('0')
+                    .len()
+                    .cmp(&yn.trim_start_matches('0').len())
+                    .then_with(|| xn.cmp(&yn));
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let ord = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+                ai.next();
+                bi.next();
+            }
+        }
+    }
+}
+
+/// Detected serial devices, naturally sorted by name.
+fn sorted_serial_devices() -> Vec<SerialDevice> {
+    let mut devices = available_ports_detailed();
+    devices.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+    devices
 }
 
 /// The left-pane view selector.
@@ -690,7 +743,7 @@ impl App {
             find: None,
             sidebar_view: SidebarView::Sessions,
             network: NetworkState::default(),
-            serial_ports: available_ports(),
+            serial_ports: sorted_serial_devices(),
             serial_ports_at: std::time::Instant::now(),
         };
         app.open_startup_tab(ctx);
@@ -1919,7 +1972,7 @@ impl App {
         }
 
         // Detected serial devices, always below everything else. Collapsed by
-        // default; double-click a device to open a serial connection to it.
+        // default; grouped by kind; double-click a device to open a connection.
         egui::CollapsingHeader::new("🔌 Serial connections")
             .id_salt("serial-devices")
             .default_open(false)
@@ -1927,13 +1980,26 @@ impl App {
                 if self.serial_ports.is_empty() {
                     ui.label(RichText::new("No serial devices detected.").weak());
                 }
-                for port in &self.serial_ports {
-                    let short = port.rsplit(['/', '\\']).next().unwrap_or(port);
-                    let resp = ui.selectable_label(false, format!("🔌 {short}"));
-                    delayed_tooltip(ui, &resp, port);
-                    if resp.double_clicked() {
-                        open_serial = Some(port.clone());
+                for kind in [SerialKind::Usb, SerialKind::Bluetooth, SerialKind::Pci, SerialKind::Other]
+                {
+                    let group: Vec<&SerialDevice> =
+                        self.serial_ports.iter().filter(|d| d.kind == kind).collect();
+                    if group.is_empty() {
+                        continue;
                     }
+                    egui::CollapsingHeader::new(kind.label())
+                        .id_salt(("serial-kind", kind.label()))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for dev in group {
+                                let short = dev.name.rsplit(['/', '\\']).next().unwrap_or(&dev.name);
+                                let resp = ui.selectable_label(false, format!("🔌 {short}"));
+                                delayed_tooltip(ui, &resp, &dev.name);
+                                if resp.double_clicked() {
+                                    open_serial = Some(dev.name.clone());
+                                }
+                            }
+                        });
                 }
             });
 
@@ -1969,6 +2035,7 @@ impl App {
         if let Some(port) = open_serial {
             let mut form = SerialForm::new();
             form.path = port;
+            form.locked_port = true;
             self.dialog = Dialog::SerialConnect(form);
         }
 
@@ -3770,29 +3837,33 @@ impl App {
                 ui.add_space(6.0);
                 egui::Grid::new("serial-fields").num_columns(2).show(ui, |ui| {
                     ui.label("Port");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut f.filter)
-                                .hint_text("filter, e.g. usb")
-                                .desired_width(90.0),
-                        )
-                        .on_hover_text("Case-insensitive substring filter for the port list");
-                        let needle = f.filter.to_lowercase();
-                        let matches: Vec<String> = f
-                            .ports
-                            .iter()
-                            .filter(|p| needle.is_empty() || p.to_lowercase().contains(&needle))
-                            .cloned()
-                            .collect();
-                        egui::ComboBox::from_id_salt("serial-port")
-                            .selected_text(if f.path.is_empty() { "(none)" } else { &f.path })
-                            .show_ui(ui, |ui| {
-                                for port in &matches {
-                                    ui.selectable_value(&mut f.path, port.clone(), port);
-                                }
-                            });
-                        refresh |= ui.button("⟳").on_hover_text("Rescan ports").clicked();
-                    });
+                    if f.locked_port {
+                        ui.label(RichText::new(&f.path).monospace());
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.filter)
+                                    .hint_text("filter, e.g. usb")
+                                    .desired_width(90.0),
+                            )
+                            .on_hover_text("Case-insensitive substring filter for the port list");
+                            let needle = f.filter.to_lowercase();
+                            let matches: Vec<String> = f
+                                .ports
+                                .iter()
+                                .filter(|p| needle.is_empty() || p.to_lowercase().contains(&needle))
+                                .cloned()
+                                .collect();
+                            egui::ComboBox::from_id_salt("serial-port")
+                                .selected_text(if f.path.is_empty() { "(none)" } else { &f.path })
+                                .show_ui(ui, |ui| {
+                                    for port in &matches {
+                                        ui.selectable_value(&mut f.path, port.clone(), port);
+                                    }
+                                });
+                            refresh |= ui.button("⟳").on_hover_text("Rescan ports").clicked();
+                        });
+                    }
                     ui.end_row();
                     ui.label("Baud");
                     egui::ComboBox::from_id_salt("serial-baud")
@@ -5687,7 +5758,7 @@ impl eframe::App for App {
         }
         // Refresh the serial device list for the sidebar every few seconds.
         if self.serial_ports_at.elapsed() >= std::time::Duration::from_secs(3) {
-            self.serial_ports = available_ports();
+            self.serial_ports = sorted_serial_devices();
             self.serial_ports_at = std::time::Instant::now();
         }
         // Keep server logs flowing and repaint while any server runs.
@@ -5751,11 +5822,22 @@ impl eframe::App for App {
             self.tabs.get(self.active).map(|t| &t.content),
             Some(TabContent::Terminal(p)) if p.count() == 1
         );
+        // The active terminal's directory (parsed from its title) to optionally
+        // follow in the SFTP pane.
+        let term_cwd = self.tabs.get(self.active).and_then(|t| match &t.content {
+            TabContent::Terminal(p) => p.get(p.focused_id()).and_then(|t| cwd_from_title(t.title())),
+            _ => None,
+        });
         if single_pane
             && let Some(tab) = self.tabs.get_mut(self.active)
             && tab.show_files
             && let Some(files) = &mut tab.files
         {
+            if files.following()
+                && let Some(cwd) = &term_cwd
+            {
+                files.follow_path(cwd, &ctx);
+            }
             egui::Panel::right("files")
                 .resizable(true)
                 .default_size(300.0)
