@@ -33,6 +33,34 @@ pub enum NewTabPlacement {
     Always,
 }
 
+/// Which URL scheme "Open web GUI" uses for a session's host.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebScheme {
+    /// `https://host` — the default for modern device management pages.
+    #[default]
+    Https,
+    /// `http://host` — for devices that only serve plain HTTP.
+    Http,
+}
+
+impl WebScheme {
+    /// The scheme prefix including `://`.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            WebScheme::Https => "https://",
+            WebScheme::Http => "http://",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WebScheme::Https => "https://",
+            WebScheme::Http => "http://",
+        }
+    }
+}
+
 /// Automatic vault-backup configuration.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct VaultBackup {
@@ -65,6 +93,9 @@ pub struct Settings {
     /// Terminal font size in points.
     #[serde(default = "default_font_size")]
     pub terminal_font_size: f32,
+    /// Scheme used by the session "Open web GUI" action.
+    #[serde(default)]
+    pub web_scheme: WebScheme,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -82,6 +113,7 @@ impl Default for Settings {
             vault_backup: VaultBackup::default(),
             recent: Vec::new(),
             terminal_font_size: default_font_size(),
+            web_scheme: WebScheme::default(),
             path: None,
         }
     }

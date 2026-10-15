@@ -111,6 +111,9 @@ Agreed "do next" items (rough order TBD with the user):
   path and some shells don't report it.)
 - **Web bookmark "sessions"** — save a web URL as a session entry so a device's
   GUI web page can be opened quickly (e.g. in the browser) from the session tree.
+  (Partial: a session's right-click ▸ "Open web GUI" opens its host in the
+  default browser, using the http/https scheme set in Settings ▸ General. A
+  standalone web-only bookmark entry is still future work.)
 - **Terminal color customization** — editable palette (background, foreground,
   cursor, 16 ANSI colors) and/or preset themes. (Font size and regex highlights
   are done; this is the remaining part of "terminal customization".)

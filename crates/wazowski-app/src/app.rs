@@ -21,7 +21,7 @@ use crate::keybinds::{Action, Keymap};
 use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
 use crate::network::{self, HostHit, LocalPort, PortHit, ScanHandle};
 use crate::panes::{Home, PaneAction, Panes, SplitDir, SwapTarget};
-use crate::settings::{NewTabPlacement, Settings, StartupTab};
+use crate::settings::{NewTabPlacement, Settings, StartupTab, WebScheme};
 use crate::sftp_ui::FileBrowser;
 use crate::servers_ui::{ServerEntry, ServerForm, ServersStore};
 use crate::sources::{
@@ -1917,6 +1917,23 @@ impl App {
                 if shell_on_startup { StartupTab::LocalShell } else { StartupTab::None };
             *changed = true;
         }
+        ui.horizontal(|ui| {
+            ui.label("Open web GUI with:");
+            egui::ComboBox::from_id_salt("web-scheme")
+                .selected_text(self.settings.web_scheme.label())
+                .show_ui(ui, |ui| {
+                    for value in [WebScheme::Https, WebScheme::Http] {
+                        if ui
+                            .selectable_value(&mut self.settings.web_scheme, value, value.label())
+                            .changed()
+                        {
+                            *changed = true;
+                        }
+                    }
+                });
+        })
+        .response
+        .on_hover_text("Scheme used by a session's right-click \"Open web GUI\" action");
     }
 
     fn settings_tabs(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
@@ -2517,6 +2534,15 @@ impl App {
                     self.connect_as(&session);
                 }
                 Ok(())
+            }
+            TreeAction::OpenWebGui(store, id) => {
+                if let Some(session) = self.session_in(&store, &id) {
+                    let url = web_gui_url(&session.host, self.settings.web_scheme);
+                    open::that_detached(&url)
+                        .map_err(|e| anyhow::anyhow!("could not open the browser: {e}"))
+                } else {
+                    Ok(())
+                }
             }
             TreeAction::Edit(store, id) => {
                 if let Some(session) = self.session_in(&store, &id) {
@@ -6609,6 +6635,7 @@ fn initial_vault_state(path: &std::path::Path) -> VaultState {
 enum TreeAction {
     Connect(StoreId, String),
     ConnectAs(StoreId, String),
+    OpenWebGui(StoreId, String),
     Edit(StoreId, String),
     Delete(StoreId, String),
     Duplicate(StoreId, String),
@@ -6928,6 +6955,10 @@ fn session_row(
             *action = Some(TreeAction::ConnectAs(store.clone(), id.to_owned()));
             ui.close();
         }
+        if ui.button("Open web GUI").clicked() {
+            *action = Some(TreeAction::OpenWebGui(store.clone(), id.to_owned()));
+            ui.close();
+        }
         if editable {
             if ui.button("Edit…").clicked() {
                 *action = Some(TreeAction::Edit(store.clone(), id.to_owned()));
@@ -6962,6 +6993,18 @@ fn session_row(
             }
         }
     });
+}
+
+/// Builds the URL for a session's web management page. If the host already
+/// carries a scheme it is used as-is; otherwise the configured scheme is
+/// prepended. Any trailing slash in the host is trimmed.
+fn web_gui_url(host: &str, scheme: WebScheme) -> String {
+    let host = host.trim().trim_end_matches('/');
+    if host.starts_with("http://") || host.starts_with("https://") {
+        host.to_owned()
+    } else {
+        format!("{}{host}", scheme.prefix())
+    }
 }
 
 /// A nested "Move to / Copy to" menu over destinations (store → folder).
@@ -7253,3 +7296,21 @@ fn step_editor(ui: &mut egui::Ui, step: &mut Step) {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_gui_url_prepends_configured_scheme() {
+        assert_eq!(web_gui_url("10.0.0.1", WebScheme::Https), "https://10.0.0.1");
+        assert_eq!(web_gui_url("switch.lan", WebScheme::Http), "http://switch.lan");
+    }
+
+    #[test]
+    fn web_gui_url_respects_existing_scheme_and_trims() {
+        assert_eq!(web_gui_url("http://10.0.0.1", WebScheme::Https), "http://10.0.0.1");
+        assert_eq!(web_gui_url("https://nas:8443", WebScheme::Http), "https://nas:8443");
+        assert_eq!(web_gui_url("  10.0.0.1/  ", WebScheme::Https), "https://10.0.0.1");
+    }
+}
