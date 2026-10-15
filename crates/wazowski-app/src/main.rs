@@ -56,6 +56,7 @@ fn main() -> eframe::Result {
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("Wazowski")
         .with_app_id("wazowski")
+        .with_decorations(false)
         .with_inner_size([1200.0, 760.0])
         .with_min_inner_size([640.0, 400.0]);
     // The window/taskbar icon, embedded from icon.png at the repo root.

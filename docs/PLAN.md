@@ -103,6 +103,25 @@ Agreed "do next" items (rough order TBD with the user):
 - **List open ports on the host** ✅ (via `ss`/`netstat`).
 - **Wake-on-LAN** ✅ — magic packet to broadcast.
 
+## Shell overhaul (done)
+
+- **Custom title bar** — native window decorations are off; a custom bar draws the
+  app-icon menu (About / Quit), title, theme toggle, and minimize/maximize/close.
+  Dragging the bar moves the window; double-click maximizes. (Edge-resize may be
+  limited under some Linux compositors — a follow-up could add resize handles.)
+- **Left-rail views** — the top menu bar is gone. The rail now has Sessions,
+  Macros, Files, **Tools**, **Vault**, Settings.
+- **Tools pane** — categories Servers (HTTP/TFTP/SFTP/iperf3), Network Tools
+  (IP Scanner / Port Scan / Wake-on-LAN), Host Tools (Open Ports). Each server is
+  one-per-protocol: a config row (folder, interface, port, SFTP creds, stop-after
+  timer checkbox) with the live console filling the rest; Start/Stop inline (no
+  start-time prompt). Network/host tools render in the same area.
+- **Vault pane** — credentials listed by type (passwords / private keys); click to
+  edit or delete; "Show password/key" reveals the value after master-password
+  re-auth. Vault file operations (create/unlock/import/back up/delete, plus the
+  advanced secrets manager with key generation) moved to Settings ▸ Vault.
+- **Keybindings** moved into Settings ▸ Keybindings.
+
 ## Later backlog (roadmap, not yet scheduled)
 
 - **SFTP: follow the terminal's working directory** — when the shell changes

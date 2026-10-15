@@ -23,7 +23,7 @@ use crate::network::{self, HostHit, LocalPort, PortHit, ScanHandle};
 use crate::panes::{Home, PaneAction, Panes, SplitDir, SwapTarget};
 use crate::settings::{NewTabPlacement, Settings, StartupTab, WebScheme};
 use crate::sftp_ui::FileBrowser;
-use crate::servers_ui::{ServerEntry, ServerForm, ServersStore};
+use crate::servers_ui::{ServerEntry, ServersStore};
 use crate::sources::{
     self, GitAuthKind, SharedSource, SourceDef, SourceKind, SourcesConfig,
 };
@@ -76,10 +76,6 @@ enum TabContent {
     Connecting(Box<Connecting>),
     /// One or more working terminals, arranged as a splittable layout.
     Terminal(Box<Panes>),
-    /// The quick-servers manager (singleton).
-    Servers,
-    /// The network toolbox (singleton).
-    Network,
     /// This tab's session has been moved into a split pane on another tab.
     Detached { host_tab: u64 },
 }
@@ -160,6 +156,48 @@ enum NetTool {
     PortScanWellKnown,
     SubnetScan,
 }
+
+/// Loads the embedded app icon as an egui texture, for the custom title bar.
+fn load_app_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../../icon.png")).ok()?;
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    Some(ctx.load_texture("app-icon", image, egui::TextureOptions::LINEAR))
+}
+
+/// The stable config id used for the single server of each protocol kind.
+fn kind_id(kind: ServerKind) -> String {
+    match kind {
+        ServerKind::Http => "server-http",
+        ServerKind::Tftp => "server-tftp",
+        ServerKind::Sftp => "server-sftp",
+        ServerKind::Iperf => "server-iperf",
+    }
+    .to_owned()
+}
+
+/// A fresh default configuration for a protocol's single server.
+fn default_server_config(kind: ServerKind) -> ServerConfig {
+    ServerConfig {
+        id: kind_id(kind),
+        name: kind.label().to_owned(),
+        kind,
+        root: directories::UserDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .unwrap_or_default(),
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        port: kind.default_port(),
+        writable: false,
+        username: String::new(),
+        password: String::new(),
+    }
+}
+
+/// The four protocol kinds, in display order.
+const SERVER_KINDS: [ServerKind; 4] =
+    [ServerKind::Http, ServerKind::Tftp, ServerKind::Sftp, ServerKind::Iperf];
 
 /// Whether an executable named `name` is on the PATH.
 fn has_bin(name: &str) -> bool {
@@ -279,6 +317,8 @@ enum Dialog {
     None,
     UnlockVault { password: String, remember: bool, error: Option<String> },
     CreateVault { password: String, confirm: String, remember: bool, error: Option<String> },
+    /// Re-authenticate the master password to reveal a stored secret's value.
+    RevealSecret { name: String, password: String, error: Option<String> },
     EditSession(SessionForm),
     HostKey { info: UnknownHostKey, changed: bool, tab_id: u64 },
     QuickConnect(ConnectAuthForm),
@@ -290,7 +330,6 @@ enum Dialog {
     ConfirmDeleteVault,
     ConfirmQuit,
     ConfirmImportVault { src: PathBuf },
-    EditServer(ServerForm),
     SerialConnect(SerialForm),
     StartServer { id: String, auto_stop: bool, minutes: String },
     ServerFix {
@@ -305,8 +344,6 @@ enum Dialog {
     AddSource(AddSourceForm),
     MissingShare { id: String },
     DropMenu { payload: DragPayload, to: StoreId, folder: String },
-    /// The keybindings editor. `capturing` is the action awaiting a new key.
-    Keybindings { capturing: Option<Action> },
     /// The macro editor (new or existing).
     MacroEdit(MacroForm),
     /// Confirm running a macro, showing its steps and where they go.
@@ -663,6 +700,18 @@ pub struct App {
     settings_category: SettingsCategory,
     /// Cached Extras environment checks; recomputed on demand.
     env_checks: Option<EnvChecks>,
+    /// Which tool the Tools pane is showing.
+    tools_item: ToolsItem,
+    /// The credential selected in the Vault pane (its secret name), if any.
+    vault_selected: Option<String>,
+    /// Editable form for the selected credential.
+    vault_form: Option<SecretForm>,
+    /// A revealed secret value (name, shown text) after master-password re-auth.
+    vault_reveal: Option<(String, String)>,
+    /// The window/app icon as a texture, for the custom title bar.
+    app_icon: Option<egui::TextureHandle>,
+    /// The keybinding action awaiting a new key press (Settings ▸ Keybindings).
+    keybind_capturing: Option<Action>,
 }
 
 /// Natural (numeric-aware) comparison of two serial device names, so `ttyUSB2`
@@ -713,7 +762,23 @@ enum SidebarView {
     Sessions,
     Macros,
     Files,
+    Tools,
+    Vault,
     Settings,
+}
+
+/// An item selected in the Tools pane. Category headers aren't selectable.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ToolsItem {
+    #[default]
+    ServerHttp,
+    ServerTftp,
+    ServerSftp,
+    ServerIperf,
+    IpScanner,
+    PortScan,
+    WakeOnLan,
+    OpenPorts,
 }
 
 /// A settings page category (left-rail selection).
@@ -724,6 +789,7 @@ enum SettingsCategory {
     Tabs,
     Vault,
     Terminal,
+    Keybindings,
     Extras,
 }
 
@@ -900,7 +966,14 @@ impl App {
             highlights: HighlightStore::load_or_default(),
             settings_category: SettingsCategory::General,
             env_checks: None,
+            tools_item: ToolsItem::default(),
+            vault_selected: None,
+            vault_form: None,
+            vault_reveal: None,
+            app_icon: load_app_icon(ctx),
+            keybind_capturing: None,
         };
+        app.migrate_servers_one_per_kind();
         ctx.set_visuals(egui::Visuals::dark());
         app.open_startup_tab(ctx);
         app
@@ -1120,13 +1193,10 @@ impl App {
         }
     }
 
-    /// Opens (or focuses) the singleton Network toolbox tab.
-    fn open_network_tab(&mut self) {
-        if let Some(i) = self.tabs.iter().position(|t| matches!(t.content, TabContent::Network)) {
-            self.active = i;
-        } else {
-            self.push_tab("Network", TabContent::Network, None);
-        }
+    /// Switches the left rail to the Tools view, showing a specific tool.
+    fn show_tool(&mut self, item: ToolsItem) {
+        self.sidebar_view = SidebarView::Tools;
+        self.tools_item = item;
     }
 
     fn push_tab(&mut self, label: impl Into<String>, content: TabContent, files: Option<FileBrowser>) {
@@ -1522,16 +1592,42 @@ impl App {
 
     // --- Quick servers ------------------------------------------------------
 
-    /// Opens (or focuses) the singleton Servers tab.
-    fn open_servers_tab(&mut self) {
-        if let Some(i) = self.tabs.iter().position(|t| matches!(t.content, TabContent::Servers)) {
-            self.active = i;
-        } else {
-            self.push_tab("Servers", TabContent::Servers, None);
+    /// Collapses stored servers to exactly one per protocol kind, keeping the
+    /// most recent config of each kind and filling in defaults for any missing.
+    /// Running handles and logs are carried over by kind. Persists the result.
+    fn migrate_servers_one_per_kind(&mut self) {
+        let configs: Vec<ServerConfig> = SERVER_KINDS
+            .iter()
+            .map(|&kind| {
+                self.servers_store
+                    .configs
+                    .iter()
+                    .rev()
+                    .find(|c| c.kind == kind)
+                    .cloned()
+                    .map(|mut c| {
+                        c.id = kind_id(kind);
+                        c.name = kind.label().to_owned();
+                        c
+                    })
+                    .unwrap_or_else(|| default_server_config(kind))
+            })
+            .collect();
+        let mut entries: Vec<ServerEntry> = Vec::with_capacity(configs.len());
+        for cfg in &configs {
+            if let Some(pos) = self.servers.iter().position(|e| e.config.kind == cfg.kind) {
+                let mut entry = self.servers.remove(pos);
+                entry.config = cfg.clone();
+                entries.push(entry);
+            } else {
+                entries.push(ServerEntry::new(cfg.clone()));
+            }
         }
+        self.servers = entries;
+        self.servers_store.configs = configs;
+        let _ = self.servers_store.save();
     }
 
-    /// Drains logs from running servers; returns whether any are running.
     fn poll_servers(&mut self) -> bool {
         let now = std::time::Instant::now();
         let mut any = false;
@@ -1768,97 +1864,94 @@ impl App {
         }
     }
 
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
+    /// The custom window title bar (native decorations are off): app-icon menu,
+    /// title, theme toggle, and window controls. Dragging it moves the window.
+    fn title_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut about = false;
+        let mut quit = false;
+        let mut toggle_max = false;
+        let mut minimize = false;
+        let mut toggle_theme = false;
+
+        let bar = ui.horizontal(|ui| {
+            ui.set_height(28.0);
+            ui.add_space(6.0);
+            let app_menu = |ui: &mut egui::Ui, about: &mut bool, quit: &mut bool| {
+                ui.set_min_width(150.0);
                 if ui.button("About Wazowski").clicked() {
-                    self.dialog = Dialog::About;
+                    *about = true;
+                    ui.close();
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    *quit = true;
+                    ui.close();
                 }
-            });
-            ui.menu_button("Session", |ui| {
-                if ui.button("New session…").clicked() {
-                    self.dialog = Dialog::EditSession(SessionForm::new());
-                }
-                ui.separator();
-                if ui.button("Add shared source…").clicked() {
-                    self.dialog = Dialog::AddSource(AddSourceForm::default());
-                }
-            });
-            ui.menu_button("Tools", |ui| {
-                if ui.button("Quick servers").clicked() {
-                    self.open_servers_tab();
-                }
-                if ui.button("Network scanner").clicked() {
-                    self.open_network_tab();
-                }
-                ui.separator();
-                if ui.button("Keybindings…").clicked() {
-                    self.dialog = Dialog::Keybindings { capturing: None };
-                }
-            });
-            ui.menu_button("Vault", |ui| {
-                let exists = !matches!(self.vault, VaultState::Absent);
-                match &self.vault {
-                    VaultState::Absent => {
-                        if ui.button("Create vault…").clicked() {
-                            self.dialog = Dialog::CreateVault {
-                                password: String::new(),
-                                confirm: String::new(),
-                                remember: false,
-                                error: None,
-                            };
-                        }
-                    }
-                    VaultState::Locked => {
-                        if ui.button("Unlock vault…").clicked() {
-                            self.dialog = Dialog::UnlockVault {
-                                password: String::new(),
-                                remember: false,
-                                error: None,
-                            };
-                        }
-                    }
-                    VaultState::Unlocked(_) => {
-                        if ui.button("Manage secrets…").clicked() {
-                            self.dialog = Dialog::VaultManager(VaultManagerState::default());
-                        }
-                    }
-                }
-                ui.separator();
-                if ui.button("Import vault…").clicked() {
-                    self.import_vault();
-                }
-                if exists {
-                    if ui.button("Back up vault…").clicked() {
-                        self.backup_vault();
-                    }
-                    if ui.button("Delete vault…").clicked() {
-                        self.dialog = Dialog::ConfirmDeleteVault;
-                    }
-                }
-            });
-            // Far-right theme toggle.
+            };
+            if let Some(tex) = &self.app_icon {
+                let img = egui::Image::new(egui::load::SizedTexture::new(
+                    tex.id(),
+                    egui::vec2(18.0, 18.0),
+                ));
+                ui.menu_image_button(img, |ui| app_menu(ui, &mut about, &mut quit))
+                    .response
+                    .on_hover_text("Menu");
+            } else {
+                ui.menu_button("⬢", |ui| app_menu(ui, &mut about, &mut quit));
+            }
+            ui.label(RichText::new("Wazowski").strong());
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✕").on_hover_text("Close").clicked() {
+                    quit = true;
+                }
+                if ui.button("🗖").on_hover_text("Maximize / restore").clicked() {
+                    toggle_max = true;
+                }
+                if ui.button("🗕").on_hover_text("Minimize").clicked() {
+                    minimize = true;
+                }
                 let (icon, hint) = if self.dark_mode {
                     ("☀", "Switch to light mode")
                 } else {
                     ("🌙", "Switch to dark mode")
                 };
                 if ui.button(icon).on_hover_text(hint).clicked() {
-                    self.dark_mode = !self.dark_mode;
-                    let visuals = if self.dark_mode {
-                        egui::Visuals::dark()
-                    } else {
-                        egui::Visuals::light()
-                    };
-                    ui.ctx().set_visuals(visuals);
+                    toggle_theme = true;
                 }
             });
         });
+
+        // Dragging the bar (or double-clicking it) moves/maximizes the window.
+        let resp = bar.response.interact(egui::Sense::click_and_drag());
+        if resp.double_clicked() {
+            toggle_max = true;
+        }
+        if resp.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+
+        if about {
+            self.dialog = Dialog::About;
+        }
+        if quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if minimize {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if toggle_max {
+            let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+        }
+        if toggle_theme {
+            self.dark_mode = !self.dark_mode;
+            ctx.set_visuals(if self.dark_mode {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+        }
     }
 
     /// Copies the vault file to a user-chosen location.
@@ -1921,6 +2014,7 @@ impl App {
                 SettingsCategory::Terminal => {
                     self.settings_terminal(ui, &mut changed, &mut hl_changed)
                 }
+                SettingsCategory::Keybindings => self.settings_keybindings(ui),
                 SettingsCategory::Extras => self.settings_extras(ui, &mut extras_action),
             }
         });
@@ -2018,6 +2112,55 @@ impl App {
 
     fn settings_vault(&mut self, ui: &mut egui::Ui, changed: &mut bool, backup_now: &mut bool) {
         let vault_exists = Vault::exists(&self.vault_path);
+
+        // Vault file operations (create/unlock live in the Vault left-rail pane
+        // too; these are the file-level operations and advanced management).
+        ui.label(RichText::new("Vault file").strong());
+        ui.horizontal_wrapped(|ui| {
+            match &self.vault {
+                VaultState::Absent => {
+                    if ui.button("Create vault…").clicked() {
+                        self.dialog = Dialog::CreateVault {
+                            password: String::new(),
+                            confirm: String::new(),
+                            remember: false,
+                            error: None,
+                        };
+                    }
+                }
+                VaultState::Locked => {
+                    if ui.button("Unlock vault…").clicked() {
+                        self.dialog = Dialog::UnlockVault {
+                            password: String::new(),
+                            remember: false,
+                            error: None,
+                        };
+                    }
+                }
+                VaultState::Unlocked(_) => {
+                    if ui
+                        .button("Manage secrets (advanced)…")
+                        .on_hover_text("Includes generating SSH key pairs")
+                        .clicked()
+                    {
+                        self.dialog = Dialog::VaultManager(VaultManagerState::default());
+                    }
+                }
+            }
+            if ui.button("Import vault…").clicked() {
+                self.import_vault();
+            }
+            if vault_exists {
+                if ui.button("Back up vault…").clicked() {
+                    self.backup_vault();
+                }
+                if ui.button("Delete vault…").clicked() {
+                    self.dialog = Dialog::ConfirmDeleteVault;
+                }
+            }
+        });
+        ui.add_space(10.0);
+
         ui.label(RichText::new("Automatic vault backup").strong());
         if !vault_exists {
             ui.label(RichText::new("No vault exists yet.").weak());
@@ -2250,6 +2393,18 @@ impl App {
                 .on_hover_text("Files (SFTP)");
                 ui.selectable_value(
                     view,
+                    SidebarView::Tools,
+                    icon("🧰", Color32::from_rgb(200, 150, 110)),
+                )
+                .on_hover_text("Tools (servers & network)");
+                ui.selectable_value(
+                    view,
+                    SidebarView::Vault,
+                    icon("🔒", Color32::from_rgb(210, 190, 90)),
+                )
+                .on_hover_text("Vault (credentials)");
+                ui.selectable_value(
+                    view,
                     SidebarView::Settings,
                     icon("⚙", Color32::from_rgb(170, 170, 180)),
                 )
@@ -2260,6 +2415,8 @@ impl App {
                 SidebarView::Sessions => self.sidebar_sessions(ui, ctx),
                 SidebarView::Macros => self.sidebar_macros(ui),
                 SidebarView::Files => self.sidebar_files(ui, ctx),
+                SidebarView::Tools => self.sidebar_tools(ui),
+                SidebarView::Vault => self.sidebar_vault(ui),
                 SidebarView::Settings => self.sidebar_settings_categories(ui),
             });
         });
@@ -2274,10 +2431,139 @@ impl App {
             (SettingsCategory::Tabs, "Tabs"),
             (SettingsCategory::Vault, "Vault"),
             (SettingsCategory::Terminal, "Terminal"),
+            (SettingsCategory::Keybindings, "Keybindings"),
             (SettingsCategory::Extras, "Extras"),
         ] {
             ui.selectable_value(&mut self.settings_category, cat, label);
         }
+    }
+
+    /// The Tools view's left pane: server/network/host tool categories.
+    fn sidebar_tools(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Tools");
+        ui.separator();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let item = &mut self.tools_item;
+            ui.add_space(2.0);
+            ui.label(RichText::new("Servers").strong());
+            ui.selectable_value(item, ToolsItem::ServerHttp, "    HTTP");
+            ui.selectable_value(item, ToolsItem::ServerTftp, "    TFTP");
+            ui.selectable_value(item, ToolsItem::ServerSftp, "    SFTP");
+            ui.selectable_value(item, ToolsItem::ServerIperf, "    iperf3");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Network Tools").strong());
+            ui.selectable_value(item, ToolsItem::IpScanner, "    IP Scanner");
+            ui.selectable_value(item, ToolsItem::PortScan, "    Port Scan");
+            ui.selectable_value(item, ToolsItem::WakeOnLan, "    Wake-on-LAN");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Host Tools").strong());
+            ui.selectable_value(item, ToolsItem::OpenPorts, "    Open Ports");
+        });
+    }
+
+    /// The Vault view's left pane: credentials grouped by type.
+    fn sidebar_vault(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Vault");
+            if matches!(self.vault, VaultState::Unlocked(_))
+                && ui.small_button("+").on_hover_text("New credential").clicked()
+            {
+                self.vault_selected = None;
+                self.vault_reveal = None;
+                self.vault_form = Some(SecretForm::new());
+            }
+        });
+        ui.separator();
+        match &self.vault {
+            VaultState::Absent => {
+                ui.label(RichText::new("No vault yet.").weak());
+                if ui.button("Create vault…").clicked() {
+                    self.dialog = Dialog::CreateVault {
+                        password: String::new(),
+                        confirm: String::new(),
+                        remember: false,
+                        error: None,
+                    };
+                }
+                return;
+            }
+            VaultState::Locked => {
+                ui.label(RichText::new("Vault is locked.").weak());
+                if ui.button("🔒 Unlock vault…").clicked() {
+                    self.dialog = Dialog::UnlockVault {
+                        password: String::new(),
+                        remember: false,
+                        error: None,
+                    };
+                }
+                return;
+            }
+            VaultState::Unlocked(_) => {}
+        }
+
+        // Collect names by type, then render (drops the vault borrow first).
+        let (passwords, keys) = {
+            let vault = self.vault.unlocked().expect("unlocked");
+            let (mut p, mut k) = (Vec::new(), Vec::new());
+            for name in vault.names() {
+                match vault.get(&name) {
+                    Some(Secret::Password { .. }) => p.push(name),
+                    Some(Secret::PrivateKey { .. }) => k.push(name),
+                    None => {}
+                }
+            }
+            (p, k)
+        };
+
+        let mut clicked: Option<String> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if passwords.is_empty() && keys.is_empty() {
+                ui.label(RichText::new("No credentials yet. Click + to add one.").weak());
+            }
+            if !passwords.is_empty() {
+                ui.add_space(2.0);
+                ui.label(RichText::new("Passwords").strong());
+                for name in &passwords {
+                    let selected = self.vault_selected.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(selected, format!("🔑 {name}")).clicked() {
+                        clicked = Some(name.clone());
+                    }
+                }
+            }
+            if !keys.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Private keys").strong());
+                for name in &keys {
+                    let selected = self.vault_selected.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(selected, format!("🗝 {name}")).clicked() {
+                        clicked = Some(name.clone());
+                    }
+                }
+            }
+        });
+        if let Some(name) = clicked {
+            self.select_credential(&name);
+        }
+    }
+
+    /// Loads the selected credential into an editable form (value left blank).
+    fn select_credential(&mut self, name: &str) {
+        self.vault_reveal = None;
+        let Some(vault) = self.vault.unlocked() else { return };
+        let Some(secret) = vault.get(name) else { return };
+        let (kind, username) = match secret {
+            Secret::Password { username, .. } => (SecretKind::Password, username.clone()),
+            Secret::PrivateKey { username, .. } => (SecretKind::Key, username.clone()),
+        };
+        self.vault_selected = Some(name.to_owned());
+        self.vault_form = Some(SecretForm {
+            original: Some(name.to_owned()),
+            name: name.to_owned(),
+            kind,
+            username: username.unwrap_or_default(),
+            value: String::new(),
+            passphrase: String::new(),
+        });
     }
 
     /// The Files view: the SFTP browser for the active single-pane SSH tab.
@@ -2962,7 +3248,6 @@ impl App {
                     TabContent::Connecting(c) if c.error.is_some() => format!("⚠ {name}"),
                     TabContent::Connecting(_) => format!("⏳ {name}"),
                     TabContent::Terminal(_) => name,
-                    TabContent::Servers | TabContent::Network => format!("🖧 {name}"),
                     TabContent::Detached { .. } => format!("⇄ {name}"),
                 }
             })
@@ -3061,15 +3346,11 @@ impl App {
         self.broadcast = broadcast;
         if let Some(i) = clicked_tab {
             self.active = i;
-            // Leave the Settings view so the clicked tab is shown.
-            if self.sidebar_view == SidebarView::Settings {
-                self.sidebar_view = SidebarView::Sessions;
-            }
+            // Leave a full-area rail view so the clicked tab is shown.
+            self.leave_overlay_view();
         }
         if new_shell {
-            if self.sidebar_view == SidebarView::Settings {
-                self.sidebar_view = SidebarView::Sessions;
-            }
+            self.leave_overlay_view();
             self.open_local_shell(ui.ctx());
         }
         match pane_action {
@@ -3103,23 +3384,32 @@ impl App {
         }
     }
 
+    /// Returns to the Sessions view if a full-area rail view (Settings/Tools/
+    /// Vault) is showing, so a clicked tab or new shell becomes visible.
+    fn leave_overlay_view(&mut self) {
+        if matches!(
+            self.sidebar_view,
+            SidebarView::Settings | SidebarView::Tools | SidebarView::Vault
+        ) {
+            self.sidebar_view = SidebarView::Sessions;
+        }
+    }
+
     fn central(&mut self, ui: &mut egui::Ui) {
-        // The Settings view (selected in the left rail) replaces the terminal area.
+        // Left-rail views (Settings / Tools / Vault) replace the terminal area.
         if self.sidebar_view == SidebarView::Settings {
             self.render_settings(ui);
             return;
         }
-        // The servers manager needs other &mut self fields, so handle it before
-        // the &mut self.tabs borrow below.
+        if self.sidebar_view == SidebarView::Tools {
+            self.render_tools(ui);
+            return;
+        }
+        if self.sidebar_view == SidebarView::Vault {
+            self.render_vault_view(ui);
+            return;
+        }
         match self.tabs.get(self.active).map(|t| &t.content) {
-            Some(TabContent::Servers) => {
-                self.render_servers(ui);
-                return;
-            }
-            Some(TabContent::Network) => {
-                self.render_network(ui);
-                return;
-            }
             Some(TabContent::Terminal(panes)) if panes.all_exited() => {
                 self.render_ended_tab(ui);
                 return;
@@ -3187,7 +3477,7 @@ impl App {
                         retry = Some(action);
                     }
                 }
-                TabContent::Servers | TabContent::Network | TabContent::Detached { .. } => {}
+                TabContent::Detached { .. } => {}
             },
             None => {
                 ui.vertical_centered(|ui| {
@@ -3564,21 +3854,23 @@ impl App {
         self.network.ping = Some(network::ping_host(host));
     }
 
-    /// Opens the Network toolbox and runs `tool` against a session's `host`.
+    /// Opens the Tools pane and runs `tool` against a session's `host`.
     fn session_network_tool(&mut self, host: &str, tool: NetTool) {
-        self.open_network_tab();
         let host = host.trim().to_owned();
         match tool {
             NetTool::Ping => {
+                self.show_tool(ToolsItem::PortScan);
                 self.network.port_target = host;
                 self.start_ping();
             }
             NetTool::PortScanCommon => {
+                self.show_tool(ToolsItem::PortScan);
                 self.network.port_target = host;
                 self.network.port_mode = PortMode::Common;
                 self.start_port_scan();
             }
             NetTool::PortScanWellKnown => {
+                self.show_tool(ToolsItem::PortScan);
                 self.network.port_target = host;
                 self.network.port_mode = PortMode::Custom;
                 self.network.port_spec = "1-1024".into();
@@ -3586,6 +3878,7 @@ impl App {
             }
             NetTool::SubnetScan => match network::resolve(&host) {
                 Some(std::net::IpAddr::V4(ip)) => {
+                    self.show_tool(ToolsItem::IpScanner);
                     let o = ip.octets();
                     self.network.subnet_cidr = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
                     self.start_subnet_scan();
@@ -3598,9 +3891,23 @@ impl App {
         }
     }
 
-    /// The network toolbox: port scan, subnet scan, local ports, Wake-on-LAN.
-    fn render_network(&mut self, ui: &mut egui::Ui) {
-        // Drain streaming scan results (take the handle out to avoid a borrow clash).
+    /// The Tools view (left-rail): servers, network tools, host tools.
+    fn render_tools(&mut self, ui: &mut egui::Ui) {
+        self.drain_network_scans(ui);
+        match self.tools_item {
+            ToolsItem::ServerHttp => self.render_server_panel(ui, ServerKind::Http),
+            ToolsItem::ServerTftp => self.render_server_panel(ui, ServerKind::Tftp),
+            ToolsItem::ServerSftp => self.render_server_panel(ui, ServerKind::Sftp),
+            ToolsItem::ServerIperf => self.render_server_panel(ui, ServerKind::Iperf),
+            ToolsItem::IpScanner => self.tools_ip_scanner(ui),
+            ToolsItem::PortScan => self.tools_port_scan(ui),
+            ToolsItem::WakeOnLan => self.tools_wol(ui),
+            ToolsItem::OpenPorts => self.tools_open_ports(ui),
+        }
+    }
+
+    /// Drains any running network scan/ping handles into their result buffers.
+    fn drain_network_scans(&mut self, ui: &mut egui::Ui) {
         if let Some(h) = self.network.port_scan.take() {
             for hit in h.drain() {
                 self.network.port_open.push((hit.port, hit.service));
@@ -3633,105 +3940,109 @@ impl App {
                 self.network.subnet_hosts.sort_by_key(|h| u32::from(h.ip));
             }
         }
+    }
 
+    /// Port Scan tool: scan a host's ports and/or ping it.
+    fn tools_port_scan(&mut self, ui: &mut egui::Ui) {
         let mut start_port = false;
         let mut start_ping = false;
-        let mut start_subnet = false;
-        let mut scan_host: Option<String> = None;
-        let mut refresh_local = false;
-        let mut send_wol = false;
-
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.heading("Network toolbox");
-            ui.separator();
-
-            // --- Port scanner ---
-            ui.strong("Port scan");
-            ui.horizontal(|ui| {
-                ui.label("Host:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.network.port_target)
-                        .hint_text("IP or hostname")
-                        .desired_width(180.0),
-                );
-                ui.radio_value(&mut self.network.port_mode, PortMode::Common, "Common");
-                ui.radio_value(&mut self.network.port_mode, PortMode::Custom, "Ports:");
-                ui.add_enabled(
-                    self.network.port_mode == PortMode::Custom,
-                    egui::TextEdit::singleline(&mut self.network.port_spec)
-                        .hint_text("22,80,443 or 1-1024")
-                        .desired_width(140.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                let scanning = self.network.port_scan.is_some();
-                if ui.add_enabled(!scanning, egui::Button::new("Scan")).clicked() {
-                    start_port = true;
-                }
-                if scanning {
-                    ui.spinner();
-                    if ui.button("Stop").clicked()
-                        && let Some(h) = &self.network.port_scan
-                    {
-                        h.cancel();
-                    }
-                }
-                let pinging = self.network.ping.is_some();
-                if ui.add_enabled(!pinging, egui::Button::new("Ping")).clicked() {
-                    start_ping = true;
-                }
-                if pinging {
-                    ui.spinner();
-                }
-                if let Some(e) = &self.network.port_error {
-                    ui.colored_label(ui.visuals().error_fg_color, e);
-                }
-            });
-            if let Some(s) = &self.network.ping_status {
-                ui.label(RichText::new(s).weak());
+        ui.add_space(6.0);
+        ui.heading("Port Scan");
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Host:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.network.port_target)
+                    .hint_text("IP or hostname")
+                    .desired_width(180.0),
+            );
+            ui.radio_value(&mut self.network.port_mode, PortMode::Common, "Common");
+            ui.radio_value(&mut self.network.port_mode, PortMode::Custom, "Ports:");
+            ui.add_enabled(
+                self.network.port_mode == PortMode::Custom,
+                egui::TextEdit::singleline(&mut self.network.port_spec)
+                    .hint_text("22,80,443 or 1-1024")
+                    .desired_width(140.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            let scanning = self.network.port_scan.is_some();
+            if ui.add_enabled(!scanning, egui::Button::new("Scan")).clicked() {
+                start_port = true;
             }
-            if !self.network.port_open.is_empty() {
-                let list = self
-                    .network
-                    .port_open
-                    .iter()
-                    .map(|(p, s)| if s.is_empty() { p.to_string() } else { format!("{p} ({s})") })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ui.label(format!("Open: {list}"));
-            } else if self.network.port_scan.is_none() && !self.network.port_target.is_empty() {
-                ui.label(RichText::new("No open ports found (or not scanned yet).").weak());
+            if scanning {
+                ui.spinner();
+                if ui.button("Stop").clicked()
+                    && let Some(h) = &self.network.port_scan
+                {
+                    h.cancel();
+                }
             }
-
-            ui.add_space(10.0);
-            ui.separator();
-
-            // --- Subnet scanner ---
-            ui.strong("Subnet scan");
-            ui.horizontal(|ui| {
-                ui.label("Subnet:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.network.subnet_cidr)
-                        .hint_text("10.0.0.0/24")
-                        .desired_width(180.0),
-                );
-                let scanning = self.network.subnet_scan.is_some();
-                if ui.add_enabled(!scanning, egui::Button::new("Ping sweep")).clicked() {
-                    start_subnet = true;
-                }
-                if scanning {
-                    ui.spinner();
-                    if ui.button("Stop").clicked()
-                        && let Some(h) = &self.network.subnet_scan
-                    {
-                        h.cancel();
-                    }
-                }
-            });
-            if let Some(e) = &self.network.subnet_error {
+            let pinging = self.network.ping.is_some();
+            if ui.add_enabled(!pinging, egui::Button::new("Ping")).clicked() {
+                start_ping = true;
+            }
+            if pinging {
+                ui.spinner();
+            }
+            if let Some(e) = &self.network.port_error {
                 ui.colored_label(ui.visuals().error_fg_color, e);
             }
+        });
+        if let Some(s) = &self.network.ping_status {
+            ui.label(RichText::new(s).weak());
+        }
+        if !self.network.port_open.is_empty() {
+            let list = self
+                .network
+                .port_open
+                .iter()
+                .map(|(p, s)| if s.is_empty() { p.to_string() } else { format!("{p} ({s})") })
+                .collect::<Vec<_>>()
+                .join(", ");
+            ui.label(format!("Open: {list}"));
+        } else if self.network.port_scan.is_none() && !self.network.port_target.is_empty() {
+            ui.label(RichText::new("No open ports found (or not scanned yet).").weak());
+        }
+        if start_port {
+            self.start_port_scan();
+        }
+        if start_ping {
+            self.start_ping();
+        }
+    }
+
+    /// IP Scanner tool: ping-sweep a subnet and probe common services.
+    fn tools_ip_scanner(&mut self, ui: &mut egui::Ui) {
+        let mut start_subnet = false;
+        let mut scan_host: Option<String> = None;
+        ui.add_space(6.0);
+        ui.heading("IP Scanner");
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Subnet:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.network.subnet_cidr)
+                    .hint_text("10.0.0.0/24")
+                    .desired_width(180.0),
+            );
+            let scanning = self.network.subnet_scan.is_some();
+            if ui.add_enabled(!scanning, egui::Button::new("Ping sweep")).clicked() {
+                start_subnet = true;
+            }
+            if scanning {
+                ui.spinner();
+                if ui.button("Stop").clicked()
+                    && let Some(h) = &self.network.subnet_scan
+                {
+                    h.cancel();
+                }
+            }
+        });
+        if let Some(e) = &self.network.subnet_error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for host in &self.network.subnet_hosts {
                 ui.horizontal(|ui| {
                     let dot = if host.pingable { "🟢" } else { "⚪" };
@@ -3750,17 +4061,61 @@ impl App {
                     }
                 });
             }
+        });
+        if start_subnet {
+            self.start_subnet_scan();
+        }
+        if let Some(ip) = scan_host {
+            self.network.port_target = ip;
+            self.network.port_mode = PortMode::Common;
+            self.tools_item = ToolsItem::PortScan;
+            self.start_port_scan();
+        }
+    }
 
-            ui.add_space(10.0);
-            ui.separator();
-
-            // --- Local listening ports ---
-            ui.horizontal(|ui| {
-                ui.strong("Local listening ports");
-                if ui.button("Refresh").clicked() {
-                    refresh_local = true;
-                }
+    /// Wake-on-LAN tool: send a magic packet to a MAC address.
+    fn tools_wol(&mut self, ui: &mut egui::Ui) {
+        let mut send_wol = false;
+        ui.add_space(6.0);
+        ui.heading("Wake-on-LAN");
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("MAC:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.network.wol_mac)
+                    .hint_text("AA:BB:CC:DD:EE:FF")
+                    .desired_width(180.0),
+            );
+            if ui.button("Send magic packet").clicked() {
+                send_wol = true;
+            }
+        });
+        if let Some(s) = &self.network.wol_status {
+            ui.label(RichText::new(s).weak());
+        }
+        if send_wol {
+            self.network.wol_status = Some(match network::parse_mac(&self.network.wol_mac) {
+                Some(mac) => match network::send_wol(mac) {
+                    Ok(()) => "Magic packet sent.".into(),
+                    Err(e) => format!("Failed: {e}"),
+                },
+                None => "Enter a valid MAC address.".into(),
             });
+        }
+    }
+
+    /// Host Tools ▸ Open Ports: this machine's listening sockets.
+    fn tools_open_ports(&mut self, ui: &mut egui::Ui) {
+        let mut refresh_local = false;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.heading("Open Ports");
+            if ui.button("Refresh").clicked() {
+                refresh_local = true;
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             match &self.network.local_ports {
                 None => {
                     ui.label(RichText::new("Click Refresh to list this host's open ports.").weak());
@@ -3783,78 +4138,151 @@ impl App {
                     });
                 }
             }
-
-            ui.add_space(10.0);
-            ui.separator();
-
-            // --- Wake-on-LAN ---
-            ui.strong("Wake-on-LAN");
-            ui.horizontal(|ui| {
-                ui.label("MAC:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.network.wol_mac)
-                        .hint_text("AA:BB:CC:DD:EE:FF")
-                        .desired_width(180.0),
-                );
-                if ui.button("Send magic packet").clicked() {
-                    send_wol = true;
-                }
-            });
-            if let Some(s) = &self.network.wol_status {
-                ui.label(RichText::new(s).weak());
-            }
         });
-
-        if start_port {
-            self.start_port_scan();
-        }
-        if start_ping {
-            self.start_ping();
-        }
-        if start_subnet {
-            self.start_subnet_scan();
-        }
-        if let Some(ip) = scan_host {
-            self.network.port_target = ip;
-            self.network.port_mode = PortMode::Common;
-            self.start_port_scan();
-        }
         if refresh_local {
             match network::local_listening_ports() {
                 Ok(ports) => self.network.local_ports = Some(ports),
                 Err(e) => self.error = Some(e),
             }
         }
-        if send_wol {
-            self.network.wol_status = Some(match network::parse_mac(&self.network.wol_mac) {
-                Some(mac) => match network::send_wol(mac) {
-                    Ok(()) => "Magic packet sent.".into(),
-                    Err(e) => format!("Failed: {e}"),
-                },
-                None => "Enter a valid MAC address.".into(),
-            });
-        }
     }
 
-    fn render_servers(&mut self, ui: &mut egui::Ui) {
-        enum Act {
-            Start(String),
-            Stop(String),
-            Edit(String),
-            Remove(String),
-        }
-        let mut act: Option<Act> = None;
+    /// A single protocol server: config row at top, live console below.
+    fn render_server_panel(&mut self, ui: &mut egui::Ui, kind: ServerKind) {
+        let Some(idx) = self.servers.iter().position(|e| e.config.kind == kind) else { return };
+        let mut changed = false;
+        let mut start = false;
+        let mut stop = false;
+        let binds = wazowski_servers::bind_options();
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.heading("Quick servers");
-            if ui.button("➕ Add server…").clicked() {
-                self.dialog = Dialog::EditServer(ServerForm::new());
+            ui.heading(format!("{} server", kind.label()));
+            match &self.servers[idx].running {
+                Some(r) => {
+                    ui.colored_label(Color32::GREEN, format!("● {}", r.addr()));
+                }
+                None => {
+                    ui.label(RichText::new("○ stopped").weak());
+                }
             }
         });
-        ui.label(
-            RichText::new("Serve a folder over HTTP/TFTP/SFTP, or run an iperf3 server.").weak(),
-        );
+        ui.separator();
+
+        {
+            let entry = &mut self.servers[idx];
+            egui::Grid::new(("server-cfg", kind.label()))
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    if kind.uses_root() {
+                        ui.label("Folder:");
+                        ui.horizontal(|ui| {
+                            let mut s = entry.config.root.display().to_string();
+                            if ui
+                                .add(egui::TextEdit::singleline(&mut s).desired_width(280.0))
+                                .changed()
+                            {
+                                entry.config.root = s.into();
+                                changed = true;
+                            }
+                            if ui.button("Browse…").clicked()
+                                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                            {
+                                entry.config.root = dir;
+                                changed = true;
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    ui.label("Interface:");
+                    let current = binds
+                        .iter()
+                        .find(|(_, ip)| *ip == entry.config.bind)
+                        .map(|(l, _)| l.clone())
+                        .unwrap_or_else(|| entry.config.bind.to_string());
+                    egui::ComboBox::from_id_salt(("bind", kind.label()))
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for (label, ip) in &binds {
+                                if ui.selectable_label(entry.config.bind == *ip, label).clicked() {
+                                    entry.config.bind = *ip;
+                                    changed = true;
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Port:");
+                    let mut port = entry.config.port.to_string();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut port).desired_width(80.0))
+                        .changed()
+                        && let Ok(p) = port.trim().parse::<u16>()
+                    {
+                        entry.config.port = p;
+                        changed = true;
+                    }
+                    ui.end_row();
+
+                    if matches!(kind, ServerKind::Sftp) {
+                        ui.label("Username:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut entry.config.username)
+                                    .desired_width(160.0),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.end_row();
+                        ui.label("Password:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut entry.config.password)
+                                    .password(true)
+                                    .desired_width(160.0),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.end_row();
+                    }
+                    if matches!(kind, ServerKind::Tftp | ServerKind::Sftp) {
+                        ui.label("Writable:");
+                        if ui.checkbox(&mut entry.config.writable, "allow uploads").changed() {
+                            changed = true;
+                        }
+                        ui.end_row();
+                    }
+                });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let running = entry.is_running();
+                if running {
+                    if ui.button("⏹ Stop").clicked() {
+                        stop = true;
+                    }
+                } else if ui.button("▶ Start").clicked() {
+                    start = true;
+                }
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.checkbox(&mut entry.auto_stop, "Stop after");
+                    ui.add_enabled(
+                        entry.auto_stop,
+                        egui::TextEdit::singleline(&mut entry.stop_minutes).desired_width(44.0),
+                    );
+                    ui.label("minutes");
+                });
+                if let Some(t) = entry.stop_at {
+                    let secs = t.saturating_duration_since(std::time::Instant::now()).as_secs();
+                    ui.label(RichText::new(format!("⏱ stops in {}m", secs / 60 + 1)).weak());
+                }
+            });
+        }
         if let Some(task) = &self.admin_task {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -3863,86 +4291,243 @@ impl App {
         }
         ui.separator();
 
+        egui::ScrollArea::vertical()
+            .id_salt(("server-console", kind.label()))
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                let log = &self.servers[idx].log;
+                if log.is_empty() {
+                    ui.label(
+                        RichText::new("Console output appears here once the server starts.").weak(),
+                    );
+                }
+                for line in log.iter().rev().take(1000).rev() {
+                    ui.label(RichText::new(line).monospace().size(11.0));
+                }
+            });
+
+        if changed {
+            let cfg = self.servers[idx].config.clone();
+            if let Err(e) = self.servers_store.upsert(cfg) {
+                self.error = Some(format!("{e:#}"));
+            }
+        }
+        if start {
+            let (auto, mins) = {
+                let e = &self.servers[idx];
+                (e.auto_stop, e.stop_minutes.trim().parse::<u64>().ok())
+            };
+            let auto_stop = if auto { mins.filter(|m| *m > 0) } else { None };
+            if auto && auto_stop.is_none() {
+                self.error = Some("Enter a positive number of minutes for the stop timer.".into());
+            } else {
+                let id = self.servers[idx].config.id.clone();
+                let ctx = ui.ctx().clone();
+                self.start_server(&id, auto_stop, &ctx);
+            }
+        }
+        if stop {
+            let id = self.servers[idx].config.id.clone();
+            self.stop_server(&id);
+        }
+    }
+
+    /// The Vault view's central area: edit the selected credential, with a
+    /// master-password-gated reveal.
+    fn render_vault_view(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        if !matches!(self.vault, VaultState::Unlocked(_)) {
+            ui.heading("Vault");
+            ui.separator();
+            ui.label(
+                RichText::new("Unlock or create the vault in the left pane to manage credentials.")
+                    .weak(),
+            );
+            return;
+        }
+        let Some(mut form) = self.vault_form.take() else {
+            ui.heading("Vault");
+            ui.separator();
+            ui.label(
+                RichText::new("Select a credential on the left, or click + to add one.").weak(),
+            );
+            return;
+        };
+        let editing = form.original.is_some();
+        let (mut save, mut delete, mut reveal, mut cancel) = (false, false, false, false);
+
+        ui.heading(if editing { "Edit credential" } else { "New credential" });
+        ui.separator();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if self.servers.is_empty() {
-                ui.label(RichText::new("No servers configured. Add one to get started.").weak());
-            }
-            for entry in &self.servers {
-                let id = entry.config.id.clone();
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong(&entry.config.name);
-                        ui.label(RichText::new(entry.config.kind.label()).weak());
-                        match &entry.running {
-                            Some(r) => {
-                                let timer = entry
-                                    .stop_at
-                                    .map(|t| {
-                                        let secs = t.saturating_duration_since(std::time::Instant::now()).as_secs();
-                                        format!("  ⏱ stops in {}m", secs / 60 + 1)
-                                    })
-                                    .unwrap_or_default();
-                                ui.colored_label(Color32::GREEN, format!("● {}{timer}", r.addr()))
-                            }
-                            None => ui.label(
-                                RichText::new(format!("○ {}:{}", entry.config.bind, entry.config.port))
-                                    .weak(),
-                            ),
-                        };
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Remove").clicked() {
-                                act = Some(Act::Remove(id.clone()));
-                            }
-                            ui.add_enabled_ui(!entry.is_running(), |ui| {
-                                if ui.small_button("Edit").clicked() {
-                                    act = Some(Act::Edit(id.clone()));
-                                }
-                            });
-                            if entry.is_running() {
-                                if ui.button("Stop").clicked() {
-                                    act = Some(Act::Stop(id.clone()));
-                                }
-                            } else if ui.button("Start").clicked() {
-                                act = Some(Act::Start(id.clone()));
-                            }
-                        });
+            egui::Grid::new("vault-edit").num_columns(2).spacing([8.0, 8.0]).show(ui, |ui| {
+                ui.label("Name:");
+                ui.add_enabled(
+                    !editing,
+                    egui::TextEdit::singleline(&mut form.name).desired_width(240.0),
+                );
+                ui.end_row();
+                ui.label("Type:");
+                egui::ComboBox::from_id_salt("vault-type")
+                    .selected_text(match form.kind {
+                        SecretKind::Password => "Password",
+                        SecretKind::Key => "Private key",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut form.kind, SecretKind::Password, "Password");
+                        ui.selectable_value(&mut form.kind, SecretKind::Key, "Private key");
                     });
-                    if !entry.log.is_empty() {
-                        egui::ScrollArea::vertical()
-                            .id_salt(("server-log", &id))
-                            .max_height(140.0)
-                            .auto_shrink([false, false])
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                for line in entry.log.iter().rev().take(200).rev() {
-                                    ui.label(RichText::new(line).monospace().size(11.0));
-                                }
-                            });
+                ui.end_row();
+                ui.label("Username:");
+                ui.add(egui::TextEdit::singleline(&mut form.username).desired_width(240.0));
+                ui.end_row();
+                let hint = if editing { "(unchanged)" } else { "" };
+                match form.kind {
+                    SecretKind::Password => {
+                        ui.label("Password:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.value)
+                                .password(true)
+                                .hint_text(hint)
+                                .desired_width(240.0),
+                        );
+                        ui.end_row();
                     }
-                });
-                ui.add_space(4.0);
+                    SecretKind::Key => {
+                        ui.label("Private key:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut form.value)
+                                .hint_text(if editing { hint } else { "-----BEGIN ..." })
+                                .desired_width(360.0)
+                                .desired_rows(6),
+                        );
+                        ui.end_row();
+                        ui.label("Passphrase:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.passphrase)
+                                .password(true)
+                                .hint_text(hint)
+                                .desired_width(240.0),
+                        );
+                        ui.end_row();
+                    }
+                }
+            });
+
+            if editing {
+                ui.add_space(6.0);
+                if ui.button("👁 Show password/key").clicked() {
+                    reveal = true;
+                }
+                if let Some((name, value)) = &self.vault_reveal
+                    && Some(name.as_str()) == form.original.as_deref()
+                {
+                    let mut shown = value.clone();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut shown)
+                            .desired_width(360.0)
+                            .desired_rows(3)
+                            .font(egui::TextStyle::Monospace)
+                            .interactive(false),
+                    );
+                }
             }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    save = true;
+                }
+                if editing && ui.button("Delete").clicked() {
+                    delete = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
         });
 
-        match act {
-            Some(Act::Start(id)) => {
-                self.dialog = Dialog::StartServer { id, auto_stop: true, minutes: "60".into() };
-            }
-            Some(Act::Stop(id)) => self.stop_server(&id),
-            Some(Act::Edit(id)) => {
-                if let Some(entry) = self.servers.iter().find(|e| e.config.id == id) {
-                    self.dialog = Dialog::EditServer(ServerForm::from_config(&entry.config));
-                }
-            }
-            Some(Act::Remove(id)) => {
-                self.stop_server(&id);
-                self.servers.retain(|e| e.config.id != id);
-                if let Err(e) = self.servers_store.remove(&id) {
-                    self.error = Some(format!("{e:#}"));
-                }
-            }
-            None => {}
+        if cancel {
+            self.vault_form = None;
+            self.vault_selected = None;
+            self.vault_reveal = None;
+            return;
         }
+        if delete {
+            if let Some(name) = &form.original {
+                let name = name.clone();
+                if let Some(vault) = self.vault.unlocked_mut()
+                    && let Err(e) = vault.remove(&name)
+                {
+                    self.error = Some(format!("{e:#}"));
+                    self.vault_form = Some(form);
+                    return;
+                }
+            }
+            self.vault_form = None;
+            self.vault_selected = None;
+            self.vault_reveal = None;
+            return;
+        }
+        if reveal {
+            if let Some(name) = form.original.clone() {
+                self.dialog = Dialog::RevealSecret { name, password: String::new(), error: None };
+            }
+            self.vault_form = Some(form);
+            return;
+        }
+        if save {
+            match self.save_vault_credential(&form) {
+                Ok(saved_name) => {
+                    self.vault_selected = Some(saved_name.clone());
+                    self.vault_reveal = None;
+                    // Reload the form so it reflects the saved (now-existing) entry.
+                    self.select_credential(&saved_name);
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    self.vault_form = Some(form);
+                }
+            }
+            return;
+        }
+        self.vault_form = Some(form);
+    }
+
+    /// Saves a credential form into the unlocked vault. Returns its name.
+    fn save_vault_credential(&mut self, form: &SecretForm) -> Result<String, String> {
+        let name = form.name.trim().to_owned();
+        if name.is_empty() {
+            return Err("Give the credential a name.".into());
+        }
+        let keep_existing = form.original.is_some() && form.value.trim().is_empty();
+        let existing = self.vault.unlocked().and_then(|v| v.get(&name).cloned());
+        let username = {
+            let u = form.username.trim();
+            (!u.is_empty()).then(|| u.to_owned())
+        };
+        let secret = if keep_existing {
+            match (form.kind, existing.as_ref()) {
+                (SecretKind::Password, Some(Secret::Password { password, .. })) => {
+                    Secret::Password { username, password: password.clone() }
+                }
+                (SecretKind::Key, Some(Secret::PrivateKey { pem, passphrase, .. })) => {
+                    Secret::PrivateKey {
+                        pem: pem.clone(),
+                        passphrase: passphrase.clone(),
+                        username,
+                    }
+                }
+                _ => return Err("Enter the new secret value to change its type.".into()),
+            }
+        } else {
+            if form.value.trim().is_empty() {
+                return Err("Enter the secret value.".into());
+            }
+            form.to_secret()
+        };
+        let vault = self.vault.unlocked_mut().ok_or("The vault is locked.")?;
+        vault.put(&name, secret).map_err(|e| format!("{e:#}"))?;
+        Ok(name)
     }
 
     // --- Dialogs ------------------------------------------------------------
@@ -3952,6 +4537,7 @@ impl App {
             Dialog::None => {}
             Dialog::UnlockVault { .. } => self.show_unlock_vault(ctx),
             Dialog::CreateVault { .. } => self.show_create_vault(ctx),
+            Dialog::RevealSecret { .. } => self.show_reveal_secret(ctx),
             Dialog::EditSession(_) => self.show_edit_session(ctx),
             Dialog::HostKey { .. } => self.show_host_key(ctx),
             Dialog::QuickConnect(_) => self.show_quick_connect(ctx),
@@ -3965,13 +4551,11 @@ impl App {
             Dialog::ConfirmImportVault { .. } => self.show_confirm_import_vault(ctx),
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
             Dialog::AddSource(_) => self.show_add_source(ctx),
-            Dialog::EditServer(_) => self.show_edit_server(ctx),
             Dialog::SerialConnect(_) => self.show_serial_connect(ctx),
             Dialog::StartServer { .. } => self.show_start_server(ctx),
             Dialog::ServerFix { .. } => self.show_server_fix(ctx),
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
             Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
-            Dialog::Keybindings { .. } => self.show_keybindings(ctx),
             Dialog::MacroEdit(_) => self.show_macro_edit(ctx),
             Dialog::ConfirmMacro { .. } => self.show_confirm_macro(ctx),
             Dialog::About => self.show_about(ctx),
@@ -4102,13 +4686,14 @@ impl App {
 
     /// The keybindings editor: lists every action, lets the user click one and
     /// press keys to rebind it, with reset-to-default and a save.
-    fn show_keybindings(&mut self, ctx: &egui::Context) {
-        let Dialog::Keybindings { capturing } = &mut self.dialog else { return };
-        let mut capturing = *capturing;
+    /// Settings ▸ Keybindings: click a shortcut, press keys to rebind; saves
+    /// immediately. Lives in the Settings page (no longer a modal).
+    fn settings_keybindings(&mut self, ui: &mut egui::Ui) {
+        let mut capturing = self.keybind_capturing;
 
         // If an action is awaiting a key, grab the first non-modifier key press.
         if let Some(action) = capturing {
-            let captured = ctx.input_mut(|i| {
+            let captured = ui.input_mut(|i| {
                 i.events.iter().find_map(|e| match e {
                     egui::Event::Key { key, pressed: true, modifiers, .. }
                         if !is_modifier_key(*key) =>
@@ -4121,70 +4706,46 @@ impl App {
             if let Some(shortcut) = captured {
                 self.keymap.set(action, shortcut);
                 capturing = None;
+                if let Err(e) = self.keymap.save() {
+                    self.error = Some(format!("Could not save keybindings: {e:#}"));
+                }
+            }
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                capturing = None;
             }
         }
 
-        let mut open = true;
-        let mut close = false;
         let mut save = false;
-        egui::Window::new("Keybindings")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label("Click a shortcut, then press the keys to rebind it.");
-                ui.add_space(6.0);
-                egui::Grid::new("keybinds-grid").num_columns(3).spacing([12.0, 6.0]).show(
-                    ui,
-                    |ui| {
-                        for action in Action::ALL {
-                            ui.label(action.label());
-                            let label = if capturing == Some(action) {
-                                "press keys…".to_owned()
-                            } else {
-                                self.keymap.text(action)
-                            };
-                            let selected = capturing == Some(action);
-                            if ui.selectable_label(selected, label).clicked() {
-                                capturing = if selected { None } else { Some(action) };
-                            }
-                            if ui.small_button("Reset").clicked() {
-                                self.keymap.reset(action);
-                                capturing = None;
-                            }
-                            ui.end_row();
-                        }
-                    },
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        save = true;
-                    }
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
-                    if capturing.is_some() {
-                        ui.label(RichText::new("Esc to cancel capture").weak());
-                    }
-                });
-            });
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) && capturing.is_some() {
-            capturing = None;
-        }
-        if save {
-            if let Err(e) = self.keymap.save() {
-                self.error = Some(format!("Could not save keybindings: {e:#}"));
+        ui.label("Click a shortcut, then press the keys to rebind it.");
+        ui.add_space(6.0);
+        egui::Grid::new("keybinds-grid").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+            for action in Action::ALL {
+                ui.label(action.label());
+                let label = if capturing == Some(action) {
+                    "press keys…".to_owned()
+                } else {
+                    self.keymap.text(action)
+                };
+                let selected = capturing == Some(action);
+                if ui.selectable_label(selected, label).clicked() {
+                    capturing = if selected { None } else { Some(action) };
+                }
+                if ui.small_button("Reset").clicked() {
+                    self.keymap.reset(action);
+                    capturing = None;
+                    save = true;
+                }
+                ui.end_row();
             }
-            close = true;
+        });
+        if capturing.is_some() {
+            ui.add_space(4.0);
+            ui.label(RichText::new("Esc to cancel capture").weak());
         }
-        if close || !open {
-            self.dialog = Dialog::None;
-        } else if let Dialog::Keybindings { capturing: c } = &mut self.dialog {
-            *c = capturing;
+        if save && let Err(e) = self.keymap.save() {
+            self.error = Some(format!("Could not save keybindings: {e:#}"));
         }
+        self.keybind_capturing = capturing;
     }
 
     // --- Macros -------------------------------------------------------------
@@ -4520,148 +5081,6 @@ impl App {
             self.apply_tree_action(Some(act), ctx);
         } else if cancel {
             self.dialog = Dialog::None;
-        }
-    }
-
-    fn show_edit_server(&mut self, ctx: &egui::Context) {
-        let mut save = false;
-        let mut cancel = false;
-        let mut browse = false;
-        let bind_options = wazowski_servers::bind_options();
-        if let Dialog::EditServer(f) = &mut self.dialog {
-            let title = if f.id.is_some() { "Edit server" } else { "New server" };
-            egui::Modal::new(egui::Id::new("edit-server")).show(ctx, |ui| {
-                ui.set_width(440.0);
-                ui.heading(title);
-                ui.add_space(6.0);
-                egui::Grid::new("server-fields").num_columns(2).show(ui, |ui| {
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut f.name);
-                    ui.end_row();
-                    ui.label("Type");
-                    egui::ComboBox::from_id_salt("server-kind")
-                        .selected_text(f.kind.label())
-                        .show_ui(ui, |ui| {
-                            for kind in
-                                [ServerKind::Http, ServerKind::Tftp, ServerKind::Sftp, ServerKind::Iperf]
-                            {
-                                if ui.selectable_value(&mut f.kind, kind, kind.label()).clicked() {
-                                    // Suggest the type's default port when switching.
-                                    f.port = kind.default_port().to_string();
-                                }
-                            }
-                        });
-                    ui.end_row();
-                    if f.kind.uses_root() {
-                        ui.label("Folder");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut f.root)
-                                    .hint_text("folder to serve")
-                                    .desired_width(240.0),
-                            );
-                            browse |= ui.button("Browse…").clicked();
-                        });
-                        ui.end_row();
-                    }
-                    ui.label("Bind");
-                    egui::ComboBox::from_id_salt("server-bind")
-                        .selected_text(
-                            bind_options
-                                .iter()
-                                .find(|(_, ip)| *ip == f.bind)
-                                .map(|(l, _)| l.clone())
-                                .unwrap_or_else(|| f.bind.to_string()),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (label, ip) in &bind_options {
-                                ui.selectable_value(&mut f.bind, *ip, label);
-                            }
-                        });
-                    ui.end_row();
-                    ui.label("Port");
-                    ui.text_edit_singleline(&mut f.port);
-                    ui.end_row();
-                    if matches!(f.kind, ServerKind::Tftp | ServerKind::Sftp) {
-                        ui.label("Allow uploads");
-                        ui.checkbox(&mut f.writable, "writable");
-                        ui.end_row();
-                    }
-                    if f.kind == ServerKind::Sftp {
-                        ui.label("Username");
-                        ui.add(egui::TextEdit::singleline(&mut f.username).hint_text("(any if blank)"));
-                        ui.end_row();
-                        ui.label("Password");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut f.password)
-                                .password(true)
-                                .hint_text("(any if blank)"),
-                        );
-                        ui.end_row();
-                    }
-                });
-                if f.kind == ServerKind::Iperf {
-                    ui.label(RichText::new("Requires the iperf3 binary on your PATH.").weak());
-                }
-                if let Some(error) = &f.error {
-                    ui.colored_label(Color32::LIGHT_RED, error.as_str());
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    save |= ui.button("Save").clicked();
-                    cancel |= ui.button("Cancel").clicked();
-                });
-            });
-        }
-        if browse
-            && let Some(dir) = rfd::FileDialog::new().pick_folder()
-            && let Dialog::EditServer(f) = &mut self.dialog
-        {
-            f.root = dir.to_string_lossy().into_owned();
-        }
-        if save {
-            self.try_save_server();
-        }
-        if cancel {
-            self.dialog = Dialog::None;
-        }
-    }
-
-    fn try_save_server(&mut self) {
-        let Dialog::EditServer(f) = &self.dialog else { return };
-        let port: u16 = match f.port.trim().parse() {
-            Ok(p) if p > 0 => p,
-            _ => return self.set_server_error("Port must be a number from 1–65535."),
-        };
-        let name = if f.name.trim().is_empty() { f.kind.label().to_owned() } else { f.name.trim().to_owned() };
-        if f.kind.uses_root() && f.root.trim().is_empty() {
-            return self.set_server_error("Choose a folder to serve.");
-        }
-        let id = f.id.clone().unwrap_or_else(|| Session::new("", "", "").id);
-        let config = ServerConfig {
-            id: id.clone(),
-            name,
-            kind: f.kind,
-            root: PathBuf::from(f.root.trim()),
-            bind: f.bind,
-            port,
-            writable: f.writable,
-            username: f.username.trim().to_owned(),
-            password: f.password.clone(),
-        };
-        if let Err(e) = self.servers_store.upsert(config.clone()) {
-            return self.set_server_error(&format!("{e:#}"));
-        }
-        match self.servers.iter_mut().find(|e| e.config.id == id) {
-            Some(entry) => entry.config = config,
-            None => self.servers.push(ServerEntry::new(config)),
-        }
-        self.dialog = Dialog::None;
-    }
-
-    fn set_server_error(&mut self, message: &str) {
-        if let Dialog::EditServer(f) = &mut self.dialog {
-            f.error = Some(message.to_owned());
         }
     }
 
@@ -5613,6 +6032,64 @@ impl App {
         }
         if cancel {
             self.dialog = Dialog::None;
+        }
+    }
+
+    fn show_reveal_secret(&mut self, ctx: &egui::Context) {
+        let mut submit = false;
+        let mut cancel = false;
+        if let Dialog::RevealSecret { name, password, error } = &mut self.dialog {
+            let name = name.clone();
+            egui::Modal::new(egui::Id::new("reveal-secret")).show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.heading("Show secret");
+                ui.label(RichText::new(format!("Confirm the master password to reveal \"{name}\".")).weak());
+                ui.add_space(6.0);
+                let field = ui.add(
+                    egui::TextEdit::singleline(password).password(true).hint_text("Master password"),
+                );
+                autofocus(ui, &field);
+                submit |= entered(ui, &field);
+                if let Some(error) = error {
+                    ui.colored_label(Color32::LIGHT_RED, error.as_str());
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    submit |= ui.button("Show").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if submit {
+            self.try_reveal_secret();
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn try_reveal_secret(&mut self) {
+        let Dialog::RevealSecret { name, password, error } = &mut self.dialog else { return };
+        // Re-verify the master password by re-opening the vault from disk.
+        match Vault::open(self.vault_path.clone(), password) {
+            Ok(_) => {
+                let name = name.clone();
+                let value = self.vault.unlocked().and_then(|v| v.get(&name)).map(|s| match s {
+                    Secret::Password { password, .. } => password.clone(),
+                    Secret::PrivateKey { pem, .. } => pem.clone(),
+                });
+                match value {
+                    Some(v) => {
+                        self.vault_reveal = Some((name, v));
+                        self.dialog = Dialog::None;
+                    }
+                    None => {
+                        self.dialog = Dialog::None;
+                    }
+                }
+            }
+            Err(VaultError::BadPassword) => *error = Some("Incorrect master password.".into()),
+            Err(e) => *error = Some(format!("{e}")),
         }
     }
 
@@ -6641,7 +7118,7 @@ impl eframe::App for App {
             }
         }
 
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
+        egui::Panel::top("titlebar").show(ui, |ui| self.title_bar(ui, &ctx));
         egui::Panel::left("sessions")
             .resizable(true)
             .default_size(240.0)
