@@ -10,6 +10,16 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
+/// Stops a spawned helper (ping/ss) from flashing a console window on Windows.
+#[cfg(windows)]
+fn hide_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn hide_window(_cmd: &mut Command) {}
+
 /// Well-known ports and their service labels, for the "common" scan and for
 /// naming open ports in results.
 pub const COMMON_PORTS: &[(u16, &str)] = &[
@@ -213,6 +223,7 @@ fn ping(ip: Ipv4Addr) -> bool {
     cmd.args(["-n", "1", "-w", "1000", &ip]);
     #[cfg(not(windows))]
     cmd.args(["-c", "1", "-W", "1", &ip]);
+    hide_window(&mut cmd);
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -265,10 +276,17 @@ pub struct LocalPort {
 
 /// Lists the host's listening TCP/UDP sockets via `ss` (Linux) or `netstat`.
 pub fn local_listening_ports() -> Result<Vec<LocalPort>, String> {
-    let output = Command::new("ss")
-        .args(["-tulnpH"])
+    let mut ss = Command::new("ss");
+    ss.args(["-tulnpH"]);
+    hide_window(&mut ss);
+    let output = ss
         .output()
-        .or_else(|_| Command::new("netstat").args(["-tulnp"]).output())
+        .or_else(|_| {
+            let mut ns = Command::new("netstat");
+            ns.args(["-tulnp"]);
+            hide_window(&mut ns);
+            ns.output()
+        })
         .map_err(|e| format!("could not list ports (need `ss` or `netstat`): {e}"))?;
     if !output.status.success() {
         return Err("the port-listing command failed".into());

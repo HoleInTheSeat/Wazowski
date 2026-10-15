@@ -522,6 +522,10 @@ pub struct App {
     sidebar_view: SidebarView,
     /// The network toolbox state.
     network: NetworkState,
+    /// Serial ports detected on the system, refreshed periodically for the
+    /// sidebar's "Serial connections" group.
+    serial_ports: Vec<String>,
+    serial_ports_at: std::time::Instant,
 }
 
 /// The left-pane view selector.
@@ -686,6 +690,8 @@ impl App {
             find: None,
             sidebar_view: SidebarView::Sessions,
             network: NetworkState::default(),
+            serial_ports: available_ports(),
+            serial_ports_at: std::time::Instant::now(),
         };
         app.open_startup_tab(ctx);
         app
@@ -1822,6 +1828,7 @@ impl App {
 
     fn session_tree(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut action: Option<TreeAction> = None;
+        let mut open_serial: Option<String> = None;
 
         // Destinations for move/copy: the local store plus every reachable share.
         let mut destinations = vec![Destination {
@@ -1911,6 +1918,25 @@ impl App {
             });
         }
 
+        // Detected serial devices, always below everything else. Collapsed by
+        // default; double-click a device to open a serial connection to it.
+        egui::CollapsingHeader::new("🔌 Serial connections")
+            .id_salt("serial-devices")
+            .default_open(false)
+            .show(ui, |ui| {
+                if self.serial_ports.is_empty() {
+                    ui.label(RichText::new("No serial devices detected.").weak());
+                }
+                for port in &self.serial_ports {
+                    let short = port.rsplit(['/', '\\']).next().unwrap_or(port);
+                    let resp = ui.selectable_label(false, format!("🔌 {short}"));
+                    delayed_tooltip(ui, &resp, port);
+                    if resp.double_clicked() {
+                        open_serial = Some(port.clone());
+                    }
+                }
+            });
+
         // Fill the remaining blank space as a drop zone + right-click menu for
         // the local store, so the whole empty pane is usable.
         let bg = ui.allocate_response(ui.available_size(), egui::Sense::click());
@@ -1939,6 +1965,11 @@ impl App {
         });
         if add_source {
             self.dialog = Dialog::AddSource(AddSourceForm::default());
+        }
+        if let Some(port) = open_serial {
+            let mut form = SerialForm::new();
+            form.path = port;
+            self.dialog = Dialog::SerialConnect(form);
         }
 
         self.apply_tree_action(action, ctx);
@@ -5653,6 +5684,11 @@ impl eframe::App for App {
         self.poll_admin(&ctx);
         if self.settings.auto_backup_due() && Vault::exists(&self.vault_path) {
             self.run_vault_backup(false);
+        }
+        // Refresh the serial device list for the sidebar every few seconds.
+        if self.serial_ports_at.elapsed() >= std::time::Duration::from_secs(3) {
+            self.serial_ports = available_ports();
+            self.serial_ports_at = std::time::Instant::now();
         }
         // Keep server logs flowing and repaint while any server runs.
         if self.poll_servers() {

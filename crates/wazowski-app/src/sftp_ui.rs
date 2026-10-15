@@ -3,8 +3,11 @@
 //! Operations run on worker threads (SFTP calls block) and are polled each
 //! frame, so the UI never stalls on the network.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
+use std::time::SystemTime;
 
 use egui::{Context, RichText};
 use wazowski_ssh::{FileEntry, Sftp};
@@ -13,10 +16,27 @@ use wazowski_ssh::{FileEntry, Sftp};
 enum JobOutcome {
     /// A directory listing for `cwd`.
     Listed { cwd: String, entries: Vec<FileEntry> },
+    /// A file was downloaded to a temp path to be opened locally.
+    Opened { remote: String, local: PathBuf },
     /// A mutating action finished; the browser should refresh.
     Acted,
     /// A read-only action finished; nothing to refresh.
     Noop,
+}
+
+/// A remote file downloaded to a temp path and opened locally, watched for edits.
+struct OpenFile {
+    remote: String,
+    local: PathBuf,
+    /// The temp file's modified time as of the last download/upload, to detect edits.
+    seen_mtime: Option<SystemTime>,
+    /// Set once a local edit is detected, until the user uploads or dismisses.
+    changed: bool,
+}
+
+/// Modified time of a local file, if available.
+fn mtime(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// A running background job.
@@ -36,10 +56,20 @@ pub struct FileBrowser {
     started: bool,
     /// Inline "new folder" name input, shown when `Some`.
     new_folder: Option<String>,
+    /// Temp directory holding files opened from this session (cleared on drop).
+    temp_dir: PathBuf,
+    /// Remote files opened locally, watched for edits.
+    open_files: Vec<OpenFile>,
 }
 
 impl FileBrowser {
     pub fn new(sftp: Sftp) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "wazowski-sftp-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         Self {
             sftp,
             cwd: ".".into(),
@@ -49,6 +79,8 @@ impl FileBrowser {
             job: None,
             started: false,
             new_folder: None,
+            temp_dir,
+            open_files: Vec::new(),
         }
     }
 
@@ -98,6 +130,14 @@ impl FileBrowser {
                 self.selected = None;
                 self.status.clear();
                 self.job = None;
+            }
+            Ok(Ok(JobOutcome::Opened { remote, local })) => {
+                self.job = None;
+                self.status.clear();
+                match open::that(&local) {
+                    Ok(()) => self.track_open(remote, local),
+                    Err(e) => self.status = format!("could not open the file: {e}"),
+                }
             }
             Ok(Ok(JobOutcome::Acted)) => {
                 self.job = None;
@@ -185,6 +225,13 @@ impl FileBrowser {
 
         self.entry_list(ui, ctx);
 
+        // Watch opened files for local edits and offer to upload changes back.
+        self.watch_open_files();
+        self.edited_files(ui, ctx);
+        if !self.open_files.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+
         if !self.status.is_empty() {
             ui.separator();
             ui.label(RichText::new(&self.status).color(ui.visuals().warn_fg_color));
@@ -214,6 +261,12 @@ impl FileBrowser {
                         download_file = Some((entry.name.clone(), entry.size));
                     }
                 }
+                let resp = resp.on_hover_text(if entry.is_dir {
+                    "Double-click to open"
+                } else {
+                    "Double-click to open locally; edits can be uploaded back"
+                });
+                let _ = resp;
             }
         });
 
@@ -222,7 +275,7 @@ impl FileBrowser {
             self.list(target, ctx);
         }
         if let Some((name, _)) = download_file {
-            self.download(&name, ctx);
+            self.open_file(&name, ctx);
         }
 
         ui.add_space(4.0);
@@ -277,6 +330,84 @@ impl FileBrowser {
         });
     }
 
+    /// Downloads a file into the temp dir and opens it with the host's default app.
+    fn open_file(&mut self, name: &str, ctx: &Context) {
+        if std::fs::create_dir_all(&self.temp_dir).is_err() {
+            self.status = "could not create a temp directory".into();
+            return;
+        }
+        let remote = join(&self.cwd, name);
+        let local = self.temp_dir.join(name);
+        let (remote_job, local_job) = (remote.clone(), local.clone());
+        self.spawn(ctx, move |sftp| {
+            sftp.download(&remote_job, local_job.clone())?;
+            Ok(JobOutcome::Opened { remote: remote_job, local: local_job })
+        });
+    }
+
+    /// Records a freshly opened file so later local edits can be detected.
+    fn track_open(&mut self, remote: String, local: PathBuf) {
+        let seen = mtime(&local);
+        if let Some(f) = self.open_files.iter_mut().find(|f| f.remote == remote) {
+            f.local = local;
+            f.seen_mtime = seen;
+            f.changed = false;
+        } else {
+            self.open_files.push(OpenFile { remote, local, seen_mtime: seen, changed: false });
+        }
+    }
+
+    /// Flags any opened file whose temp copy has been modified since last seen.
+    fn watch_open_files(&mut self) {
+        for f in &mut self.open_files {
+            if f.changed {
+                continue;
+            }
+            let now = mtime(&f.local);
+            if now != f.seen_mtime && now.is_some() {
+                f.changed = true;
+            }
+        }
+    }
+
+    /// Renders the "edited files" prompts, offering to upload each change back.
+    fn edited_files(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        if !self.open_files.iter().any(|f| f.changed) {
+            return;
+        }
+        ui.separator();
+        ui.label(RichText::new("Edited files").strong());
+        let mut upload: Option<usize> = None;
+        let mut dismiss: Option<usize> = None;
+        for (i, f) in self.open_files.iter().enumerate() {
+            if !f.changed {
+                continue;
+            }
+            let name = f.remote.rsplit('/').next().unwrap_or(&f.remote);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("✎ {name}")).color(ui.visuals().warn_fg_color));
+                if ui.button("Upload").on_hover_text("Upload the edited file back").clicked() {
+                    upload = Some(i);
+                }
+                if ui.button("Dismiss").clicked() {
+                    dismiss = Some(i);
+                }
+            });
+        }
+        if let Some(i) = upload {
+            let (remote, local) = (self.open_files[i].remote.clone(), self.open_files[i].local.clone());
+            self.open_files[i].seen_mtime = mtime(&local);
+            self.open_files[i].changed = false;
+            self.spawn(ctx, move |sftp| {
+                sftp.upload(local, &remote)?;
+                Ok(JobOutcome::Noop)
+            });
+        } else if let Some(i) = dismiss {
+            self.open_files[i].seen_mtime = mtime(&self.open_files[i].local);
+            self.open_files[i].changed = false;
+        }
+    }
+
     fn delete(&mut self, name: &str, is_dir: bool, ctx: &Context) {
         let remote = join(&self.cwd, name);
         self.spawn(ctx, move |sftp| {
@@ -296,6 +427,13 @@ impl FileBrowser {
             sftp.mkdir(&remote)?;
             Ok(JobOutcome::Acted)
         });
+    }
+}
+
+impl Drop for FileBrowser {
+    fn drop(&mut self) {
+        // Clear temp files opened from this session when the tab/program closes.
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
     }
 }
 
