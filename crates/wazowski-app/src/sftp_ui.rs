@@ -521,18 +521,15 @@ impl FileBrowser {
                 RichText::new(format!("📄 {name}"))
             };
             let changed = f.changed;
-            // Left-click opens the same menu (via menu_button); right-click too.
-            let mb = ui.menu_button(label, |ui| open_file_menu(ui, changed));
-            if let Some(item) = mb.inner.flatten() {
-                act = Some(map(item, i));
-            }
-            mb.response
-                .on_hover_text("Left- or right-click for actions")
-                .context_menu(|ui| {
-                    if let Some(item) = open_file_menu(ui, changed) {
-                        act = Some(map(item, i));
-                    }
-                });
+            // Left-click opens the actions menu. Scope the id per row so files with
+            // the same name don't collide ("second use of widget id").
+            ui.push_id(i, |ui| {
+                let mb = ui.menu_button(label, |ui| open_file_menu(ui, changed));
+                mb.response.on_hover_text("Click for actions (upload, delete, stop watching)");
+                if let Some(item) = mb.inner.flatten() {
+                    act = Some(map(item, i));
+                }
+            });
         }
         match act {
             Some(Act::Upload(i)) => {

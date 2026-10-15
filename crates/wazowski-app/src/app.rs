@@ -50,6 +50,8 @@ struct Tab {
     session_id: Option<String>,
     /// When this tab's session connected, for the "connected for …" tooltip.
     connected_at: Option<std::time::Instant>,
+    /// This tab's terminal font size (seeded from the settings default).
+    font_size: f32,
 }
 
 /// How a terminal tab's session can be restarted after it ends.
@@ -1025,12 +1027,18 @@ impl App {
         }
     }
 
-    /// Sets the terminal font size (clamped) and persists it.
-    fn set_font_size(&mut self, size: f32) {
-        let size = size.clamp(8.0, 40.0);
-        if (size - self.settings.terminal_font_size).abs() > f32::EPSILON {
-            self.settings.terminal_font_size = size;
-            let _ = self.settings.save();
+    /// Sets the active tab's terminal font size (clamped). Per-tab, so it doesn't
+    /// disturb other tabs or the configured default.
+    fn set_active_font_size(&mut self, size: f32) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.font_size = size.clamp(8.0, 40.0);
+        }
+    }
+
+    /// Adjusts the active tab's font size by `delta` points.
+    fn nudge_active_font_size(&mut self, delta: f32) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            self.set_active_font_size(tab.font_size + delta);
         }
     }
 
@@ -1106,6 +1114,7 @@ impl App {
             origin_term,
             session_id: None,
             connected_at,
+            font_size: self.settings.terminal_font_size,
         };
         let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
         let index = if adjacent && !self.tabs.is_empty() {
@@ -1694,13 +1703,13 @@ impl App {
             self.sidebar_view = SidebarView::Files;
         }
         if triggered(Action::FontSizeUp, ctx, &self.keymap) {
-            self.set_font_size(self.settings.terminal_font_size + 1.0);
+            self.nudge_active_font_size(1.0);
         }
         if triggered(Action::FontSizeDown, ctx, &self.keymap) {
-            self.set_font_size(self.settings.terminal_font_size - 1.0);
+            self.nudge_active_font_size(-1.0);
         }
         if triggered(Action::FontSizeReset, ctx, &self.keymap) {
-            self.set_font_size(14.0);
+            self.set_active_font_size(self.settings.terminal_font_size);
         }
         // Action::RunMacro is handled (and consumed) by the macros feature.
         self.macro_shortcut(ctx);
@@ -1860,36 +1869,32 @@ impl App {
         let mut backup_now = false;
         let mut extras_action: Option<ExtrasAction> = None;
 
-        ui.add_space(8.0);
-        ui.heading("Settings");
-        ui.separator();
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(104.0);
-                for (cat, label) in [
-                    (SettingsCategory::General, "General"),
-                    (SettingsCategory::Tabs, "Tabs"),
-                    (SettingsCategory::Vault, "Vault"),
-                    (SettingsCategory::Terminal, "Terminal"),
-                    (SettingsCategory::Extras, "Extras"),
-                ] {
-                    ui.selectable_value(&mut self.settings_category, cat, label);
-                }
-            });
+        // Category rail on the left; the selected category fills the rest.
+        egui::Panel::left("settings-rail").resizable(false).default_size(120.0).show(ui, |ui| {
+            ui.add_space(8.0);
+            ui.heading("Settings");
             ui.separator();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                match self.settings_category {
-                    SettingsCategory::General => self.settings_general(ui, &mut changed),
-                    SettingsCategory::Tabs => self.settings_tabs(ui, &mut changed),
-                    SettingsCategory::Vault => {
-                        self.settings_vault(ui, &mut changed, &mut backup_now)
-                    }
-                    SettingsCategory::Terminal => {
-                        self.settings_terminal(ui, &mut changed, &mut hl_changed)
-                    }
-                    SettingsCategory::Extras => self.settings_extras(ui, &mut extras_action),
+            for (cat, label) in [
+                (SettingsCategory::General, "General"),
+                (SettingsCategory::Tabs, "Tabs"),
+                (SettingsCategory::Vault, "Vault"),
+                (SettingsCategory::Terminal, "Terminal"),
+                (SettingsCategory::Extras, "Extras"),
+            ] {
+                ui.selectable_value(&mut self.settings_category, cat, label);
+            }
+        });
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(8.0);
+            match self.settings_category {
+                SettingsCategory::General => self.settings_general(ui, &mut changed),
+                SettingsCategory::Tabs => self.settings_tabs(ui, &mut changed),
+                SettingsCategory::Vault => self.settings_vault(ui, &mut changed, &mut backup_now),
+                SettingsCategory::Terminal => {
+                    self.settings_terminal(ui, &mut changed, &mut hl_changed)
                 }
-            });
+                SettingsCategory::Extras => self.settings_extras(ui, &mut extras_action),
+            }
         });
 
         if changed && let Err(e) = self.settings.save() {
@@ -1923,7 +1928,6 @@ impl App {
     }
 
     fn settings_general(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
-        ui.label(RichText::new("General").strong());
         if ui
             .checkbox(&mut self.settings.allow_multiple_instances, "Allow multiple instances")
             .on_hover_text("Takes effect at the next launch")
@@ -1943,7 +1947,6 @@ impl App {
     }
 
     fn settings_tabs(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
-        ui.label(RichText::new("Tabs").strong());
         ui.horizontal(|ui| {
             ui.label("New tab opens:");
             let text = match self.settings.new_tab_placement {
@@ -2015,9 +2018,8 @@ impl App {
     }
 
     fn settings_terminal(&mut self, ui: &mut egui::Ui, changed: &mut bool, hl_changed: &mut bool) {
-        ui.label(RichText::new("Terminal").strong());
         ui.horizontal(|ui| {
-            ui.label("Font size:");
+            ui.label("Default font size:");
             if ui
                 .add(egui::DragValue::new(&mut self.settings.terminal_font_size).range(8.0..=40.0))
                 .on_hover_text("Also: Ctrl+scroll in a terminal, or Ctrl+= / Ctrl+- / Ctrl+0")
@@ -3056,7 +3058,8 @@ impl App {
             .map(|(_, t)| SwapTarget { tab_id: t.id, label: t.label.clone() })
             .collect();
         let mut pane_action: Option<PaneAction> = None;
-        let font_size = self.settings.terminal_font_size;
+        let font_size =
+            self.tabs.get(active).map(|t| t.font_size).unwrap_or(self.settings.terminal_font_size);
         let highlights = self.highlights.compiled();
         match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
@@ -3131,7 +3134,7 @@ impl App {
             _ => 0.0,
         };
         if zoom != 0.0 {
-            self.set_font_size(self.settings.terminal_font_size + zoom.signum());
+            self.nudge_active_font_size(zoom.signum());
         }
         // Multi-exec: mirror the focused pane's input to every other terminal
         // that isn't the source and hasn't been excluded from broadcast.
@@ -3303,7 +3306,7 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(active)
             && let TabContent::Terminal(panes) = &mut tab.content
         {
-            let fs = self.settings.terminal_font_size;
+            let fs = tab.font_size;
             panes.show(ui, false, false, None, &[], None, fs, &[], &mut None);
         }
         match act {
