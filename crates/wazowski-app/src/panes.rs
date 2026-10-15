@@ -434,6 +434,7 @@ impl Panes {
         search: Option<&SearchQuery>,
         targets: &[SwapTarget],
         origin: Option<u64>,
+        font_size: f32,
         action: &mut Option<PaneAction>,
     ) -> Option<(u64, Vec<u8>)> {
         let area = ui.available_rect_before_wrap();
@@ -451,6 +452,7 @@ impl Panes {
                     search,
                     targets,
                     origin,
+                    font_size,
                     new_focus: &mut new_focus,
                     source: &mut source,
                     action,
@@ -475,6 +477,7 @@ struct Ctx<'a> {
     targets: &'a [SwapTarget],
     /// The tab's original session terminal id (CloseOthers is offered only there).
     origin: Option<u64>,
+    font_size: f32,
     new_focus: &'a mut u64,
     source: &'a mut Option<(u64, Vec<u8>)>,
     action: &'a mut Option<PaneAction>,
@@ -490,6 +493,7 @@ impl Ctx<'_> {
             search: self.search,
             targets: self.targets,
             origin: self.origin,
+            font_size: self.font_size,
             new_focus: self.new_focus,
             source: self.source,
             action: self.action,
@@ -518,6 +522,7 @@ fn show_pane(mut cx: Ctx, ui: &mut Ui, pane: &mut Pane, area: Rect) {
                     TerminalView::new(&mut leaf.term)
                         .interactive(cx.interactive)
                         .search(cx.search.cloned())
+                        .font_size(cx.font_size)
                         .show(ui)
                 })
                 .inner;

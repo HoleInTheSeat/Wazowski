@@ -931,6 +931,15 @@ impl App {
         }
     }
 
+    /// Sets the terminal font size (clamped) and persists it.
+    fn set_font_size(&mut self, size: f32) {
+        let size = size.clamp(8.0, 40.0);
+        if (size - self.settings.terminal_font_size).abs() > f32::EPSILON {
+            self.settings.terminal_font_size = size;
+            let _ = self.settings.save();
+        }
+    }
+
     /// The active tab's live serial baud rate, if it is a serial terminal.
     fn active_serial_baud(&self) -> Option<u32> {
         let tab = self.tabs.get(self.active)?;
@@ -1563,6 +1572,12 @@ impl App {
         if triggered(Action::ViewFiles, ctx, &self.keymap) {
             self.sidebar_view = SidebarView::Files;
         }
+        if triggered(Action::FontSizeUp, ctx, &self.keymap) {
+            self.set_font_size(self.settings.terminal_font_size + 1.0);
+        }
+        if triggered(Action::FontSizeDown, ctx, &self.keymap) {
+            self.set_font_size(self.settings.terminal_font_size - 1.0);
+        }
         // Action::RunMacro is handled (and consumed) by the macros feature.
         self.macro_shortcut(ctx);
     }
@@ -1785,6 +1800,23 @@ impl App {
                     changed = true;
                 }
             }
+
+            ui.add_space(10.0);
+            ui.label(RichText::new("Terminal").strong());
+            ui.horizontal(|ui| {
+                ui.label("Font size:");
+                if ui
+                    .add(egui::DragValue::new(&mut self.settings.terminal_font_size).range(8.0..=40.0))
+                    .on_hover_text("Also: Ctrl+scroll in a terminal, or Ctrl+= / Ctrl+-")
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.label("pt");
+            });
+            ui.label(
+                RichText::new("Highlights are configured below in \"Terminal highlights\".").weak(),
+            );
 
             ui.add_space(10.0);
             ui.label(RichText::new("Automatic vault backup").strong());
@@ -2728,6 +2760,7 @@ impl App {
             .map(|(_, t)| SwapTarget { tab_id: t.id, label: t.label.clone() })
             .collect();
         let mut pane_action: Option<PaneAction> = None;
+        let font_size = self.settings.terminal_font_size;
         match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
                 TabContent::Terminal(panes) => {
@@ -2739,6 +2772,7 @@ impl App {
                         search.as_ref(),
                         &targets,
                         origin,
+                        font_size,
                         &mut pane_action,
                     );
                 }
@@ -2789,6 +2823,17 @@ impl App {
         if let Some(action) = pane_action {
             let ctx = ui.ctx().clone();
             self.handle_pane_action(action, &ctx);
+        }
+        // Ctrl+scroll on the active terminal adjusts the global font size.
+        let zoom = match self.tabs.get_mut(active).map(|t| &mut t.content) {
+            Some(TabContent::Terminal(panes)) => {
+                let focused = panes.focused_id();
+                panes.get_mut(focused).map(|t| t.take_zoom()).unwrap_or(0.0)
+            }
+            _ => 0.0,
+        };
+        if zoom != 0.0 {
+            self.set_font_size(self.settings.terminal_font_size + zoom.signum());
         }
         // Multi-exec: mirror the focused pane's input to every other terminal
         // that isn't the source and hasn't been excluded from broadcast.
@@ -2960,7 +3005,8 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(active)
             && let TabContent::Terminal(panes) = &mut tab.content
         {
-            panes.show(ui, false, false, None, &[], None, &mut None);
+            let fs = self.settings.terminal_font_size;
+            panes.show(ui, false, false, None, &[], None, fs, &mut None);
         }
         match act {
             Some(EndAct::Restart) => {

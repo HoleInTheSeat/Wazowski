@@ -31,10 +31,12 @@ pub enum Action {
     ViewSessions,
     ViewMacros,
     ViewFiles,
+    FontSizeUp,
+    FontSizeDown,
 }
 
 impl Action {
-    pub const ALL: [Action; 15] = [
+    pub const ALL: [Action; 17] = [
         Action::NewShell,
         Action::CloseTab,
         Action::NextTab,
@@ -50,6 +52,8 @@ impl Action {
         Action::ViewSessions,
         Action::ViewMacros,
         Action::ViewFiles,
+        Action::FontSizeUp,
+        Action::FontSizeDown,
     ];
 
     /// Human-readable name shown in the Settings dialog and menus.
@@ -70,6 +74,8 @@ impl Action {
             Action::ViewSessions => "Left pane: Sessions",
             Action::ViewMacros => "Left pane: Macros",
             Action::ViewFiles => "Left pane: Files",
+            Action::FontSizeUp => "Terminal: larger font",
+            Action::FontSizeDown => "Terminal: smaller font",
         }
     }
 
@@ -94,6 +100,8 @@ impl Action {
             Action::ViewSessions => KeyboardShortcut::new(ctrl_shift, Key::Num1),
             Action::ViewMacros => KeyboardShortcut::new(ctrl_shift, Key::Num2),
             Action::ViewFiles => KeyboardShortcut::new(ctrl_shift, Key::Num3),
+            Action::FontSizeUp => KeyboardShortcut::new(ctrl, Key::Equals),
+            Action::FontSizeDown => KeyboardShortcut::new(ctrl, Key::Minus),
         }
     }
 }

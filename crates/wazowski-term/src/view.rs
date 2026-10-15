@@ -238,20 +238,28 @@ fn handle_mouse(ui: &Ui, t: &mut Terminal, response: &Response, grid: &Grid) {
     }
 
     if response.hovered() {
-        // Wheel deltas in lines; a mouse wheel notch scrolls three lines.
-        let lines: f32 = ui.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
-                        MouseWheelUnit::Point => delta.y / grid.cell.y,
-                        MouseWheelUnit::Line => delta.y * 3.0,
-                        MouseWheelUnit::Page => delta.y * grid.rows as f32,
-                    }),
-                    _ => None,
-                })
-                .sum()
+        // Ctrl+wheel zooms the font instead of scrolling; report it to the app.
+        let (zoom, lines): (f32, f32) = ui.input(|i| {
+            let mut zoom = 0.0;
+            let mut lines = 0.0;
+            for e in &i.events {
+                if let egui::Event::MouseWheel { unit, delta, modifiers, .. } = e {
+                    if modifiers.ctrl || modifiers.command {
+                        zoom += delta.y;
+                    } else {
+                        lines += match unit {
+                            MouseWheelUnit::Point => delta.y / grid.cell.y,
+                            MouseWheelUnit::Line => delta.y * 3.0,
+                            MouseWheelUnit::Page => delta.y * grid.rows as f32,
+                        };
+                    }
+                }
+            }
+            (zoom, lines)
         });
+        if zoom != 0.0 {
+            t.add_zoom(zoom);
+        }
         if lines != 0.0 {
             t.scroll_remainder += lines;
             let lines = t.scroll_remainder.trunc() as i32;

@@ -51,7 +51,7 @@ fn default_backup_days() -> u32 {
 }
 
 /// All persisted global settings.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Allow a second Wazowski process to run alongside this one.
@@ -62,8 +62,29 @@ pub struct Settings {
     /// Ids of recently connected sessions, most recent first (for the launcher).
     #[serde(default)]
     pub recent: Vec<String>,
+    /// Terminal font size in points.
+    #[serde(default = "default_font_size")]
+    pub terminal_font_size: f32,
     #[serde(skip)]
     path: Option<PathBuf>,
+}
+
+fn default_font_size() -> f32 {
+    14.0
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            allow_multiple_instances: false,
+            startup_tab: StartupTab::default(),
+            new_tab_placement: NewTabPlacement::default(),
+            vault_backup: VaultBackup::default(),
+            recent: Vec::new(),
+            terminal_font_size: default_font_size(),
+            path: None,
+        }
+    }
 }
 
 impl Settings {

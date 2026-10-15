@@ -34,6 +34,8 @@ pub struct Terminal {
     broadcast_buf: Vec<u8>,
     /// When set, this terminal is skipped while multi-exec broadcast is on.
     exclude_broadcast: bool,
+    /// Accumulated Ctrl+scroll amount, for the app to turn into font-size changes.
+    zoom_delta: f32,
     /// Working directory reported by the shell via OSC 7, if any.
     cwd: Option<String>,
     /// Rolling tail of recent output, scanned for OSC 7 sequences.
@@ -84,6 +86,7 @@ impl Terminal {
             scroll_remainder: 0.0,
             broadcast_buf: Vec::new(),
             exclude_broadcast: false,
+            zoom_delta: 0.0,
             cwd: None,
             osc_buf: Vec::new(),
             paste_requested: false,
@@ -93,6 +96,15 @@ impl Terminal {
     /// The working directory last reported by the shell via OSC 7, if any.
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
+    }
+
+    /// Drains the accumulated Ctrl+scroll amount (positive = zoom in).
+    pub fn take_zoom(&mut self) -> f32 {
+        std::mem::take(&mut self.zoom_delta)
+    }
+
+    pub(crate) fn add_zoom(&mut self, delta: f32) {
+        self.zoom_delta += delta;
     }
 
     pub fn id(&self) -> u64 {
