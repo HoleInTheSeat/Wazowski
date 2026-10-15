@@ -1550,6 +1550,15 @@ impl App {
         if triggered(Action::BaudDown, ctx, &self.keymap) {
             self.adjust_baud(-1);
         }
+        if triggered(Action::ViewSessions, ctx, &self.keymap) {
+            self.sidebar_view = SidebarView::Sessions;
+        }
+        if triggered(Action::ViewMacros, ctx, &self.keymap) {
+            self.sidebar_view = SidebarView::Macros;
+        }
+        if triggered(Action::ViewFiles, ctx, &self.keymap) {
+            self.sidebar_view = SidebarView::Files;
+        }
         // Action::RunMacro is handled (and consumed) by the macros feature.
         self.macro_shortcut(ctx);
     }
@@ -1828,9 +1837,28 @@ impl App {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 let view = &mut self.sidebar_view;
-                ui.selectable_value(view, SidebarView::Sessions, "🖥").on_hover_text("Sessions");
-                ui.selectable_value(view, SidebarView::Macros, "⚙").on_hover_text("Macros");
-                ui.selectable_value(view, SidebarView::Files, "📁").on_hover_text("Files (SFTP)");
+                const SIZE: f32 = 26.0;
+                let icon = |glyph: &str, color: Color32| {
+                    RichText::new(glyph).size(SIZE).color(color)
+                };
+                ui.selectable_value(
+                    view,
+                    SidebarView::Sessions,
+                    icon("🖥", Color32::from_rgb(90, 170, 255)),
+                )
+                .on_hover_text("Sessions");
+                ui.selectable_value(
+                    view,
+                    SidebarView::Macros,
+                    icon("⚙", Color32::from_rgb(240, 170, 60)),
+                )
+                .on_hover_text("Macros");
+                ui.selectable_value(
+                    view,
+                    SidebarView::Files,
+                    icon("📁", Color32::from_rgb(120, 200, 120)),
+                )
+                .on_hover_text("Files (SFTP)");
             });
             ui.separator();
             ui.vertical(|ui| match self.sidebar_view {

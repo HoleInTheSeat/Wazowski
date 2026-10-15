@@ -613,6 +613,13 @@ fn title_bar(cx: &mut Ctx, ui: &mut Ui, bar: Rect, leaf: &Leaf, id: u64) {
                     *cx.action = Some(PaneAction::ClosePane(id));
                     ui.close();
                 }
+                // Collapse back to just the tab's original session.
+                if let Some(origin) = cx.origin
+                    && ui.button("Close all but original session").clicked()
+                {
+                    *cx.action = Some(PaneAction::CloseOthers(origin));
+                    ui.close();
+                }
                 if !cx.targets.is_empty() {
                     ui.separator();
                     ui.label(RichText::new("Show session").weak());

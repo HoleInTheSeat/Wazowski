@@ -28,10 +28,13 @@ pub enum Action {
     Find,
     BaudUp,
     BaudDown,
+    ViewSessions,
+    ViewMacros,
+    ViewFiles,
 }
 
 impl Action {
-    pub const ALL: [Action; 12] = [
+    pub const ALL: [Action; 15] = [
         Action::NewShell,
         Action::CloseTab,
         Action::NextTab,
@@ -44,6 +47,9 @@ impl Action {
         Action::Find,
         Action::BaudUp,
         Action::BaudDown,
+        Action::ViewSessions,
+        Action::ViewMacros,
+        Action::ViewFiles,
     ];
 
     /// Human-readable name shown in the Settings dialog and menus.
@@ -61,6 +67,9 @@ impl Action {
             Action::Find => "Find in terminals",
             Action::BaudUp => "Serial: raise baud",
             Action::BaudDown => "Serial: lower baud",
+            Action::ViewSessions => "Left pane: Sessions",
+            Action::ViewMacros => "Left pane: Macros",
+            Action::ViewFiles => "Left pane: Files",
         }
     }
 
@@ -82,6 +91,9 @@ impl Action {
             Action::Find => KeyboardShortcut::new(ctrl_shift, Key::F),
             Action::BaudUp => KeyboardShortcut::new(ctrl_shift, Key::ArrowUp),
             Action::BaudDown => KeyboardShortcut::new(ctrl_shift, Key::ArrowDown),
+            Action::ViewSessions => KeyboardShortcut::new(ctrl_shift, Key::Num1),
+            Action::ViewMacros => KeyboardShortcut::new(ctrl_shift, Key::Num2),
+            Action::ViewFiles => KeyboardShortcut::new(ctrl_shift, Key::Num3),
         }
     }
 }
