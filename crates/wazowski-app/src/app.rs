@@ -78,8 +78,6 @@ enum TabContent {
     Terminal(Box<Panes>),
     /// The quick-servers manager (singleton).
     Servers,
-    /// The global settings page (singleton).
-    Settings,
     /// The network toolbox (singleton).
     Network,
     /// This tab's session has been moved into a split pane on another tab.
@@ -664,6 +662,7 @@ enum SidebarView {
     Sessions,
     Macros,
     Files,
+    Settings,
 }
 
 /// A settings page category (left-rail selection).
@@ -1063,15 +1062,6 @@ impl App {
                 }
                 None => self.open_local_shell(ctx),
             },
-        }
-    }
-
-    /// Opens (or focuses) the singleton Settings tab.
-    fn open_settings_tab(&mut self) {
-        if let Some(i) = self.tabs.iter().position(|t| matches!(t.content, TabContent::Settings)) {
-            self.active = i;
-        } else {
-            self.push_tab("Settings", TabContent::Settings, None);
         }
     }
 
@@ -1726,9 +1716,6 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Settings").clicked() {
-                    self.open_settings_tab();
-                }
                 if ui.button("About Wazowski").clicked() {
                     self.dialog = Dialog::About;
                 }
@@ -1869,21 +1856,7 @@ impl App {
         let mut backup_now = false;
         let mut extras_action: Option<ExtrasAction> = None;
 
-        // Category rail on the left; the selected category fills the rest.
-        egui::Panel::left("settings-rail").resizable(false).default_size(120.0).show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.heading("Settings");
-            ui.separator();
-            for (cat, label) in [
-                (SettingsCategory::General, "General"),
-                (SettingsCategory::Tabs, "Tabs"),
-                (SettingsCategory::Vault, "Vault"),
-                (SettingsCategory::Terminal, "Terminal"),
-                (SettingsCategory::Extras, "Extras"),
-            ] {
-                ui.selectable_value(&mut self.settings_category, cat, label);
-            }
-        });
+        // The category is selected in the left pane; show its content here.
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(8.0);
             match self.settings_category {
@@ -2178,7 +2151,7 @@ impl App {
                 ui.selectable_value(
                     view,
                     SidebarView::Macros,
-                    icon("⚙", Color32::from_rgb(240, 170, 60)),
+                    icon("📜", Color32::from_rgb(240, 170, 60)),
                 )
                 .on_hover_text("Macros");
                 ui.selectable_value(
@@ -2187,14 +2160,36 @@ impl App {
                     icon("📁", Color32::from_rgb(120, 200, 120)),
                 )
                 .on_hover_text("Files (SFTP)");
+                ui.selectable_value(
+                    view,
+                    SidebarView::Settings,
+                    icon("⚙", Color32::from_rgb(170, 170, 180)),
+                )
+                .on_hover_text("Settings");
             });
             ui.separator();
             ui.vertical(|ui| match self.sidebar_view {
                 SidebarView::Sessions => self.sidebar_sessions(ui, ctx),
                 SidebarView::Macros => self.sidebar_macros(ui),
                 SidebarView::Files => self.sidebar_files(ui, ctx),
+                SidebarView::Settings => self.sidebar_settings_categories(ui),
             });
         });
+    }
+
+    /// The Settings view's left pane: the category selector.
+    fn sidebar_settings_categories(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        ui.separator();
+        for (cat, label) in [
+            (SettingsCategory::General, "General"),
+            (SettingsCategory::Tabs, "Tabs"),
+            (SettingsCategory::Vault, "Vault"),
+            (SettingsCategory::Terminal, "Terminal"),
+            (SettingsCategory::Extras, "Extras"),
+        ] {
+            ui.selectable_value(&mut self.settings_category, cat, label);
+        }
     }
 
     /// The Files view: the SFTP browser for the active single-pane SSH tab.
@@ -2865,7 +2860,6 @@ impl App {
                     TabContent::Connecting(_) => format!("⏳ {name}"),
                     TabContent::Terminal(_) => name,
                     TabContent::Servers | TabContent::Network => format!("🖧 {name}"),
-                    TabContent::Settings => format!("⚙ {name}"),
                     TabContent::Detached { .. } => format!("⇄ {name}"),
                 }
             })
@@ -2964,8 +2958,15 @@ impl App {
         self.broadcast = broadcast;
         if let Some(i) = clicked_tab {
             self.active = i;
+            // Leave the Settings view so the clicked tab is shown.
+            if self.sidebar_view == SidebarView::Settings {
+                self.sidebar_view = SidebarView::Sessions;
+            }
         }
         if new_shell {
+            if self.sidebar_view == SidebarView::Settings {
+                self.sidebar_view = SidebarView::Sessions;
+            }
             self.open_local_shell(ui.ctx());
         }
         match pane_action {
@@ -3000,15 +3001,16 @@ impl App {
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
-        // The servers manager and settings page need other &mut self fields, so
-        // handle them before the &mut self.tabs borrow below.
+        // The Settings view (selected in the left rail) replaces the terminal area.
+        if self.sidebar_view == SidebarView::Settings {
+            self.render_settings(ui);
+            return;
+        }
+        // The servers manager needs other &mut self fields, so handle it before
+        // the &mut self.tabs borrow below.
         match self.tabs.get(self.active).map(|t| &t.content) {
             Some(TabContent::Servers) => {
                 self.render_servers(ui);
-                return;
-            }
-            Some(TabContent::Settings) => {
-                self.render_settings(ui);
                 return;
             }
             Some(TabContent::Network) => {
@@ -3082,10 +3084,7 @@ impl App {
                         retry = Some(action);
                     }
                 }
-                TabContent::Servers
-                | TabContent::Settings
-                | TabContent::Network
-                | TabContent::Detached { .. } => {}
+                TabContent::Servers | TabContent::Network | TabContent::Detached { .. } => {}
             },
             None => {
                 ui.vertical_centered(|ui| {
