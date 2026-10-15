@@ -38,8 +38,6 @@ struct Tab {
     content: TabContent,
     /// Present for SSH tabs: the SFTP file browser for the same session.
     files: Option<FileBrowser>,
-    /// Whether the file panel is shown.
-    show_files: bool,
     /// How to restart this tab's session once it ends. SSH/serial tabs stay open
     /// when their session closes; local shells auto-close.
     restart: Option<RestartKind>,
@@ -49,6 +47,8 @@ struct Tab {
     /// The saved session this tab connects to (for persisting per-session UI
     /// state like SFTP auto-refresh). `None` for shells and ad-hoc connects.
     session_id: Option<String>,
+    /// When this tab's session connected, for the "connected for …" tooltip.
+    connected_at: Option<std::time::Instant>,
 }
 
 /// How a terminal tab's session can be restarted after it ends.
@@ -131,6 +131,12 @@ impl Default for NetworkState {
 enum SplitButton {
     Split(SplitDir),
     Close,
+}
+
+/// A tab context-menu action, applied after the tab strip is drawn.
+enum TabAct {
+    Duplicate(usize),
+    CloseOthers(usize),
 }
 
 /// State of a connecting tab.
@@ -582,6 +588,7 @@ enum SidebarView {
     #[default]
     Sessions,
     Macros,
+    Files,
 }
 
 /// State of the find-in-terminals bar.
@@ -808,6 +815,7 @@ impl App {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == home.tab_id) {
             tab.origin_term = Some(term.id());
             tab.content = TabContent::Terminal(Box::new(Panes::new(term)));
+            tab.connected_at.get_or_insert_with(std::time::Instant::now);
         }
     }
 
@@ -980,15 +988,17 @@ impl App {
             TabContent::Terminal(panes) => panes.ids().first().copied(),
             _ => None,
         };
+        let connected_at =
+            matches!(content, TabContent::Terminal(_)).then(std::time::Instant::now);
         let tab = Tab {
             id,
             label: label.into(),
             content,
-            show_files: files.is_some(),
             files,
             restart: None,
             origin_term,
             session_id: None,
+            connected_at,
         };
         let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
         let index = if adjacent && !self.tabs.is_empty() {
@@ -998,6 +1008,66 @@ impl App {
         };
         self.tabs.insert(index, tab);
         self.active = index;
+    }
+
+    /// A hover tooltip for a tab: session info plus connection duration/status.
+    fn tab_hint(&self, tab: &Tab) -> String {
+        let mut lines = Vec::new();
+        if let Some(sid) = &tab.session_id
+            && let Some((_, session)) = self.find_session_anywhere(sid)
+        {
+            lines.push(session_hint(&session));
+        } else {
+            match &tab.restart {
+                Some(RestartKind::Ssh(p)) => {
+                    lines.push(format!("SSH · {}@{}:{}", p.username, p.host, p.port))
+                }
+                Some(RestartKind::Serial(c)) => {
+                    lines.push(format!("Serial · {} @ {} baud", c.path, c.baud))
+                }
+                Some(RestartKind::Shell) => lines.push("Local shell".to_owned()),
+                None => {}
+            }
+        }
+        let ended = matches!(&tab.content, TabContent::Terminal(p) if p.all_exited());
+        if matches!(&tab.content, TabContent::Connecting(_)) {
+            lines.push("connecting…".to_owned());
+        } else if ended {
+            lines.push("disconnected".to_owned());
+        } else if let Some(at) = tab.connected_at {
+            lines.push(format!("connected for {}", fmt_duration(at.elapsed())));
+        }
+        lines.join("\n")
+    }
+
+    /// Opens the same session as `index` in a new tab.
+    fn duplicate_tab(&mut self, index: usize, ctx: &egui::Context) {
+        let Some(tab) = self.tabs.get(index) else { return };
+        let title = tab.label.clone();
+        let session_id = tab.session_id.clone();
+        match &tab.restart {
+            Some(RestartKind::Ssh(p)) => {
+                let params = (**p).clone();
+                self.open_connecting_tab(title, params, session_id, ctx);
+            }
+            Some(RestartKind::Serial(c)) => {
+                let config = (**c).clone();
+                if let Err(e) = self.open_serial_config(config, ctx) {
+                    self.error = Some(format!("Could not reopen the serial port: {e:#}"));
+                }
+            }
+            Some(RestartKind::Shell) | None => self.open_local_shell(ctx),
+        }
+        // Honour the "when duplicating" placement by moving the new tab adjacent.
+        if self.settings.new_tab_placement == NewTabPlacement::WhenDuplicating {
+            let new = self.active;
+            let dest = (index + 1).min(self.tabs.len().saturating_sub(1));
+            if new != dest {
+                let t = self.tabs.remove(new);
+                self.tabs.insert(dest, t);
+                self.active = dest;
+            }
+        }
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -1217,10 +1287,10 @@ impl App {
                     let term_id = term.id();
                     let tab = &mut self.tabs[index];
                     tab.content = TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
-                    tab.show_files = false;
                     tab.files = Some(files);
                     tab.restart = Some(RestartKind::Ssh(Box::new(params)));
                     tab.origin_term = Some(term_id);
+                    tab.connected_at = Some(std::time::Instant::now());
                 }
                 Progress::Failed(message) => {
                     c.pending = None;
@@ -1494,17 +1564,7 @@ impl App {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("Terminal", |ui| {
-                if shortcut_button(ui, "New local shell", &self.keymap.get(Action::NewShell)) {
-                    self.open_local_shell(ui.ctx());
-                }
-                if ui.button("New serial connection…").clicked() {
-                    self.dialog = Dialog::SerialConnect(SerialForm::new());
-                }
-                if ui.add_enabled(!self.tabs.is_empty(), egui::Button::new("Close tab")).clicked() {
-                    self.close_tab(self.active);
-                }
-                ui.separator();
+            ui.menu_button("File", |ui| {
                 if ui.button("Settings").clicked() {
                     self.open_settings_tab();
                 }
@@ -1767,11 +1827,32 @@ impl App {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.sidebar_view, SidebarView::Sessions, "Sessions");
             ui.selectable_value(&mut self.sidebar_view, SidebarView::Macros, "Macros");
+            ui.selectable_value(&mut self.sidebar_view, SidebarView::Files, "Files");
         });
         ui.separator();
         match self.sidebar_view {
             SidebarView::Sessions => self.sidebar_sessions(ui, ctx),
             SidebarView::Macros => self.sidebar_macros(ui),
+            SidebarView::Files => self.sidebar_files(ui, ctx),
+        }
+    }
+
+    /// The Files view: the SFTP browser for the active single-pane SSH tab.
+    fn sidebar_files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let single_pane = matches!(
+            self.tabs.get(self.active).map(|t| &t.content),
+            Some(TabContent::Terminal(p)) if p.count() == 1
+        );
+        if single_pane
+            && let Some(tab) = self.tabs.get_mut(self.active)
+            && let Some(files) = &mut tab.files
+        {
+            files.ui(ui, ctx);
+        } else {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Open an SSH session (unsplit) to browse its files here.").weak(),
+            );
         }
     }
 
@@ -2400,11 +2481,14 @@ impl App {
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         let mut close = None;
-        let mut toggle_files = None;
         let mut pane_action: Option<SplitButton> = None;
         let mut baud_delta: Option<i32> = None;
+        let mut tab_action: Option<TabAct> = None;
+        // Precompute tooltips to avoid borrowing self inside the tab loop.
+        let hints: Vec<String> = self.tabs.iter().map(|t| self.tab_hint(t)).collect();
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
+                let tab_count = self.tabs.len();
                 for (i, tab) in self.tabs.iter().enumerate() {
                     let name: String = tab.label.chars().take(28).collect();
                     let label = match &tab.content {
@@ -2416,9 +2500,25 @@ impl App {
                         TabContent::Network => format!("🖧 {name}"),
                         TabContent::Detached { .. } => format!("⇄ {name}"),
                     };
-                    if ui.selectable_label(i == self.active, label).clicked() {
+                    let resp = ui.selectable_label(i == self.active, label);
+                    if resp.clicked() {
                         self.active = i;
                     }
+                    delayed_tooltip(ui, &resp, &hints[i]);
+                    resp.context_menu(|ui| {
+                        if ui.button("Duplicate").clicked() {
+                            tab_action = Some(TabAct::Duplicate(i));
+                            ui.close();
+                        }
+                        if ui.button("Close").clicked() {
+                            close = Some(i);
+                            ui.close();
+                        }
+                        if tab_count > 1 && ui.button("Close others").clicked() {
+                            tab_action = Some(TabAct::CloseOthers(i));
+                            ui.close();
+                        }
+                    });
                     if ui.small_button("×").on_hover_text("Close tab").clicked() {
                         close = Some(i);
                     }
@@ -2457,27 +2557,8 @@ impl App {
                         baud_delta = Some(1);
                     }
                 }
-                // A toggle for the SFTP panel, for the active SSH tab. Hidden
-                // while the tab is split, to avoid confusion about which pane it
-                // belongs to; it returns once the tab is a single session again.
-                if let Some(tab) = self.tabs.get(self.active)
-                    && tab.files.is_some()
-                    && matches!(&tab.content, TabContent::Terminal(p) if p.count() == 1)
-                {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut shown = tab.show_files;
-                        if ui.toggle_value(&mut shown, "📁 Files").clicked() {
-                            toggle_files = Some(shown);
-                        }
-                    });
-                }
             });
         });
-        if let Some(show) = toggle_files
-            && let Some(tab) = self.tabs.get_mut(self.active)
-        {
-            tab.show_files = show;
-        }
         match pane_action {
             Some(SplitButton::Split(dir)) => self.split_active_pane(dir, ui.ctx()),
             Some(SplitButton::Close) => self.close_active_pane(),
@@ -2485,6 +2566,24 @@ impl App {
         }
         if let Some(delta) = baud_delta {
             self.adjust_baud(delta);
+        }
+        match tab_action {
+            Some(TabAct::Duplicate(i)) => {
+                let ctx = ui.ctx().clone();
+                self.duplicate_tab(i, &ctx);
+            }
+            Some(TabAct::CloseOthers(i)) => {
+                let keep_id = self.tabs[i].id;
+                let mut j = 0;
+                while j < self.tabs.len() {
+                    if self.tabs[j].id != keep_id {
+                        self.close_tab(j);
+                    } else {
+                        j += 1;
+                    }
+                }
+            }
+            None => {}
         }
         if let Some(i) = close {
             self.close_tab(i);
@@ -2733,6 +2832,7 @@ impl App {
         if let Some(term) = term {
             self.tabs[detached_index].origin_term = Some(term.id());
             self.tabs[detached_index].content = TabContent::Terminal(Box::new(Panes::new(term)));
+            self.tabs[detached_index].connected_at.get_or_insert_with(std::time::Instant::now);
             self.active = detached_index;
         }
     }
@@ -2743,6 +2843,7 @@ impl App {
         enum EndAct {
             Restart,
             Save,
+            Print,
             Close,
         }
         let active = self.active;
@@ -2766,6 +2867,10 @@ impl App {
                 if ui.button("Save output…").clicked() {
                     act = Some(EndAct::Save);
                 }
+                if ui.button("Print output").on_hover_text("Send the output to a printer").clicked()
+                {
+                    act = Some(EndAct::Print);
+                }
                 if ui.button("Close").clicked() {
                     act = Some(EndAct::Close);
                 }
@@ -2784,6 +2889,7 @@ impl App {
                 self.restart_tab(active, &ctx);
             }
             Some(EndAct::Save) => self.save_tab_output(active),
+            Some(EndAct::Print) => self.print_tab_output(active),
             Some(EndAct::Close) => self.close_tab(active),
             None => {}
         }
@@ -2812,6 +2918,7 @@ impl App {
                         self.tabs[index].origin_term = Some(term.id());
                         self.tabs[index].content =
                             TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
+                        self.tabs[index].connected_at = Some(std::time::Instant::now());
                     }
                     Err(e) => self.error = Some(format!("Could not start a shell: {e:#}")),
                 }
@@ -2824,6 +2931,7 @@ impl App {
                         self.tabs[index].origin_term = Some(term.id());
                         self.tabs[index].content =
                             TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
+                        self.tabs[index].connected_at = Some(std::time::Instant::now());
                     }
                     Err(e) => self.error = Some(format!("Could not reopen the serial port: {e:#}")),
                 }
@@ -2843,7 +2951,6 @@ impl App {
                     error: None,
                 }));
                 tab.files = None;
-                tab.show_files = false;
             }
         }
     }
@@ -2866,6 +2973,26 @@ impl App {
             && let Err(e) = std::fs::write(&path, text)
         {
             self.error = Some(format!("Could not save output: {e}"));
+        }
+    }
+
+    /// The tab's original session's full text (scrollback + screen), if available.
+    fn tab_output_text(&self, index: usize) -> Option<String> {
+        let tab = self.tabs.get(index)?;
+        match &tab.content {
+            TabContent::Terminal(panes) => {
+                let id = tab.origin_term.unwrap_or_else(|| panes.focused_id());
+                panes.get(id).or_else(|| panes.get(panes.focused_id())).map(|t| t.full_text())
+            }
+            _ => None,
+        }
+    }
+
+    /// Sends the tab's output to a printer via the platform print command.
+    fn print_tab_output(&mut self, index: usize) {
+        let Some(text) = self.tab_output_text(index) else { return };
+        if let Err(e) = print_text(&text) {
+            self.error = Some(format!("Could not print output: {e}"));
         }
     }
 
@@ -3983,21 +4110,30 @@ impl App {
             stop_bits: f.stop_bits,
             flow: f.flow,
         };
+        self.dialog = Dialog::None;
+        if let Err(e) = self.open_serial_config(config, ctx) {
+            self.set_serial_error(&format!("{e:#}"));
+        }
+    }
+
+    /// Opens a serial connection tab from a config (shared by the dialog and
+    /// tab duplication).
+    fn open_serial_config(
+        &mut self,
+        config: SerialConfig,
+        ctx: &egui::Context,
+    ) -> anyhow::Result<()> {
         let label = format!("Serial {}", config.path.rsplit('/').next().unwrap_or(&config.path));
         let size = TermSize::default();
         let repaint = ctx.clone();
-        match SerialBackend::open(&config, move || repaint.request_repaint()) {
-            Ok((backend, output)) => {
-                let term = Terminal::new(Box::new(backend), output, size);
-                self.dialog = Dialog::None;
-                let panes = Panes::new(Box::new(term));
-                self.push_tab(label, TabContent::Terminal(Box::new(panes)), None);
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.restart = Some(RestartKind::Serial(Box::new(config)));
-                }
-            }
-            Err(e) => self.set_serial_error(&format!("{e:#}")),
+        let (backend, output) = SerialBackend::open(&config, move || repaint.request_repaint())?;
+        let term = Terminal::new(Box::new(backend), output, size);
+        let panes = Panes::new(Box::new(term));
+        self.push_tab(label, TabContent::Terminal(Box::new(panes)), None);
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.restart = Some(RestartKind::Serial(Box::new(config)));
         }
+        Ok(())
     }
 
     fn set_serial_error(&mut self, message: &str) {
@@ -5845,22 +5981,7 @@ impl eframe::App for App {
                 self.macro_run = None;
             }
         }
-        // SFTP file browser for the active SSH tab, when shown and not split.
-        let single_pane = matches!(
-            self.tabs.get(self.active).map(|t| &t.content),
-            Some(TabContent::Terminal(p)) if p.count() == 1
-        );
-        if single_pane
-            && let Some(tab) = self.tabs.get_mut(self.active)
-            && tab.show_files
-            && let Some(files) = &mut tab.files
-        {
-            egui::Panel::right("files")
-                .resizable(true)
-                .default_size(300.0)
-                .size_range(220.0..=560.0)
-                .show(ui, |ui| files.ui(ui, &ctx));
-        }
+        // The SFTP browser now lives in the left pane's "Files" view (see sidebar).
         // Persist a changed SFTP auto-refresh toggle back to the saved session.
         let pref = self.tabs.get(self.active).and_then(|t| {
             Some((t.session_id.clone()?, t.files.as_ref()?.auto_refresh()))
@@ -6495,6 +6616,48 @@ fn appearance_picker(
     });
 }
 
+/// Writes `text` to a temp file and prints it via the platform's print command
+/// (CUPS `lp`/`lpr` on Unix, Notepad `/p` on Windows).
+fn print_text(text: &str) -> std::io::Result<()> {
+    let path = std::env::temp_dir().join(format!("wazowski-print-{}.txt", std::process::id()));
+    std::fs::write(&path, text)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("notepad.exe")
+            .arg("/p")
+            .arg(&path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let status = std::process::Command::new("lp")
+            .arg(&path)
+            .status()
+            .or_else(|_| std::process::Command::new("lpr").arg(&path).status())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("the print command failed (is CUPS/lp installed?)"))
+        }
+    }
+}
+
+/// Formats an elapsed duration compactly (e.g. `3m 12s`, `1h 4m`).
+fn fmt_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3_600 {
+        format!("{}m {}s", s / 60, s % 60)
+    } else {
+        format!("{}h {}m", s / 3_600, (s % 3_600) / 60)
+    }
+}
+
 /// A coarse "N units ago" description of a past time, dependency-free.
 fn time_ago(when: std::time::SystemTime) -> String {
     let Ok(elapsed) = when.elapsed() else { return "just now".to_owned() };
@@ -6557,7 +6720,3 @@ fn step_editor(ui: &mut egui::Ui, step: &mut Step) {
     }
 }
 
-fn shortcut_button(ui: &mut egui::Ui, text: &str, shortcut: &KeyboardShortcut) -> bool {
-    let button = egui::Button::new(text).shortcut_text(ui.ctx().format_shortcut(shortcut));
-    ui.add(button).clicked()
-}

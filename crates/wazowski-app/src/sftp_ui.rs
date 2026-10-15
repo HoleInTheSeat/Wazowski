@@ -211,22 +211,6 @@ impl FileBrowser {
                 ui.spinner();
             }
         });
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!self.busy(), |ui| {
-                if ui.button("⬆").on_hover_text("Parent directory").clicked() {
-                    self.go_up(ctx);
-                }
-                if ui.button("⟳").on_hover_text("Refresh").clicked() {
-                    self.refresh(ctx);
-                }
-                if ui.button("Upload").on_hover_text("Upload a local file here").clicked() {
-                    self.upload(ctx);
-                }
-                if ui.button("New folder").clicked() {
-                    self.new_folder = Some(String::new());
-                }
-            });
-        });
         ui.checkbox(&mut self.auto_refresh, "Auto-refresh")
             .on_hover_text("Periodically re-list this directory (only while this tab is visible)");
 
@@ -299,7 +283,29 @@ impl FileBrowser {
                 }
             });
         }
-        self.entry_list(ui, ctx);
+        // A vertical icon toolbar beside the file list.
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.add_enabled_ui(!self.busy(), |ui| {
+                    if ui.button("⬆").on_hover_text("Parent directory").clicked() {
+                        self.go_up(ctx);
+                    }
+                    if ui.button("⟳").on_hover_text("Refresh").clicked() {
+                        self.refresh(ctx);
+                    }
+                    if ui.button("📤").on_hover_text("Upload a file here").clicked() {
+                        self.upload(ctx);
+                    }
+                    if ui.button("📁").on_hover_text("New folder").clicked() {
+                        self.new_folder = Some(String::new());
+                    }
+                });
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                self.entry_list(ui, ctx);
+            });
+        });
     }
 
     fn entry_list(&mut self, ui: &mut egui::Ui, ctx: &Context) {
@@ -479,7 +485,7 @@ impl FileBrowser {
             } else {
                 "Right-click for actions"
             };
-            ui.label(label).on_hover_text(hover).context_menu(|ui| {
+            ui.selectable_label(false, label).on_hover_text(hover).context_menu(|ui| {
                 if ui.add_enabled(f.changed, egui::Button::new("Upload changes")).clicked() {
                     act = Some(Act::Upload(i));
                     ui.close();
