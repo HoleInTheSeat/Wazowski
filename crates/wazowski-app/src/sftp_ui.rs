@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
 use std::time::SystemTime;
 
-use egui::{Context, RichText};
+use egui::{Color32, Context, RichText};
 use wazowski_ssh::{FileEntry, Sftp};
 
 /// Result of a background SFTP job.
@@ -97,6 +97,8 @@ pub struct FileBrowser {
     last_refresh: std::time::Instant,
     /// Inline "duplicate" prompt: (source name, new name) when active.
     duplicate: Option<(String, String)>,
+    /// Quick-filter text; matching file names are highlighted (not hidden).
+    highlight: String,
 }
 
 impl FileBrowser {
@@ -121,7 +123,13 @@ impl FileBrowser {
             auto_refresh: false,
             last_refresh: std::time::Instant::now(),
             duplicate: None,
+            highlight: String::new(),
         }
+    }
+
+    /// Sets the quick-filter text used to highlight matching file names.
+    pub fn set_highlight(&mut self, highlight: &str) {
+        self.highlight = highlight.to_lowercase();
     }
 
     /// The current auto-refresh state (persisted per session by the app).
@@ -361,7 +369,14 @@ impl FileBrowser {
                 } else {
                     format!("{icon} {}  ({})", entry.name, human_size(entry.size))
                 };
-                let resp = ui.selectable_label(self.selected == Some(i), label);
+                let matched =
+                    !self.highlight.is_empty() && entry.name.to_lowercase().contains(&self.highlight);
+                let text = if matched {
+                    RichText::new(label).color(Color32::from_rgb(240, 200, 80)).strong()
+                } else {
+                    RichText::new(label)
+                };
+                let resp = ui.selectable_label(self.selected == Some(i), text);
                 if resp.clicked() {
                     self.selected = Some(i);
                 }

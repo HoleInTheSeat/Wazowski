@@ -157,6 +157,11 @@ enum NetTool {
     SubnetScan,
 }
 
+/// A full-width quick-filter text field with a magnifier hint.
+fn filter_box(ui: &mut egui::Ui, buf: &mut String) {
+    ui.add(egui::TextEdit::singleline(buf).hint_text("🔍 filter").desired_width(f32::INFINITY));
+}
+
 /// Loads the embedded app icon as an egui texture, for the custom title bar.
 fn load_app_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../../icon.png")).ok()?;
@@ -712,6 +717,13 @@ pub struct App {
     app_icon: Option<egui::TextureHandle>,
     /// The keybinding action awaiting a new key press (Settings ▸ Keybindings).
     keybind_capturing: Option<Action>,
+    /// Per-pane quick-filter text (Sessions/Macros/Files/Tools/Vault/Settings).
+    filter_sessions: String,
+    filter_macros: String,
+    filter_files: String,
+    filter_tools: String,
+    filter_vault: String,
+    filter_settings: String,
 }
 
 /// Natural (numeric-aware) comparison of two serial device names, so `ttyUSB2`
@@ -887,6 +899,15 @@ enum DragPayload {
 
 /// Adds a broad-coverage fallback font so UI symbol glyphs (arrows, split and
 /// broadcast icons, …) render instead of showing missing-glyph boxes.
+/// Applies the base light/dark theme plus a visible outline on inactive widgets
+/// so text fields (and buttons) have an obvious border before you hover them.
+fn apply_visuals(ctx: &egui::Context, dark: bool) {
+    let mut visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let stroke = egui::Stroke::new(1.0, if dark { Color32::from_gray(95) } else { Color32::from_gray(150) });
+    visuals.widgets.inactive.bg_stroke = stroke;
+    ctx.set_visuals(visuals);
+}
+
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -972,9 +993,15 @@ impl App {
             vault_reveal: None,
             app_icon: load_app_icon(ctx),
             keybind_capturing: None,
+            filter_sessions: String::new(),
+            filter_macros: String::new(),
+            filter_files: String::new(),
+            filter_tools: String::new(),
+            filter_vault: String::new(),
+            filter_settings: String::new(),
         };
         app.migrate_servers_one_per_kind();
-        ctx.set_visuals(egui::Visuals::dark());
+        apply_visuals(ctx, true);
         app.open_startup_tab(ctx);
         app
     }
@@ -1946,11 +1973,7 @@ impl App {
         }
         if toggle_theme {
             self.dark_mode = !self.dark_mode;
-            ctx.set_visuals(if self.dark_mode {
-                egui::Visuals::dark()
-            } else {
-                egui::Visuals::light()
-            });
+            apply_visuals(ctx, self.dark_mode);
         }
     }
 
@@ -2113,53 +2136,19 @@ impl App {
     fn settings_vault(&mut self, ui: &mut egui::Ui, changed: &mut bool, backup_now: &mut bool) {
         let vault_exists = Vault::exists(&self.vault_path);
 
-        // Vault file operations (create/unlock live in the Vault left-rail pane
-        // too; these are the file-level operations and advanced management).
-        ui.label(RichText::new("Vault file").strong());
-        ui.horizontal_wrapped(|ui| {
-            match &self.vault {
-                VaultState::Absent => {
-                    if ui.button("Create vault…").clicked() {
-                        self.dialog = Dialog::CreateVault {
-                            password: String::new(),
-                            confirm: String::new(),
-                            remember: false,
-                            error: None,
-                        };
-                    }
-                }
-                VaultState::Locked => {
-                    if ui.button("Unlock vault…").clicked() {
-                        self.dialog = Dialog::UnlockVault {
-                            password: String::new(),
-                            remember: false,
-                            error: None,
-                        };
-                    }
-                }
-                VaultState::Unlocked(_) => {
-                    if ui
-                        .button("Manage secrets (advanced)…")
-                        .on_hover_text("Includes generating SSH key pairs")
-                        .clicked()
-                    {
-                        self.dialog = Dialog::VaultManager(VaultManagerState::default());
-                    }
-                }
+        // Create/unlock/import/back up/delete live in the Vault left-rail pane.
+        // Keep the advanced secrets manager (SSH key generation) here.
+        if matches!(self.vault, VaultState::Unlocked(_)) {
+            ui.label(RichText::new("Advanced").strong());
+            if ui
+                .button("Manage secrets (advanced)…")
+                .on_hover_text("Includes generating SSH key pairs")
+                .clicked()
+            {
+                self.dialog = Dialog::VaultManager(VaultManagerState::default());
             }
-            if ui.button("Import vault…").clicked() {
-                self.import_vault();
-            }
-            if vault_exists {
-                if ui.button("Back up vault…").clicked() {
-                    self.backup_vault();
-                }
-                if ui.button("Delete vault…").clicked() {
-                    self.dialog = Dialog::ConfirmDeleteVault;
-                }
-            }
-        });
-        ui.add_space(10.0);
+            ui.add_space(10.0);
+        }
 
         ui.label(RichText::new("Automatic vault backup").strong());
         if !vault_exists {
@@ -2394,7 +2383,7 @@ impl App {
                 ui.selectable_value(
                     view,
                     SidebarView::Tools,
-                    icon("🧰", Color32::from_rgb(200, 150, 110)),
+                    icon("🔧", Color32::from_rgb(200, 150, 110)),
                 )
                 .on_hover_text("Tools (servers & network)");
                 ui.selectable_value(
@@ -2425,7 +2414,9 @@ impl App {
     /// The Settings view's left pane: the category selector.
     fn sidebar_settings_categories(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
+        filter_box(ui, &mut self.filter_settings);
         ui.separator();
+        let needle = self.filter_settings.to_lowercase();
         for (cat, label) in [
             (SettingsCategory::General, "General"),
             (SettingsCategory::Tabs, "Tabs"),
@@ -2434,45 +2425,104 @@ impl App {
             (SettingsCategory::Keybindings, "Keybindings"),
             (SettingsCategory::Extras, "Extras"),
         ] {
-            ui.selectable_value(&mut self.settings_category, cat, label);
+            if needle.is_empty() || label.to_lowercase().contains(&needle) {
+                ui.selectable_value(&mut self.settings_category, cat, label);
+            }
         }
     }
 
     /// The Tools view's left pane: server/network/host tool categories.
     fn sidebar_tools(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tools");
+        filter_box(ui, &mut self.filter_tools);
         ui.separator();
+        let needle = self.filter_tools.to_lowercase();
+        let item = &mut self.tools_item;
+        let categories: [(&str, &[(ToolsItem, &str)]); 3] = [
+            (
+                "Servers",
+                &[
+                    (ToolsItem::ServerHttp, "HTTP"),
+                    (ToolsItem::ServerTftp, "TFTP"),
+                    (ToolsItem::ServerSftp, "SFTP"),
+                    (ToolsItem::ServerIperf, "iperf3"),
+                ],
+            ),
+            (
+                "Network Tools",
+                &[
+                    (ToolsItem::IpScanner, "IP Scanner"),
+                    (ToolsItem::PortScan, "Port Scan"),
+                    (ToolsItem::WakeOnLan, "Wake-on-LAN"),
+                ],
+            ),
+            ("Host Tools", &[(ToolsItem::OpenPorts, "Open Ports")]),
+        ];
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let item = &mut self.tools_item;
-            ui.add_space(2.0);
-            ui.label(RichText::new("Servers").strong());
-            ui.selectable_value(item, ToolsItem::ServerHttp, "    HTTP");
-            ui.selectable_value(item, ToolsItem::ServerTftp, "    TFTP");
-            ui.selectable_value(item, ToolsItem::ServerSftp, "    SFTP");
-            ui.selectable_value(item, ToolsItem::ServerIperf, "    iperf3");
-            ui.add_space(8.0);
-            ui.label(RichText::new("Network Tools").strong());
-            ui.selectable_value(item, ToolsItem::IpScanner, "    IP Scanner");
-            ui.selectable_value(item, ToolsItem::PortScan, "    Port Scan");
-            ui.selectable_value(item, ToolsItem::WakeOnLan, "    Wake-on-LAN");
-            ui.add_space(8.0);
-            ui.label(RichText::new("Host Tools").strong());
-            ui.selectable_value(item, ToolsItem::OpenPorts, "    Open Ports");
+            for (category, items) in categories {
+                let matches: Vec<_> = items
+                    .iter()
+                    .filter(|(_, label)| {
+                        needle.is_empty() || label.to_lowercase().contains(&needle)
+                    })
+                    .collect();
+                if matches.is_empty() {
+                    continue;
+                }
+                ui.add_space(2.0);
+                ui.label(RichText::new(category).strong());
+                for (value, label) in matches {
+                    ui.selectable_value(item, *value, format!("    {label}"));
+                }
+                ui.add_space(6.0);
+            }
         });
     }
 
     /// The Vault view's left pane: credentials grouped by type.
     fn sidebar_vault(&mut self, ui: &mut egui::Ui) {
+        let vault_exists = Vault::exists(&self.vault_path);
+        let unlocked = matches!(self.vault, VaultState::Unlocked(_));
+        let mut new_credential = false;
+        let mut import = false;
+        let mut backup = false;
+        let mut delete = false;
         ui.horizontal(|ui| {
             ui.heading("Vault");
-            if matches!(self.vault, VaultState::Unlocked(_))
-                && ui.small_button("+").on_hover_text("New credential").clicked()
+            if unlocked
+                && ui.small_button("➕").on_hover_text("New credential").clicked()
             {
-                self.vault_selected = None;
-                self.vault_reveal = None;
-                self.vault_form = Some(SecretForm::new());
+                new_credential = true;
+            }
+            if ui.small_button("📥").on_hover_text("Import a vault file…").clicked() {
+                import = true;
+            }
+            if vault_exists {
+                if ui.small_button("💾").on_hover_text("Back up the vault…").clicked() {
+                    backup = true;
+                }
+                if ui.small_button("🗑").on_hover_text("Delete the vault…").clicked() {
+                    delete = true;
+                }
             }
         });
+        if new_credential {
+            self.vault_selected = None;
+            self.vault_reveal = None;
+            self.vault_form = Some(SecretForm::new());
+        }
+        if import {
+            self.import_vault();
+        }
+        if backup {
+            self.backup_vault();
+        }
+        if delete {
+            self.dialog = Dialog::ConfirmDeleteVault;
+        }
+        if unlocked {
+            filter_box(ui, &mut self.filter_vault);
+        }
         ui.separator();
         match &self.vault {
             VaultState::Absent => {
@@ -2502,10 +2552,14 @@ impl App {
         }
 
         // Collect names by type, then render (drops the vault borrow first).
+        let needle = self.filter_vault.to_lowercase();
         let (passwords, keys) = {
             let vault = self.vault.unlocked().expect("unlocked");
             let (mut p, mut k) = (Vec::new(), Vec::new());
             for name in vault.names() {
+                if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+                    continue;
+                }
                 match vault.get(&name) {
                     Some(Secret::Password { .. }) => p.push(name),
                     Some(Secret::PrivateKey { .. }) => k.push(name),
@@ -2518,7 +2572,12 @@ impl App {
         let mut clicked: Option<String> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if passwords.is_empty() && keys.is_empty() {
-                ui.label(RichText::new("No credentials yet. Click + to add one.").weak());
+                let msg = if needle.is_empty() {
+                    "No credentials yet. Click ➕ to add one."
+                } else {
+                    "No credentials match the filter."
+                };
+                ui.label(RichText::new(msg).weak());
             }
             if !passwords.is_empty() {
                 ui.add_space(2.0);
@@ -2568,14 +2627,19 @@ impl App {
 
     /// The Files view: the SFTP browser for the active single-pane SSH tab.
     fn sidebar_files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Files (SFTP)");
+        filter_box(ui, &mut self.filter_files);
+        ui.separator();
         let single_pane = matches!(
             self.tabs.get(self.active).map(|t| &t.content),
             Some(TabContent::Terminal(p)) if p.count() == 1
         );
+        let highlight = self.filter_files.clone();
         if single_pane
             && let Some(tab) = self.tabs.get_mut(self.active)
             && let Some(files) = &mut tab.files
         {
+            files.set_highlight(&highlight);
             files.ui(ui, ctx);
         } else {
             ui.add_space(8.0);
@@ -2617,6 +2681,7 @@ impl App {
                 self.quick_connect();
             }
         });
+        filter_box(ui, &mut self.filter_sessions);
         ui.separator();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -2640,12 +2705,17 @@ impl App {
                 act = Some(Act::New);
             }
         });
+        filter_box(ui, &mut self.filter_macros);
         ui.separator();
+        let needle = self.filter_macros.to_lowercase();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if self.macros.macros.is_empty() {
                 ui.label(RichText::new("No macros yet. Click + to add one.").weak());
             }
             for (i, m) in self.macros.macros.iter().enumerate() {
+                if !needle.is_empty() && !m.name.to_lowercase().contains(&needle) {
+                    continue;
+                }
                 let resp = ui.selectable_label(false, format!("⚙ {}", m.name));
                 if resp.double_clicked() {
                     act = Some(Act::Run(i, MacroTarget::ActivePane));
@@ -2716,6 +2786,7 @@ impl App {
     fn session_tree(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut action: Option<TreeAction> = None;
         let mut open_serial: Option<String> = None;
+        let filter = self.filter_sessions.to_lowercase();
 
         // Destinations for move/copy: the local store plus every reachable share.
         let mut destinations = vec![Destination {
@@ -2734,7 +2805,7 @@ impl App {
         }
 
         // Local sessions.
-        render_store(ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action);
+        render_store(ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action, &filter);
 
         // Each shared source as its own collapsible section.
         for source in &self.shared {
@@ -2757,7 +2828,7 @@ impl App {
                 if let Some(note) = source.status() {
                     ui.label(RichText::new(format!("⚠ {note}")).color(ui.visuals().warn_fg_color));
                 }
-                render_store(ui, &store, source.store(), editable, &destinations, &mut action);
+                render_store(ui, &store, source.store(), editable, &destinations, &mut action, &filter);
             });
             delayed_tooltip(ui, &resp.header_response, &source_hint(source.def()));
             // Dropping onto the source header targets that store's root.
@@ -7308,6 +7379,11 @@ impl FolderNode {
         }
         node
     }
+
+    /// Whether this node or any descendant holds at least one session.
+    fn has_sessions(&self) -> bool {
+        !self.sessions.is_empty() || self.children.values().any(FolderNode::has_sessions)
+    }
 }
 
 /// A move/copy destination: a store and its folders.
@@ -7317,6 +7393,7 @@ struct Destination {
     folders: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_store(
     ui: &mut egui::Ui,
     store: &StoreId,
@@ -7324,14 +7401,20 @@ fn render_store(
     editable: bool,
     destinations: &[Destination],
     action: &mut Option<TreeAction>,
+    filter: &str,
 ) {
-    // Build a nested tree; folder paths synthesize their ancestor nodes.
+    // Build a nested tree; folder paths synthesize their ancestor nodes. When a
+    // filter is active, only sessions whose name matches are included (and empty
+    // folders are hidden below).
     let folders = sessions.folders();
     let mut root = FolderNode::default();
     for folder in &folders {
         root.at(folder);
     }
     for session in sessions.all() {
+        if !filter.is_empty() && !session.name.to_lowercase().contains(filter) {
+            continue;
+        }
         root.at(&session.folder).sessions.push(SessionRow {
             id: session.id.clone(),
             name: session.name.clone(),
@@ -7347,7 +7430,12 @@ fn render_store(
     }
     let children: Vec<_> = root.children.iter().collect();
     for (segment, node) in children {
-        render_folder(ui, store, sessions, segment, segment, node, destinations, editable, action);
+        if !filter.is_empty() && !node.has_sessions() {
+            continue;
+        }
+        render_folder(
+            ui, store, sessions, segment, segment, node, destinations, editable, action, filter,
+        );
     }
 }
 
@@ -7364,11 +7452,16 @@ fn render_folder(
     destinations: &[Destination],
     editable: bool,
     action: &mut Option<TreeAction>,
+    filter: &str,
 ) {
     use egui::containers::collapsing_header::CollapsingState;
 
     let id = egui::Id::new((store_salt(store), "folder", full));
-    let state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    // While filtering, force folders open so matches are visible.
+    if !filter.is_empty() {
+        state.set_open(true);
+    }
     let style = data.folder_style(full);
     let icon = style.map(|s| s.icon.as_str()).filter(|i| !i.is_empty()).unwrap_or("📁");
     let text = {
@@ -7392,10 +7485,13 @@ fn render_folder(
                 session_row(ui, store, row, destinations, editable, action);
             }
             for (child_segment, child) in &node.children {
+                if !filter.is_empty() && !child.has_sessions() {
+                    continue;
+                }
                 let child_full = format!("{full}/{child_segment}");
                 render_folder(
                     ui, store, data, child_segment, &child_full, child, destinations, editable,
-                    action,
+                    action, filter,
                 );
             }
         });
