@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, RichText};
 use wazowski_core::session::Auth;
-use wazowski_core::{FolderStyle, Secret, Session, SessionStore, Vault, VaultError};
+use wazowski_core::{FolderStyle, Protocol, Secret, Session, SessionStore, Vault, VaultError};
 use wazowski_ssh::{
     AuthMaterial, ConnectParams, HostKeyPolicy, UnknownHostKey, trust_host,
 };
@@ -335,6 +335,7 @@ fn compute_env_checks() -> EnvChecks {
         printing: has_bin("lp") || has_bin("lpr"),
         low_port: low_port_granted(),
         rdp_client: detect_rdp_client(),
+        vnc_client: detect_vnc_client(),
         default_browser: detect_default_browser(),
     }
 }
@@ -638,9 +639,13 @@ struct SessionForm {
     id: Option<String>,
     name: String,
     folder: String,
+    /// The connection protocol (SSH / RDP / VNC).
+    protocol: Protocol,
     host: String,
     port: String,
     username: String,
+    /// Optional Windows domain (RDP only).
+    domain: String,
     method: AuthMethod,
     /// Whether to reference an existing vault entry or create a new one.
     source: SecretSource,
@@ -882,6 +887,8 @@ struct EnvChecks {
     low_port: Option<bool>,
     /// Name of the first detected RDP client, if any (for launching saved RDP sessions).
     rdp_client: Option<String>,
+    /// Name of the first detected VNC viewer, if any.
+    vnc_client: Option<String>,
     /// Best-effort default web browser name; `None` if it couldn't be determined.
     default_browser: Option<String>,
 }
@@ -1282,7 +1289,7 @@ impl App {
             StartupTab::Session(id) => match self.sessions.get(&id).cloned() {
                 Some(session) => {
                     self.remember_recent(&id);
-                    self.start_connect(&session, ctx);
+                    self.connect_session(&session, ctx);
                 }
                 None => self.open_local_shell(ctx),
             },
@@ -1432,6 +1439,18 @@ impl App {
 
     /// Starts connecting to `session`, resolving its credentials from the vault.
     /// A missing named credential opens a prompt to create it, then continues.
+    /// Connects a saved session according to its protocol: SSH opens a terminal
+    /// tab, RDP/VNC launch the configured external client.
+    fn connect_session(&mut self, session: &Session, ctx: &egui::Context) {
+        match session.protocol {
+            Protocol::Ssh => self.start_connect(session, ctx),
+            Protocol::Rdp => {
+                self.launch_rdp(&session.host, session.port, &session.username, &session.domain)
+            }
+            Protocol::Vnc => self.launch_vnc(&session.host, session.port),
+        }
+    }
+
     fn start_connect(&mut self, session: &Session, ctx: &egui::Context) {
         match self.resolve_auth(&session.auth) {
             Ok(resolved) => self.connect_with(&session.name, session, resolved, ctx),
@@ -2393,6 +2412,15 @@ impl App {
                 ),
             };
             ui.end_row();
+            // VNC viewer (for launching saved VNC sessions).
+            status(ui, "VNC viewer", checks.vnc_client.is_some());
+            match &checks.vnc_client {
+                Some(name) => ui.label(RichText::new(format!("found: {name}")).weak()),
+                None => ui.label(
+                    RichText::new(format!("install one of: {}", VNC_CLIENTS.join(", "))).weak(),
+                ),
+            };
+            ui.end_row();
             // Default web browser (used by "Open web GUI").
             status(ui, "Default web browser", checks.default_browser.is_some());
             match &checks.default_browser {
@@ -2420,6 +2448,33 @@ impl App {
                         let sel = self.settings.rdp_client.as_deref() == Some(*c);
                         if ui.selectable_label(sel, *c).clicked() {
                             self.settings.rdp_client = Some((*c).to_owned());
+                            changed = true;
+                        }
+                    }
+                });
+                if changed && let Err(e) = self.settings.save() {
+                    self.error = Some(format!("Could not save settings: {e:#}"));
+                }
+            });
+        }
+
+        // Preferred VNC viewer for a VNC session's Connect action.
+        let vnc_installed: Vec<&'static str> =
+            VNC_CLIENTS.iter().copied().filter(|c| has_bin(c)).collect();
+        if !vnc_installed.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("Preferred VNC viewer:");
+                let current = self.settings.vnc_client.clone().unwrap_or_else(|| "Auto".into());
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("vnc-client").selected_text(current).show_ui(ui, |ui| {
+                    if ui.selectable_label(self.settings.vnc_client.is_none(), "Auto").clicked() {
+                        self.settings.vnc_client = None;
+                        changed = true;
+                    }
+                    for c in &vnc_installed {
+                        let sel = self.settings.vnc_client.as_deref() == Some(*c);
+                        if ui.selectable_label(sel, *c).clicked() {
+                            self.settings.vnc_client = Some((*c).to_owned());
                             changed = true;
                         }
                     }
@@ -3129,7 +3184,7 @@ impl App {
             TreeAction::Connect(store, id) => {
                 if let Some(session) = self.session_in(&store, &id) {
                     self.remember_recent(&id);
-                    self.start_connect(&session, ctx);
+                    self.connect_session(&session, ctx);
                 }
                 Ok(())
             }
@@ -3151,12 +3206,6 @@ impl App {
             TreeAction::NetworkTool(store, id, tool) => {
                 if let Some(session) = self.session_in(&store, &id) {
                     self.session_network_tool(&session.host, tool);
-                }
-                Ok(())
-            }
-            TreeAction::OpenRdp(store, id) => {
-                if let Some(session) = self.session_in(&store, &id) {
-                    self.launch_rdp(&session.host, &session.username);
                 }
                 Ok(())
             }
@@ -3760,7 +3809,7 @@ impl App {
         {
             let ctx = ui.ctx().clone();
             self.remember_recent(&id);
-            self.start_connect(&session, &ctx);
+            self.connect_session(&session, &ctx);
         }
         if let Some(tab_id) = retry {
             let ctx = ui.ctx().clone();
@@ -4144,10 +4193,10 @@ impl App {
         }
     }
 
-    /// Launches an external RDP client for `host` (using the session's username
-    /// when present). Uses the preferred client from Settings if it's still
-    /// installed, else the first detected one; prompts to install if none.
-    fn launch_rdp(&mut self, host: &str, username: &str) {
+    /// Launches an external RDP client for `host:port` (using the session's
+    /// username/domain when present). Uses the preferred client from Settings if
+    /// still installed, else the first detected one; prompts to install if none.
+    fn launch_rdp(&mut self, host: &str, port: u16, username: &str, domain: &str) {
         if host.trim().is_empty() {
             self.error = Some("This session has no host to open over RDP.".into());
             return;
@@ -4165,7 +4214,34 @@ impl App {
             ));
             return;
         };
-        let args = rdp_command(&client, host, username);
+        let args = rdp_command(&client, host, port, username, domain);
+        match std::process::Command::new(&client).args(&args).spawn() {
+            Ok(_) => {}
+            Err(e) => self.error = Some(format!("Could not launch {client}: {e}")),
+        }
+    }
+
+    /// Launches an external VNC viewer for `host:port`. Uses the preferred client
+    /// from Settings if still installed, else the first detected one.
+    fn launch_vnc(&mut self, host: &str, port: u16) {
+        if host.trim().is_empty() {
+            self.error = Some("This session has no host to open over VNC.".into());
+            return;
+        }
+        let client = self
+            .settings
+            .vnc_client
+            .clone()
+            .filter(|c| has_bin(c))
+            .or_else(detect_vnc_client);
+        let Some(client) = client else {
+            self.error = Some(format!(
+                "No VNC viewer found. Install one of: {} (see Settings ▸ Extras).",
+                VNC_CLIENTS.join(", ")
+            ));
+            return;
+        };
+        let args = vnc_command(&client, host, port);
         match std::process::Command::new(&client).args(&args).spawn() {
             Ok(_) => {}
             Err(e) => self.error = Some(format!("Could not launch {client}: {e}")),
@@ -6518,6 +6594,32 @@ impl App {
                 ui.set_width(400.0);
                 ui.heading(title);
                 ui.add_space(6.0);
+                // Session-type picker: a row of icon buttons with tooltips.
+                ui.horizontal(|ui| {
+                    for (proto, icon, tip) in [
+                        (Protocol::Ssh, "🖥", "SSH terminal"),
+                        (Protocol::Rdp, "🖵", "Remote Desktop (external client)"),
+                        (Protocol::Vnc, "👁", "VNC (external viewer)"),
+                    ] {
+                        let selected = form.protocol == proto;
+                        if ui
+                            .selectable_label(selected, RichText::new(icon).size(22.0))
+                            .on_hover_text(tip)
+                            .clicked()
+                            && !selected
+                        {
+                            // Switch type; snap the port to the new default if it
+                            // was empty or a known protocol default.
+                            let known = ["22", "3389", "5900"];
+                            if form.port.trim().is_empty() || known.contains(&form.port.trim()) {
+                                form.port = proto.default_port().to_string();
+                            }
+                            form.protocol = proto;
+                        }
+                    }
+                    ui.label(RichText::new(form.protocol.label()).weak());
+                });
+                ui.add_space(6.0);
                 // Enter in any single-line field submits the form.
                 let mut enter = false;
                 let mut line = |ui: &mut egui::Ui, value: &mut String, password: bool| {
@@ -6538,9 +6640,19 @@ impl App {
                     ui.label("Port");
                     line(ui, &mut form.port, false);
                     ui.end_row();
-                    ui.label("Username");
-                    line(ui, &mut form.username, false);
-                    ui.end_row();
+                    if form.protocol != Protocol::Vnc {
+                        ui.label("Username");
+                        line(ui, &mut form.username, false);
+                        ui.end_row();
+                    }
+                    if form.protocol == Protocol::Rdp {
+                        ui.label("Domain");
+                        line(ui, &mut form.domain, false);
+                        ui.end_row();
+                    }
+                    // SSH-only authentication (RDP/VNC use the external client's
+                    // own credential handling).
+                    if form.protocol == Protocol::Ssh {
                     ui.label("Auth");
                     egui::ComboBox::from_id_salt("auth-method")
                         .selected_text(form.method.label())
@@ -6616,16 +6728,30 @@ impl App {
                             }
                         }
                     }
+                    } // end SSH-only auth section
                 });
-                ui.add_space(4.0);
-                ui.checkbox(&mut form.legacy, "Legacy mode (old switches: SHA-1 KEX, CBC ciphers)")
+                if form.protocol == Protocol::Ssh {
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut form.legacy,
+                        "Legacy mode (old switches: SHA-1 KEX, CBC ciphers)",
+                    )
                     .on_hover_text(
                         "Enables weak but widely compatible algorithms. Use only for old \
                          equipment such as HPE/ProCurve switches.",
                     );
+                }
                 ui.add_space(4.0);
-                appearance_picker(ui, &mut form.icon, &mut form.color, "🖥");
-                if form.method != AuthMethod::Agent && !vault_unlocked {
+                let default_icon = match form.protocol {
+                    Protocol::Ssh => "🖥",
+                    Protocol::Rdp => "🖵",
+                    Protocol::Vnc => "👁",
+                };
+                appearance_picker(ui, &mut form.icon, &mut form.color, default_icon);
+                if form.protocol == Protocol::Ssh
+                    && form.method != AuthMethod::Agent
+                    && !vault_unlocked
+                {
                     ui.colored_label(
                         Color32::LIGHT_YELLOW,
                         "Unlock or create the vault to use saved credentials.",
@@ -6672,6 +6798,7 @@ impl App {
             form.method,
             form.legacy,
         );
+        let (protocol, domain) = (form.protocol, form.domain.trim().to_owned());
         let (icon, color) = (form.icon.clone(), form.color);
         let (source, existing_name, new_name, secret_input, key_passphrase) = (
             form.source,
@@ -6696,13 +6823,16 @@ impl App {
             session.id = id;
         }
         session.folder = folder;
+        session.protocol = protocol;
         session.port = port;
+        session.domain = domain;
         session.legacy = legacy;
         session.icon = icon;
         session.color = color;
 
-        // Agent auth needs no stored secret.
-        session.auth = if method == AuthMethod::Agent {
+        // RDP/VNC connect through an external client that handles its own
+        // credentials, so they store no vault reference (treated like agent auth).
+        session.auth = if protocol != Protocol::Ssh || method == AuthMethod::Agent {
             Auth::Agent
         } else {
             // Resolve the vault entry name this session should reference. An empty
@@ -7526,9 +7656,11 @@ impl SessionForm {
             id: None,
             name: String::new(),
             folder: String::new(),
+            protocol: Protocol::Ssh,
             host: String::new(),
             port: "22".into(),
             username: String::new(),
+            domain: String::new(),
             method: AuthMethod::Password,
             source: SecretSource::New,
             existing_name: None,
@@ -7555,9 +7687,11 @@ impl SessionForm {
             id: Some(session.id.clone()),
             name: session.name.clone(),
             folder: session.folder.clone(),
+            protocol: session.protocol,
             host: session.host.clone(),
             port: session.port.to_string(),
             username: session.username.clone(),
+            domain: session.domain.clone(),
             method,
             source: if existing_name.is_some() { SecretSource::Existing } else { SecretSource::New },
             existing_name,
@@ -7590,7 +7724,6 @@ enum TreeAction {
     Connect(StoreId, String),
     ConnectAs(StoreId, String),
     OpenWebGui(StoreId, String),
-    OpenRdp(StoreId, String),
     NetworkTool(StoreId, String, NetTool),
     Edit(StoreId, String),
     Delete(StoreId, String),
@@ -7629,6 +7762,7 @@ struct SessionRow {
     hint: String,
     icon: String,
     color: Option<[u8; 3]>,
+    protocol: Protocol,
 }
 
 impl FolderNode {
@@ -7684,6 +7818,7 @@ fn render_store(
             hint: session_hint(session),
             icon: session.icon.clone(),
             color: session.color,
+            protocol: session.protocol,
         });
     }
 
@@ -7862,16 +7997,37 @@ fn source_hint(def: &SourceDef) -> String {
 
 /// A brief description of a session, for its left-pane hover tooltip.
 fn session_hint(s: &Session) -> String {
-    let auth = match &s.auth {
-        Auth::Agent => "SSH agent",
-        Auth::Password { .. } => "password",
-        Auth::Key { .. } => "key",
+    let where_to = if s.port == s.protocol.default_port() {
+        s.host.clone()
+    } else {
+        format!("{}:{}", s.host, s.port)
     };
-    let mut hint = format!("SSH · {}\nauth: {auth}", s.address());
-    if s.legacy {
-        hint.push_str("\nlegacy algorithms");
+    match s.protocol {
+        Protocol::Ssh => {
+            let auth = match &s.auth {
+                Auth::Agent => "SSH agent",
+                Auth::Password { .. } => "password",
+                Auth::Key { .. } => "key",
+            };
+            let mut hint = format!("SSH · {}\nauth: {auth}", s.address());
+            if s.legacy {
+                hint.push_str("\nlegacy algorithms");
+            }
+            hint
+        }
+        Protocol::Rdp => {
+            let mut hint = format!("RDP · {where_to}");
+            if !s.username.is_empty() {
+                hint.push_str(&format!("\nuser: {}", s.username));
+            }
+            if !s.domain.is_empty() {
+                hint.push_str(&format!("\ndomain: {}", s.domain));
+            }
+            hint.push_str("\nopens in external client");
+            hint
+        }
+        Protocol::Vnc => format!("VNC · {where_to}\nopens in external viewer"),
     }
-    hint
 }
 
 /// Shows a tooltip on `response`, but only once the pointer has rested on the
@@ -7913,7 +8069,12 @@ fn session_row(
     action: &mut Option<TreeAction>,
 ) {
     let (id, name) = (row.id.as_str(), row.name.as_str());
-    let icon = if row.icon.is_empty() { "🖥" } else { row.icon.as_str() };
+    let default_icon = match row.protocol {
+        Protocol::Ssh => "🖥",
+        Protocol::Rdp => "🖵",
+        Protocol::Vnc => "👁",
+    };
+    let icon = if row.icon.is_empty() { default_icon } else { row.icon.as_str() };
     let text = {
         let t = RichText::new(format!("{icon} {name}"));
         match row.color {
@@ -7932,16 +8093,12 @@ fn session_row(
             *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
             ui.close();
         }
-        if ui.button("Connect as…").clicked() {
+        if row.protocol == Protocol::Ssh && ui.button("Connect as…").clicked() {
             *action = Some(TreeAction::ConnectAs(store.clone(), id.to_owned()));
             ui.close();
         }
         if ui.button("Open web GUI").clicked() {
             *action = Some(TreeAction::OpenWebGui(store.clone(), id.to_owned()));
-            ui.close();
-        }
-        if ui.button("Open RDP").clicked() {
-            *action = Some(TreeAction::OpenRdp(store.clone(), id.to_owned()));
             ui.close();
         }
         ui.menu_button("Network tools", |ui| {
@@ -8005,29 +8162,64 @@ fn web_gui_url(host: &str, scheme: WebScheme) -> String {
     }
 }
 
-/// Builds the argument list to launch an RDP client against `host`/`username`.
+/// Builds the argument list to launch an RDP client against `host:port`.
 /// The client's binary name selects the argument style (FreeRDP, Remmina, or
 /// the Windows `mstsc`); unknown clients fall back to the FreeRDP style.
-fn rdp_command(client: &str, host: &str, username: &str) -> Vec<String> {
+fn rdp_command(client: &str, host: &str, port: u16, username: &str, domain: &str) -> Vec<String> {
     let host = host.trim();
     let user = username.trim();
+    let domain = domain.trim();
     let base = client.rsplit(['/', '\\']).next().unwrap_or(client);
+    let authority = if port == 3389 { host.to_owned() } else { format!("{host}:{port}") };
     if base.starts_with("remmina") {
         let uri = if user.is_empty() {
-            format!("rdp://{host}")
+            format!("rdp://{authority}")
         } else {
-            format!("rdp://{user}@{host}")
+            format!("rdp://{user}@{authority}")
         };
         vec!["-c".to_owned(), uri]
     } else if base.starts_with("mstsc") {
-        vec![format!("/v:{host}")]
+        vec![format!("/v:{authority}")]
     } else {
         // FreeRDP family (xfreerdp / xfreerdp3 / wlfreerdp) and fallback.
-        let mut args = vec![format!("/v:{host}")];
+        let mut args = vec![format!("/v:{authority}")];
         if !user.is_empty() {
             args.push(format!("/u:{user}"));
         }
+        if !domain.is_empty() {
+            args.push(format!("/d:{domain}"));
+        }
         args
+    }
+}
+
+/// The common VNC viewers Wazowski can launch, most-preferred first.
+const VNC_CLIENTS: &[&str] = if cfg!(windows) {
+    &["vncviewer"]
+} else if cfg!(target_os = "macos") {
+    &["vncviewer", "open"]
+} else {
+    &["vncviewer", "xtigervncviewer", "remmina"]
+};
+
+/// The first installed VNC viewer on the PATH, if any.
+fn detect_vnc_client() -> Option<String> {
+    VNC_CLIENTS.iter().find(|name| has_bin(name)).map(|name| (*name).to_owned())
+}
+
+/// Builds the argument list to launch a VNC viewer against `host:port`. The
+/// binary name selects the style: Remmina (vnc:// URI), macOS `open` (vnc://
+/// URL), or the common `vncviewer`/TigerVNC `host::port` form.
+fn vnc_command(client: &str, host: &str, port: u16) -> Vec<String> {
+    let host = host.trim();
+    let base = client.rsplit(['/', '\\']).next().unwrap_or(client);
+    if base.starts_with("remmina") {
+        vec!["-c".to_owned(), format!("vnc://{host}:{port}")]
+    } else if base == "open" {
+        vec![format!("vnc://{host}:{port}")]
+    } else {
+        // vncviewer / xtigervncviewer: explicit "host::port".
+        vec![format!("{host}::{port}")]
     }
 }
 
@@ -8340,15 +8532,29 @@ mod tests {
 
     #[test]
     fn rdp_command_freerdp_style() {
-        assert_eq!(rdp_command("xfreerdp", "10.0.0.5", "admin"), ["/v:10.0.0.5", "/u:admin"]);
-        assert_eq!(rdp_command("/usr/bin/xfreerdp3", "host", ""), ["/v:host"]);
-        assert_eq!(rdp_command("wlfreerdp", "host", "u"), ["/v:host", "/u:u"]);
+        assert_eq!(
+            rdp_command("xfreerdp", "10.0.0.5", 3389, "admin", ""),
+            ["/v:10.0.0.5", "/u:admin"]
+        );
+        assert_eq!(rdp_command("/usr/bin/xfreerdp3", "host", 3389, "", ""), ["/v:host"]);
+        assert_eq!(
+            rdp_command("wlfreerdp", "host", 3390, "u", "CORP"),
+            ["/v:host:3390", "/u:u", "/d:CORP"]
+        );
     }
 
     #[test]
     fn rdp_command_remmina_and_mstsc() {
-        assert_eq!(rdp_command("remmina", "host", "bob"), ["-c", "rdp://bob@host"]);
-        assert_eq!(rdp_command("remmina", "host", ""), ["-c", "rdp://host"]);
-        assert_eq!(rdp_command("mstsc", "host", "bob"), ["/v:host"]);
+        assert_eq!(rdp_command("remmina", "host", 3389, "bob", ""), ["-c", "rdp://bob@host"]);
+        assert_eq!(rdp_command("remmina", "host", 3390, "", ""), ["-c", "rdp://host:3390"]);
+        assert_eq!(rdp_command("mstsc", "host", 3389, "bob", ""), ["/v:host"]);
+    }
+
+    #[test]
+    fn vnc_command_styles() {
+        assert_eq!(vnc_command("vncviewer", "host", 5900), ["host::5900"]);
+        assert_eq!(vnc_command("xtigervncviewer", "host", 5901), ["host::5901"]);
+        assert_eq!(vnc_command("remmina", "host", 5900), ["-c", "vnc://host:5900"]);
+        assert_eq!(vnc_command("open", "host", 5900), ["vnc://host:5900"]);
     }
 }

@@ -157,12 +157,15 @@ Agreed "do next" items (rough order TBD with the user):
   loading indicator and block other use until connected or the toggle is cleared;
   on failure, require fixing it or clearing force.
 - **Wireshark quick launch** — a Network-tools button to start a Wireshark capture.
-- **RDP via external client** ✅ (initial) — a session's right-click ▸ "Open RDP"
-  launches the host in the user's installed client (FreeRDP / Remmina / Windows
-  mstsc), passing the session username where the client supports it. The preferred
-  client is configurable in Settings ▸ Extras (Auto or a specific one), which also
-  reports whether a client is installed and prompts to install if none.
-  (Follow-up: dedicated RDP session entries with domain/resolution options.)
+- **RDP & VNC via external clients** ✅ — RDP and VNC are first-class saved
+  session types (the session editor has a type-picker row of icon buttons:
+  SSH / RDP / VNC). Connecting an RDP/VNC session launches the user's installed
+  client (FreeRDP / Remmina / Windows mstsc for RDP; vncviewer / TigerVNC /
+  Remmina / macOS Screen Sharing for VNC) with host:port, plus username/domain
+  for RDP. Preferred clients are configurable in Settings ▸ Extras (Auto or a
+  specific one), which also reports whether each is installed. RDP/VNC store no
+  vault credentials — the external client handles its own auth.
+  (Follow-up: RDP resolution/gateway options, VNC quality options.)
 - **Visual polish / "make the UI cooler"** — themes, fonts, animations; done last.
 
 ## Portability goals

@@ -26,6 +26,38 @@ pub enum Auth {
     Key { secret: String },
 }
 
+/// The protocol a saved session connects with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    /// An SSH terminal session (the historical default).
+    #[default]
+    Ssh,
+    /// Remote Desktop, opened in an external client.
+    Rdp,
+    /// VNC, opened in an external viewer.
+    Vnc,
+}
+
+impl Protocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Protocol::Ssh => "SSH",
+            Protocol::Rdp => "RDP",
+            Protocol::Vnc => "VNC",
+        }
+    }
+
+    /// The conventional default port for this protocol.
+    pub fn default_port(self) -> u16 {
+        match self {
+            Protocol::Ssh => 22,
+            Protocol::Rdp => 3389,
+            Protocol::Vnc => 5900,
+        }
+    }
+}
+
 /// A saved connection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -36,10 +68,16 @@ pub struct Session {
     /// Folder path for grouping in the tree, e.g. `work/prod`. Empty means the root.
     #[serde(default)]
     pub folder: String,
+    /// The connection protocol. Older session files without this field load as SSH.
+    #[serde(default)]
+    pub protocol: Protocol,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
     pub username: String,
+    /// Optional Windows domain for RDP (ignored by other protocols).
+    #[serde(default)]
+    pub domain: String,
     #[serde(default)]
     pub auth: Auth,
     /// Offer legacy SSH algorithms (SHA-1 KEX, CBC ciphers) for old equipment.
@@ -67,9 +105,11 @@ impl Session {
             id: new_id(),
             name: name.into(),
             folder: String::new(),
+            protocol: Protocol::default(),
             host: host.into(),
             port: default_port(),
             username: username.into(),
+            domain: String::new(),
             auth: Auth::default(),
             legacy: false,
             icon: String::new(),
