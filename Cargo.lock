@@ -5899,7 +5899,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-app"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -5924,7 +5924,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5943,7 +5943,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-servers"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-tftp",
@@ -5964,7 +5964,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-ssh"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5982,7 +5982,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-term"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
