@@ -2656,6 +2656,7 @@ impl App {
                 self.dialog = Dialog::EditSession(SessionForm::new());
             }
         });
+        filter_box(ui, &mut self.filter_sessions);
 
         match &self.vault {
             VaultState::Locked => {
@@ -2681,7 +2682,6 @@ impl App {
                 self.quick_connect();
             }
         });
-        filter_box(ui, &mut self.filter_sessions);
         ui.separator();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
