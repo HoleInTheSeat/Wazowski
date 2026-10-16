@@ -594,6 +594,9 @@ struct SecretForm {
     username: String,
     value: String,
     passphrase: String,
+    /// For an existing private key: whether it has a passphrase (so the field
+    /// can hint one is set before the value is revealed). Not used when saving.
+    has_passphrase: bool,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -611,6 +614,7 @@ impl SecretForm {
             username: String::new(),
             value: String::new(),
             passphrase: String::new(),
+            has_passphrase: false,
         }
     }
 
@@ -2751,9 +2755,11 @@ impl App {
         self.vault_show_passphrase = false;
         let Some(vault) = self.vault.unlocked() else { return };
         let Some(secret) = vault.get(name) else { return };
-        let (kind, username) = match secret {
-            Secret::Password { username, .. } => (SecretKind::Password, username.clone()),
-            Secret::PrivateKey { username, .. } => (SecretKind::Key, username.clone()),
+        let (kind, username, has_passphrase) = match secret {
+            Secret::Password { username, .. } => (SecretKind::Password, username.clone(), false),
+            Secret::PrivateKey { username, passphrase, .. } => {
+                (SecretKind::Key, username.clone(), passphrase.is_some())
+            }
         };
         self.vault_selected = Some(name.to_owned());
         self.vault_form = Some(SecretForm {
@@ -2763,6 +2769,7 @@ impl App {
             username: username.unwrap_or_default(),
             value: String::new(),
             passphrase: String::new(),
+            has_passphrase,
         });
     }
 
@@ -4642,11 +4649,14 @@ impl App {
                     });
                     ui.add_space(6.0);
                     ui.label("Passphrase:");
+                    // Before reveal we can't show the value, but we know whether
+                    // one is set: dots = set (hidden), "(none)" = no passphrase.
+                    let pp_hint = if form.has_passphrase { "••••••••" } else { "(none)" };
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut form.passphrase)
                                 .password(!show_pass)
-                                .hint_text("(none)")
+                                .hint_text(pp_hint)
                                 .desired_width(300.0),
                         );
                         eye_clicked_pass |= eye_button(ui, show_pass);
@@ -6437,6 +6447,7 @@ impl App {
     fn show_edit_session(&mut self, ctx: &egui::Context) {
         let mut save = false;
         let mut cancel = false;
+        let mut open_in_vault: Option<String> = None;
         let secret_names = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
         let vault_unlocked = self.vault.unlocked().is_some();
         if let Dialog::EditSession(form) = &mut self.dialog {
@@ -6489,21 +6500,31 @@ impl App {
                         match form.source {
                             SecretSource::Existing => {
                                 ui.label("Vault entry");
-                                let selected = form
-                                    .existing_name
-                                    .clone()
-                                    .unwrap_or_else(|| "Choose…".into());
-                                egui::ComboBox::from_id_salt("session-secret")
-                                    .selected_text(selected)
-                                    .show_ui(ui, |ui| {
-                                        for name in &secret_names {
-                                            ui.selectable_value(
-                                                &mut form.existing_name,
-                                                Some(name.clone()),
-                                                name,
-                                            );
-                                        }
-                                    });
+                                ui.horizontal(|ui| {
+                                    let selected = form
+                                        .existing_name
+                                        .clone()
+                                        .unwrap_or_else(|| "Choose…".into());
+                                    egui::ComboBox::from_id_salt("session-secret")
+                                        .selected_text(selected)
+                                        .show_ui(ui, |ui| {
+                                            for name in &secret_names {
+                                                ui.selectable_value(
+                                                    &mut form.existing_name,
+                                                    Some(name.clone()),
+                                                    name,
+                                                );
+                                            }
+                                        });
+                                    if let Some(name) = form.existing_name.clone()
+                                        && ui
+                                            .button("↪ Vault")
+                                            .on_hover_text("Open this credential in the Vault")
+                                            .clicked()
+                                    {
+                                        open_in_vault = Some(name);
+                                    }
+                                });
                                 ui.end_row();
                             }
                             SecretSource::New => {
@@ -6567,6 +6588,11 @@ impl App {
         }
         if cancel {
             self.dialog = Dialog::None;
+        }
+        if let Some(name) = open_in_vault {
+            self.dialog = Dialog::None;
+            self.sidebar_view = SidebarView::Vault;
+            self.select_credential(&name);
         }
     }
 
@@ -7156,6 +7182,7 @@ impl App {
                 username,
                 value: String::new(),
                 passphrase: String::new(),
+                has_passphrase: false,
             });
             state.error = None;
         }
