@@ -775,6 +775,8 @@ pub struct App {
     vault_form: Option<SecretForm>,
     /// Whether the selected credential's value is currently shown (vs. masked).
     vault_show_value: bool,
+    /// Whether the selected key's passphrase is currently shown (vs. masked).
+    vault_show_passphrase: bool,
     /// The window/app icon as a texture, for the custom title bar.
     app_icon: Option<egui::TextureHandle>,
     /// The keybinding action awaiting a new key press (Settings ▸ Keybindings).
@@ -1053,6 +1055,7 @@ impl App {
             vault_selected: None,
             vault_form: None,
             vault_show_value: false,
+            vault_show_passphrase: false,
             app_icon: load_app_icon(ctx),
             keybind_capturing: None,
             filter_sessions: String::new(),
@@ -2587,6 +2590,7 @@ impl App {
             self.vault_selected = None;
             self.vault_form = Some(SecretForm::new());
             self.vault_show_value = true;
+            self.vault_show_passphrase = true;
         }
         if import {
             self.import_vault();
@@ -2744,6 +2748,7 @@ impl App {
     /// Loads the selected credential into an editable form (value left blank).
     fn select_credential(&mut self, name: &str) {
         self.vault_show_value = false;
+        self.vault_show_passphrase = false;
         let Some(vault) = self.vault.unlocked() else { return };
         let Some(secret) = vault.get(name) else { return };
         let (kind, username) = match secret {
@@ -4563,8 +4568,10 @@ impl App {
         };
         let editing = form.original.is_some();
         let show = self.vault_show_value;
+        let show_pass = self.vault_show_passphrase;
         let (mut save, mut delete, mut reveal, mut cancel) = (false, false, false, false);
         let mut eye_clicked = false;
+        let mut eye_clicked_pass = false;
 
         ui.heading(if editing { "Edit credential" } else { "New credential" });
         ui.separator();
@@ -4590,60 +4597,62 @@ impl App {
                 ui.label("Username:");
                 ui.add(egui::TextEdit::singleline(&mut form.username).desired_width(240.0));
                 ui.end_row();
-                let hint = if editing { "(unchanged)" } else { "" };
-                match form.kind {
-                    SecretKind::Password => {
-                        ui.label("Password:");
-                        // When editing, a grey "••••••••" placeholder signals a
-                        // value is stored (and hidden) even before it's revealed.
-                        let pw_hint = if editing { "••••••••" } else { "" };
-                        ui.horizontal(|ui| {
+            });
+
+            // The secret value(s) render outside the grid so a revealed multiline
+            // key grows downward without overlapping the fields below it.
+            ui.add_space(8.0);
+            let dots = if editing { "••••••••" } else { "" };
+            match form.kind {
+                SecretKind::Password => {
+                    ui.label("Password:");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.value)
+                                .password(!show)
+                                .hint_text(dots)
+                                .desired_width(300.0),
+                        );
+                        eye_clicked |= eye_button(ui, show);
+                    });
+                }
+                SecretKind::Key => {
+                    ui.label("Private key:");
+                    ui.horizontal(|ui| {
+                        if show {
                             ui.add(
-                                egui::TextEdit::singleline(&mut form.value)
-                                    .password(!show)
-                                    .hint_text(pw_hint)
-                                    .desired_width(220.0),
+                                egui::TextEdit::multiline(&mut form.value)
+                                    .hint_text(if editing { "" } else { "-----BEGIN ..." })
+                                    .desired_width(360.0)
+                                    .desired_rows(6),
                             );
-                            eye_clicked |= eye_button(ui, show);
-                        });
-                        ui.end_row();
-                    }
-                    SecretKind::Key => {
-                        ui.label("Private key:");
-                        ui.horizontal(|ui| {
-                            if show {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut form.value)
-                                        .hint_text(if editing { hint } else { "-----BEGIN ..." })
-                                        .desired_width(340.0)
-                                        .desired_rows(6),
-                                );
+                        } else {
+                            // Masked placeholder (multiline can't show asterisks).
+                            let mut masked = if form.value.is_empty() && !editing {
+                                "(nothing yet)".to_owned()
                             } else {
-                                // Masked placeholder (multiline can't show asterisks).
-                                let mut masked = if form.value.is_empty() {
-                                    "(hidden)".to_owned()
-                                } else {
-                                    "•".repeat(16)
-                                };
-                                ui.add_enabled(
-                                    false,
-                                    egui::TextEdit::singleline(&mut masked).desired_width(340.0),
-                                );
-                            }
-                            eye_clicked |= eye_button(ui, show);
-                        });
-                        ui.end_row();
-                        ui.label("Passphrase:");
+                                "•".repeat(16)
+                            };
+                            ui.add_enabled(
+                                false,
+                                egui::TextEdit::singleline(&mut masked).desired_width(360.0),
+                            );
+                        }
+                        eye_clicked |= eye_button(ui, show);
+                    });
+                    ui.add_space(6.0);
+                    ui.label("Passphrase:");
+                    ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut form.passphrase)
-                                .password(!show)
-                                .hint_text(hint)
-                                .desired_width(220.0),
+                                .password(!show_pass)
+                                .hint_text("(none)")
+                                .desired_width(300.0),
                         );
-                        ui.end_row();
-                    }
+                        eye_clicked_pass |= eye_button(ui, show_pass);
+                    });
                 }
-            });
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
@@ -4668,6 +4677,16 @@ impl App {
             } else {
                 // Value already in hand (typed or previously revealed) → just show.
                 self.vault_show_value = true;
+            }
+        }
+        if eye_clicked_pass {
+            if show_pass {
+                self.vault_show_passphrase = false;
+            } else if editing && form.value.trim().is_empty() {
+                // Nothing loaded yet → reveal (loads the key and its passphrase).
+                reveal = true;
+            } else {
+                self.vault_show_passphrase = true;
             }
         }
 
@@ -6309,6 +6328,7 @@ impl App {
                         }
                     }
                     self.vault_show_value = true;
+                    self.vault_show_passphrase = true;
                 }
                 self.dialog = Dialog::None;
             }
