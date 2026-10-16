@@ -157,6 +157,57 @@ enum NetTool {
     SubnetScan,
 }
 
+/// Lower-case search terms for the settings a category contains, so the
+/// settings filter can match on content (e.g. "highlights" → Terminal).
+fn settings_category_terms(cat: SettingsCategory) -> &'static [&'static str] {
+    match cat {
+        SettingsCategory::General => &[
+            "multiple instances",
+            "single instance",
+            "startup",
+            "open a local shell on startup",
+            "open web gui",
+            "http",
+            "https",
+            "scheme",
+            "browser",
+        ],
+        SettingsCategory::Tabs => &["new tab", "placement", "duplicate", "far right"],
+        SettingsCategory::Vault => &[
+            "vault",
+            "credentials",
+            "secrets",
+            "manage secrets",
+            "generate key",
+            "key pair",
+            "automatic backup",
+            "back up",
+            "backup folder",
+            "import",
+            "delete",
+        ],
+        SettingsCategory::Terminal => {
+            &["font size", "highlights", "highlight", "regex", "colors", "color rules", "patterns"]
+        }
+        SettingsCategory::Keybindings => {
+            &["keybindings", "shortcuts", "keys", "rebind", "hotkeys"]
+        }
+        SettingsCategory::Extras => &[
+            "environment",
+            "low port",
+            "privileged port",
+            "setcap",
+            "iperf3",
+            "bandwidth",
+            "printing",
+            "cups",
+            "lp",
+            "rdp client",
+            "default web browser",
+        ],
+    }
+}
+
 /// A full-width quick-filter text field with a magnifier hint.
 fn filter_box(ui: &mut egui::Ui, buf: &mut String) {
     ui.add(egui::TextEdit::singleline(buf).hint_text("🔍 filter").desired_width(f32::INFINITY));
@@ -711,8 +762,6 @@ pub struct App {
     vault_selected: Option<String>,
     /// Editable form for the selected credential.
     vault_form: Option<SecretForm>,
-    /// A revealed secret value (name, shown text) after master-password re-auth.
-    vault_reveal: Option<(String, String)>,
     /// The window/app icon as a texture, for the custom title bar.
     app_icon: Option<egui::TextureHandle>,
     /// The keybinding action awaiting a new key press (Settings ▸ Keybindings).
@@ -990,7 +1039,6 @@ impl App {
             tools_item: ToolsItem::default(),
             vault_selected: None,
             vault_form: None,
-            vault_reveal: None,
             app_icon: load_app_icon(ctx),
             keybind_capturing: None,
             filter_sessions: String::new(),
@@ -2417,15 +2465,30 @@ impl App {
         filter_box(ui, &mut self.filter_settings);
         ui.separator();
         let needle = self.filter_settings.to_lowercase();
-        for (cat, label) in [
+        let all = [
             (SettingsCategory::General, "General"),
             (SettingsCategory::Tabs, "Tabs"),
             (SettingsCategory::Vault, "Vault"),
             (SettingsCategory::Terminal, "Terminal"),
             (SettingsCategory::Keybindings, "Keybindings"),
             (SettingsCategory::Extras, "Extras"),
-        ] {
-            if needle.is_empty() || label.to_lowercase().contains(&needle) {
+        ];
+        // A category matches on its name or the terms of the settings it holds.
+        let matches = |cat: SettingsCategory, label: &str| {
+            needle.is_empty()
+                || label.to_lowercase().contains(&needle)
+                || settings_category_terms(cat).iter().any(|t| t.contains(needle.as_str()))
+        };
+        // If the active category is filtered out, jump to the first match so the
+        // matching setting is actually shown in the content pane.
+        if !needle.is_empty()
+            && !all.iter().any(|&(c, l)| c == self.settings_category && matches(c, l))
+            && let Some(&(first, _)) = all.iter().find(|&&(c, l)| matches(c, l))
+        {
+            self.settings_category = first;
+        }
+        for (cat, label) in all {
+            if matches(cat, label) {
                 ui.selectable_value(&mut self.settings_category, cat, label);
             }
         }
@@ -2508,7 +2571,6 @@ impl App {
         });
         if new_credential {
             self.vault_selected = None;
-            self.vault_reveal = None;
             self.vault_form = Some(SecretForm::new());
         }
         if import {
@@ -2607,7 +2669,6 @@ impl App {
 
     /// Loads the selected credential into an editable form (value left blank).
     fn select_credential(&mut self, name: &str) {
-        self.vault_reveal = None;
         let Some(vault) = self.vault.unlocked() else { return };
         let Some(secret) = vault.get(name) else { return };
         let (kind, username) = match secret {
@@ -4487,20 +4548,12 @@ impl App {
 
             if editing {
                 ui.add_space(6.0);
-                if ui.button("👁 Show password/key").clicked() {
-                    reveal = true;
-                }
-                if let Some((name, value)) = &self.vault_reveal
-                    && Some(name.as_str()) == form.original.as_deref()
+                if ui
+                    .button("👁 Show password/key")
+                    .on_hover_text("Reveal the stored value in the field above (asks for the master password)")
+                    .clicked()
                 {
-                    let mut shown = value.clone();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut shown)
-                            .desired_width(360.0)
-                            .desired_rows(3)
-                            .font(egui::TextStyle::Monospace)
-                            .interactive(false),
-                    );
+                    reveal = true;
                 }
             }
             ui.separator();
@@ -4520,7 +4573,6 @@ impl App {
         if cancel {
             self.vault_form = None;
             self.vault_selected = None;
-            self.vault_reveal = None;
             return;
         }
         if delete {
@@ -4536,7 +4588,6 @@ impl App {
             }
             self.vault_form = None;
             self.vault_selected = None;
-            self.vault_reveal = None;
             return;
         }
         if reveal {
@@ -4550,7 +4601,6 @@ impl App {
             match self.save_vault_credential(&form) {
                 Ok(saved_name) => {
                     self.vault_selected = Some(saved_name.clone());
-                    self.vault_reveal = None;
                     // Reload the form so it reflects the saved (now-existing) entry.
                     self.select_credential(&saved_name);
                 }
@@ -6145,19 +6195,20 @@ impl App {
         match Vault::open(self.vault_path.clone(), password) {
             Ok(_) => {
                 let name = name.clone();
-                let value = self.vault.unlocked().and_then(|v| v.get(&name)).map(|s| match s {
-                    Secret::Password { password, .. } => password.clone(),
-                    Secret::PrivateKey { pem, .. } => pem.clone(),
-                });
-                match value {
-                    Some(v) => {
-                        self.vault_reveal = Some((name, v));
-                        self.dialog = Dialog::None;
-                    }
-                    None => {
-                        self.dialog = Dialog::None;
+                // Populate the revealed value straight into the edit form fields.
+                if let Some(secret) = self.vault.unlocked().and_then(|v| v.get(&name)).cloned()
+                    && let Some(form) = &mut self.vault_form
+                    && form.original.as_deref() == Some(name.as_str())
+                {
+                    match &secret {
+                        Secret::Password { password, .. } => form.value = password.clone(),
+                        Secret::PrivateKey { pem, passphrase, .. } => {
+                            form.value = pem.clone();
+                            form.passphrase = passphrase.clone().unwrap_or_default();
+                        }
                     }
                 }
+                self.dialog = Dialog::None;
             }
             Err(VaultError::BadPassword) => *error = Some("Incorrect master password.".into()),
             Err(e) => *error = Some(format!("{e}")),
