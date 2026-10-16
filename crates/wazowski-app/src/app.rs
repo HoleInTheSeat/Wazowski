@@ -208,6 +208,17 @@ fn settings_category_terms(cat: SettingsCategory) -> &'static [&'static str] {
     }
 }
 
+/// A small show/hide toggle button: an eye, struck through when the value is
+/// currently shown. Returns whether it was clicked.
+fn eye_button(ui: &mut egui::Ui, shown: bool) -> bool {
+    let (text, tip) = if shown {
+        (RichText::new("👁").strikethrough(), "Hide password/key")
+    } else {
+        (RichText::new("👁"), "Show password/key (asks for the master password)")
+    };
+    ui.button(text).on_hover_text(tip).clicked()
+}
+
 /// A full-width quick-filter text field with a magnifier hint.
 fn filter_box(ui: &mut egui::Ui, buf: &mut String) {
     ui.add(egui::TextEdit::singleline(buf).hint_text("🔍 filter").desired_width(f32::INFINITY));
@@ -762,6 +773,8 @@ pub struct App {
     vault_selected: Option<String>,
     /// Editable form for the selected credential.
     vault_form: Option<SecretForm>,
+    /// Whether the selected credential's value is currently shown (vs. masked).
+    vault_show_value: bool,
     /// The window/app icon as a texture, for the custom title bar.
     app_icon: Option<egui::TextureHandle>,
     /// The keybinding action awaiting a new key press (Settings ▸ Keybindings).
@@ -1039,6 +1052,7 @@ impl App {
             tools_item: ToolsItem::default(),
             vault_selected: None,
             vault_form: None,
+            vault_show_value: false,
             app_icon: load_app_icon(ctx),
             keybind_capturing: None,
             filter_sessions: String::new(),
@@ -2572,6 +2586,7 @@ impl App {
         if new_credential {
             self.vault_selected = None;
             self.vault_form = Some(SecretForm::new());
+            self.vault_show_value = true;
         }
         if import {
             self.import_vault();
@@ -2631,7 +2646,13 @@ impl App {
             (p, k)
         };
 
-        let mut clicked: Option<String> = None;
+        enum RowAct {
+            Open(String),
+            Duplicate(String),
+            Delete(String),
+        }
+        let mut act: Option<RowAct> = None;
+        let selected_name = self.vault_selected.clone();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if passwords.is_empty() && keys.is_empty() {
                 let msg = if needle.is_empty() {
@@ -2641,34 +2662,88 @@ impl App {
                 };
                 ui.label(RichText::new(msg).weak());
             }
+            // One credential row with its right-click menu.
+            let mut row = |ui: &mut egui::Ui, label: String, name: &str| {
+                let selected = selected_name.as_deref() == Some(name);
+                let resp = ui.selectable_label(selected, label);
+                if resp.clicked() {
+                    act = Some(RowAct::Open(name.to_owned()));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Edit").clicked() {
+                        act = Some(RowAct::Open(name.to_owned()));
+                        ui.close();
+                    }
+                    if ui.button("Duplicate").clicked() {
+                        act = Some(RowAct::Duplicate(name.to_owned()));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Delete").clicked() {
+                        act = Some(RowAct::Delete(name.to_owned()));
+                        ui.close();
+                    }
+                });
+            };
             if !passwords.is_empty() {
                 ui.add_space(2.0);
                 ui.label(RichText::new("Passwords").strong());
                 for name in &passwords {
-                    let selected = self.vault_selected.as_deref() == Some(name.as_str());
-                    if ui.selectable_label(selected, format!("🔑 {name}")).clicked() {
-                        clicked = Some(name.clone());
-                    }
+                    row(ui, format!("🔑 {name}"), name);
                 }
             }
             if !keys.is_empty() {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Private keys").strong());
                 for name in &keys {
-                    let selected = self.vault_selected.as_deref() == Some(name.as_str());
-                    if ui.selectable_label(selected, format!("🗝 {name}")).clicked() {
-                        clicked = Some(name.clone());
-                    }
+                    row(ui, format!("🗝 {name}"), name);
                 }
             }
         });
-        if let Some(name) = clicked {
-            self.select_credential(&name);
+        match act {
+            Some(RowAct::Open(name)) => self.select_credential(&name),
+            Some(RowAct::Duplicate(name)) => self.duplicate_credential(&name),
+            Some(RowAct::Delete(name)) => self.delete_credential_named(&name),
+            None => {}
+        }
+    }
+
+    /// Copies a credential to a new, unique name (e.g. "name copy") and selects it.
+    fn duplicate_credential(&mut self, name: &str) {
+        let Some(secret) = self.vault.unlocked().and_then(|v| v.get(name)).cloned() else { return };
+        let existing: Vec<String> = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
+        let mut new_name = format!("{name} copy");
+        let mut n = 2;
+        while existing.iter().any(|e| e == &new_name) {
+            new_name = format!("{name} copy {n}");
+            n += 1;
+        }
+        if let Some(vault) = self.vault.unlocked_mut() {
+            if let Err(e) = vault.put(&new_name, secret) {
+                self.error = Some(format!("{e:#}"));
+                return;
+            }
+            self.select_credential(&new_name);
+        }
+    }
+
+    /// Deletes a credential by name, clearing the editor if it was selected.
+    fn delete_credential_named(&mut self, name: &str) {
+        if let Some(vault) = self.vault.unlocked_mut()
+            && let Err(e) = vault.remove(name)
+        {
+            self.error = Some(format!("{e:#}"));
+            return;
+        }
+        if self.vault_selected.as_deref() == Some(name) {
+            self.vault_selected = None;
+            self.vault_form = None;
         }
     }
 
     /// Loads the selected credential into an editable form (value left blank).
     fn select_credential(&mut self, name: &str) {
+        self.vault_show_value = false;
         let Some(vault) = self.vault.unlocked() else { return };
         let Some(secret) = vault.get(name) else { return };
         let (kind, username) = match secret {
@@ -4487,7 +4562,9 @@ impl App {
             return;
         };
         let editing = form.original.is_some();
+        let show = self.vault_show_value;
         let (mut save, mut delete, mut reveal, mut cancel) = (false, false, false, false);
+        let mut eye_clicked = false;
 
         ui.heading(if editing { "Edit credential" } else { "New credential" });
         ui.separator();
@@ -4517,45 +4594,56 @@ impl App {
                 match form.kind {
                     SecretKind::Password => {
                         ui.label("Password:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut form.value)
-                                .password(true)
-                                .hint_text(hint)
-                                .desired_width(240.0),
-                        );
+                        // When editing, a grey "••••••••" placeholder signals a
+                        // value is stored (and hidden) even before it's revealed.
+                        let pw_hint = if editing { "••••••••" } else { "" };
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.value)
+                                    .password(!show)
+                                    .hint_text(pw_hint)
+                                    .desired_width(220.0),
+                            );
+                            eye_clicked |= eye_button(ui, show);
+                        });
                         ui.end_row();
                     }
                     SecretKind::Key => {
                         ui.label("Private key:");
-                        ui.add(
-                            egui::TextEdit::multiline(&mut form.value)
-                                .hint_text(if editing { hint } else { "-----BEGIN ..." })
-                                .desired_width(360.0)
-                                .desired_rows(6),
-                        );
+                        ui.horizontal(|ui| {
+                            if show {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut form.value)
+                                        .hint_text(if editing { hint } else { "-----BEGIN ..." })
+                                        .desired_width(340.0)
+                                        .desired_rows(6),
+                                );
+                            } else {
+                                // Masked placeholder (multiline can't show asterisks).
+                                let mut masked = if form.value.is_empty() {
+                                    "(hidden)".to_owned()
+                                } else {
+                                    "•".repeat(16)
+                                };
+                                ui.add_enabled(
+                                    false,
+                                    egui::TextEdit::singleline(&mut masked).desired_width(340.0),
+                                );
+                            }
+                            eye_clicked |= eye_button(ui, show);
+                        });
                         ui.end_row();
                         ui.label("Passphrase:");
                         ui.add(
                             egui::TextEdit::singleline(&mut form.passphrase)
-                                .password(true)
+                                .password(!show)
                                 .hint_text(hint)
-                                .desired_width(240.0),
+                                .desired_width(220.0),
                         );
                         ui.end_row();
                     }
                 }
             });
-
-            if editing {
-                ui.add_space(6.0);
-                if ui
-                    .button("👁 Show password/key")
-                    .on_hover_text("Reveal the stored value in the field above (asks for the master password)")
-                    .clicked()
-                {
-                    reveal = true;
-                }
-            }
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
@@ -4569,6 +4657,19 @@ impl App {
                 }
             });
         });
+
+        if eye_clicked {
+            if show {
+                // Currently shown → hide.
+                self.vault_show_value = false;
+            } else if editing && form.value.trim().is_empty() {
+                // Value not loaded yet → re-authenticate, then reveal.
+                reveal = true;
+            } else {
+                // Value already in hand (typed or previously revealed) → just show.
+                self.vault_show_value = true;
+            }
+        }
 
         if cancel {
             self.vault_form = None;
@@ -6207,6 +6308,7 @@ impl App {
                             form.passphrase = passphrase.clone().unwrap_or_default();
                         }
                     }
+                    self.vault_show_value = true;
                 }
                 self.dialog = Dialog::None;
             }
