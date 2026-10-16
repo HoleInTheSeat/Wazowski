@@ -2402,6 +2402,34 @@ impl App {
             ui.end_row();
         });
 
+        // Preferred RDP client for the session "Open RDP" action.
+        let installed: Vec<&'static str> =
+            RDP_CLIENTS.iter().copied().filter(|c| has_bin(c)).collect();
+        if !installed.is_empty() {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Preferred RDP client:");
+                let current = self.settings.rdp_client.clone().unwrap_or_else(|| "Auto".into());
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("rdp-client").selected_text(current).show_ui(ui, |ui| {
+                    if ui.selectable_label(self.settings.rdp_client.is_none(), "Auto").clicked() {
+                        self.settings.rdp_client = None;
+                        changed = true;
+                    }
+                    for c in &installed {
+                        let sel = self.settings.rdp_client.as_deref() == Some(*c);
+                        if ui.selectable_label(sel, *c).clicked() {
+                            self.settings.rdp_client = Some((*c).to_owned());
+                            changed = true;
+                        }
+                    }
+                });
+                if changed && let Err(e) = self.settings.save() {
+                    self.error = Some(format!("Could not save settings: {e:#}"));
+                }
+            });
+        }
+
         ui.add_space(6.0);
         if ui.button("Re-check").clicked() {
             *action = Some(ExtrasAction::Recheck);
@@ -3123,6 +3151,12 @@ impl App {
             TreeAction::NetworkTool(store, id, tool) => {
                 if let Some(session) = self.session_in(&store, &id) {
                     self.session_network_tool(&session.host, tool);
+                }
+                Ok(())
+            }
+            TreeAction::OpenRdp(store, id) => {
+                if let Some(session) = self.session_in(&store, &id) {
+                    self.launch_rdp(&session.host, &session.username);
                 }
                 Ok(())
             }
@@ -4107,6 +4141,34 @@ impl App {
                         Some(format!("Could not resolve {host} to an IPv4 address."));
                 }
             },
+        }
+    }
+
+    /// Launches an external RDP client for `host` (using the session's username
+    /// when present). Uses the preferred client from Settings if it's still
+    /// installed, else the first detected one; prompts to install if none.
+    fn launch_rdp(&mut self, host: &str, username: &str) {
+        if host.trim().is_empty() {
+            self.error = Some("This session has no host to open over RDP.".into());
+            return;
+        }
+        let client = self
+            .settings
+            .rdp_client
+            .clone()
+            .filter(|c| has_bin(c))
+            .or_else(detect_rdp_client);
+        let Some(client) = client else {
+            self.error = Some(format!(
+                "No RDP client found. Install one of: {} (see Settings ▸ Extras).",
+                RDP_CLIENTS.join(", ")
+            ));
+            return;
+        };
+        let args = rdp_command(&client, host, username);
+        match std::process::Command::new(&client).args(&args).spawn() {
+            Ok(_) => {}
+            Err(e) => self.error = Some(format!("Could not launch {client}: {e}")),
         }
     }
 
@@ -7528,6 +7590,7 @@ enum TreeAction {
     Connect(StoreId, String),
     ConnectAs(StoreId, String),
     OpenWebGui(StoreId, String),
+    OpenRdp(StoreId, String),
     NetworkTool(StoreId, String, NetTool),
     Edit(StoreId, String),
     Delete(StoreId, String),
@@ -7877,6 +7940,10 @@ fn session_row(
             *action = Some(TreeAction::OpenWebGui(store.clone(), id.to_owned()));
             ui.close();
         }
+        if ui.button("Open RDP").clicked() {
+            *action = Some(TreeAction::OpenRdp(store.clone(), id.to_owned()));
+            ui.close();
+        }
         ui.menu_button("Network tools", |ui| {
             for (label, tool) in [
                 ("Ping", NetTool::Ping),
@@ -7935,6 +8002,32 @@ fn web_gui_url(host: &str, scheme: WebScheme) -> String {
         host.to_owned()
     } else {
         format!("{}{host}", scheme.prefix())
+    }
+}
+
+/// Builds the argument list to launch an RDP client against `host`/`username`.
+/// The client's binary name selects the argument style (FreeRDP, Remmina, or
+/// the Windows `mstsc`); unknown clients fall back to the FreeRDP style.
+fn rdp_command(client: &str, host: &str, username: &str) -> Vec<String> {
+    let host = host.trim();
+    let user = username.trim();
+    let base = client.rsplit(['/', '\\']).next().unwrap_or(client);
+    if base.starts_with("remmina") {
+        let uri = if user.is_empty() {
+            format!("rdp://{host}")
+        } else {
+            format!("rdp://{user}@{host}")
+        };
+        vec!["-c".to_owned(), uri]
+    } else if base.starts_with("mstsc") {
+        vec![format!("/v:{host}")]
+    } else {
+        // FreeRDP family (xfreerdp / xfreerdp3 / wlfreerdp) and fallback.
+        let mut args = vec![format!("/v:{host}")];
+        if !user.is_empty() {
+            args.push(format!("/u:{user}"));
+        }
+        args
     }
 }
 
@@ -8243,5 +8336,19 @@ mod tests {
         assert_eq!(web_gui_url("http://10.0.0.1", WebScheme::Https), "http://10.0.0.1");
         assert_eq!(web_gui_url("https://nas:8443", WebScheme::Http), "https://nas:8443");
         assert_eq!(web_gui_url("  10.0.0.1/  ", WebScheme::Https), "https://10.0.0.1");
+    }
+
+    #[test]
+    fn rdp_command_freerdp_style() {
+        assert_eq!(rdp_command("xfreerdp", "10.0.0.5", "admin"), ["/v:10.0.0.5", "/u:admin"]);
+        assert_eq!(rdp_command("/usr/bin/xfreerdp3", "host", ""), ["/v:host"]);
+        assert_eq!(rdp_command("wlfreerdp", "host", "u"), ["/v:host", "/u:u"]);
+    }
+
+    #[test]
+    fn rdp_command_remmina_and_mstsc() {
+        assert_eq!(rdp_command("remmina", "host", "bob"), ["-c", "rdp://bob@host"]);
+        assert_eq!(rdp_command("remmina", "host", ""), ["-c", "rdp://host"]);
+        assert_eq!(rdp_command("mstsc", "host", "bob"), ["/v:host"]);
     }
 }
