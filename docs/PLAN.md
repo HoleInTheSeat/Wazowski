@@ -163,8 +163,12 @@ Agreed "do next" items (rough order TBD with the user):
   client (FreeRDP / Remmina / Windows mstsc for RDP; vncviewer / TigerVNC /
   Remmina / macOS Screen Sharing for VNC) with host:port, plus username/domain
   for RDP. Preferred clients are configurable in Settings ▸ Extras (Auto or a
-  specific one), which also reports whether each is installed. RDP/VNC store no
-  vault credentials — the external client handles its own auth.
+  specific one), which also reports whether each is installed. RDP/VNC can
+  reference a vault Password credential; the password is handed to the client
+  over stdin (FreeRDP `/from-stdin`, TigerVNC `-autopass`) so it never appears
+  in the process list (other clients prompt). RDP also supports "Connect as…"
+  for one-off credentials. Session types have distinct default colors
+  (SSH default/white, RDP blue, VNC orange).
   (Follow-up: RDP resolution/gateway options, VNC quality options.)
 - **Visual polish / "make the UI cooler"** — themes, fonts, animations; done last.
 

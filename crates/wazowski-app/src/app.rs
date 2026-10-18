@@ -1445,9 +1445,19 @@ impl App {
         match session.protocol {
             Protocol::Ssh => self.start_connect(session, ctx),
             Protocol::Rdp => {
-                self.launch_rdp(&session.host, session.port, &session.username, &session.domain)
+                let (user, password) = self.resolve_launch_creds(session);
+                self.launch_rdp(
+                    &session.host,
+                    session.port,
+                    &user,
+                    &session.domain,
+                    password.as_deref(),
+                );
             }
-            Protocol::Vnc => self.launch_vnc(&session.host, session.port),
+            Protocol::Vnc => {
+                let (_user, password) = self.resolve_launch_creds(session);
+                self.launch_vnc(&session.host, session.port, password.as_deref());
+            }
         }
     }
 
@@ -4193,10 +4203,34 @@ impl App {
         }
     }
 
+    /// Resolves a session's launch credentials from the vault: the username to
+    /// use (the credential's own username overrides the session's when the
+    /// session has none) and the password, when the vault is unlocked and the
+    /// session references a stored Password. Missing/locked → no password (the
+    /// external client prompts).
+    fn resolve_launch_creds(&self, session: &Session) -> (String, Option<String>) {
+        let mut user = session.username.clone();
+        let mut password = None;
+        if let Auth::Password { secret } = &session.auth
+            && !secret.is_empty()
+            && let Some(vault) = self.vault.unlocked()
+            && let Some(Secret::Password { username, password: pw }) = vault.get(secret)
+        {
+            if user.is_empty()
+                && let Some(u) = username
+            {
+                user = u.clone();
+            }
+            password = Some(pw.clone());
+        }
+        (user, password)
+    }
+
     /// Launches an external RDP client for `host:port` (using the session's
-    /// username/domain when present). Uses the preferred client from Settings if
-    /// still installed, else the first detected one; prompts to install if none.
-    fn launch_rdp(&mut self, host: &str, port: u16, username: &str, domain: &str) {
+    /// username/domain when present, and a vault password when available). Uses
+    /// the preferred client from Settings if still installed, else the first
+    /// detected one; prompts to install if none.
+    fn launch_rdp(&mut self, host: &str, port: u16, username: &str, domain: &str, password: Option<&str>) {
         if host.trim().is_empty() {
             self.error = Some("This session has no host to open over RDP.".into());
             return;
@@ -4214,16 +4248,18 @@ impl App {
             ));
             return;
         };
-        let args = rdp_command(&client, host, port, username, domain);
-        match std::process::Command::new(&client).args(&args).spawn() {
-            Ok(_) => {}
-            Err(e) => self.error = Some(format!("Could not launch {client}: {e}")),
+        let (args, stdin) = rdp_command(&client, host, port, username, domain, password);
+        let mut cmd = std::process::Command::new(&client);
+        cmd.args(&args);
+        if let Err(e) = spawn_client(cmd, stdin) {
+            self.error = Some(format!("Could not launch {client}: {e}"));
         }
     }
 
-    /// Launches an external VNC viewer for `host:port`. Uses the preferred client
-    /// from Settings if still installed, else the first detected one.
-    fn launch_vnc(&mut self, host: &str, port: u16) {
+    /// Launches an external VNC viewer for `host:port` (with a vault password
+    /// when available). Uses the preferred client from Settings if still
+    /// installed, else the first detected one.
+    fn launch_vnc(&mut self, host: &str, port: u16, password: Option<&str>) {
         if host.trim().is_empty() {
             self.error = Some("This session has no host to open over VNC.".into());
             return;
@@ -4241,10 +4277,11 @@ impl App {
             ));
             return;
         };
-        let args = vnc_command(&client, host, port);
-        match std::process::Command::new(&client).args(&args).spawn() {
-            Ok(_) => {}
-            Err(e) => self.error = Some(format!("Could not launch {client}: {e}")),
+        let (args, stdin) = vnc_command(&client, host, port, password);
+        let mut cmd = std::process::Command::new(&client);
+        cmd.args(&args);
+        if let Err(e) = spawn_client(cmd, stdin) {
+            self.error = Some(format!("Could not launch {client}: {e}"));
         }
     }
 
@@ -5034,6 +5071,13 @@ impl App {
                     .unwrap_or(StoreId::Local);
                 let _ = self.store_upsert(&store, session.clone());
             }
+        }
+        // RDP launches the external client with the one-off credentials; SSH
+        // opens a terminal tab.
+        if session.protocol == Protocol::Rdp {
+            let pw = (!form.password.is_empty()).then(|| form.password.clone());
+            self.launch_rdp(&session.host, session.port, &username, &session.domain, pw.as_deref());
+            return;
         }
         let resolved = ResolvedAuth {
             material: AuthMaterial::Password(form.password),
@@ -6728,7 +6772,59 @@ impl App {
                             }
                         }
                     }
-                    } // end SSH-only auth section
+                    } else {
+                        // RDP/VNC: an optional vault Password credential. Leaving
+                        // it blank lets the external client prompt instead.
+                        ui.label("Credential");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut form.source,
+                                SecretSource::Existing,
+                                "From vault",
+                            );
+                            ui.selectable_value(&mut form.source, SecretSource::New, "New");
+                        });
+                        ui.end_row();
+                        match form.source {
+                            SecretSource::Existing => {
+                                ui.label("Vault entry");
+                                ui.horizontal(|ui| {
+                                    let selected = form
+                                        .existing_name
+                                        .clone()
+                                        .unwrap_or_else(|| "Choose…".into());
+                                    egui::ComboBox::from_id_salt("session-secret-rv")
+                                        .selected_text(selected)
+                                        .show_ui(ui, |ui| {
+                                            for name in &secret_names {
+                                                ui.selectable_value(
+                                                    &mut form.existing_name,
+                                                    Some(name.clone()),
+                                                    name,
+                                                );
+                                            }
+                                        });
+                                    if let Some(name) = form.existing_name.clone()
+                                        && ui
+                                            .button("↪ Vault")
+                                            .on_hover_text("Open this credential in the Vault")
+                                            .clicked()
+                                    {
+                                        open_in_vault = Some(name);
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            SecretSource::New => {
+                                ui.label("Save as");
+                                line(ui, &mut form.new_name, false);
+                                ui.end_row();
+                                ui.label("Password");
+                                line(ui, &mut form.secret_input, true);
+                                ui.end_row();
+                            }
+                        }
+                    } // end credential section
                 });
                 if form.protocol == Protocol::Ssh {
                     ui.add_space(4.0);
@@ -6748,10 +6844,11 @@ impl App {
                     Protocol::Vnc => "👁",
                 };
                 appearance_picker(ui, &mut form.icon, &mut form.color, default_icon);
-                if form.protocol == Protocol::Ssh
-                    && form.method != AuthMethod::Agent
-                    && !vault_unlocked
-                {
+                let uses_vault = match form.protocol {
+                    Protocol::Ssh => form.method != AuthMethod::Agent,
+                    Protocol::Rdp | Protocol::Vnc => true,
+                };
+                if uses_vault && !vault_unlocked {
                     ui.colored_label(
                         Color32::LIGHT_YELLOW,
                         "Unlock or create the vault to use saved credentials.",
@@ -6830,9 +6927,12 @@ impl App {
         session.icon = icon;
         session.color = color;
 
-        // RDP/VNC connect through an external client that handles its own
-        // credentials, so they store no vault reference (treated like agent auth).
-        session.auth = if protocol != Protocol::Ssh || method == AuthMethod::Agent {
+        // SSH supports agent/password/key; RDP/VNC only an optional vault
+        // Password (the external client handles the rest). A blank credential
+        // means "prompt at connect time".
+        let effective_method =
+            if protocol == Protocol::Ssh { method } else { AuthMethod::Password };
+        session.auth = if protocol == Protocol::Ssh && method == AuthMethod::Agent {
             Auth::Agent
         } else {
             // Resolve the vault entry name this session should reference. An empty
@@ -6851,7 +6951,7 @@ impl App {
                     if !secret_input.is_empty() {
                         // Store the session's username with the credential.
                         let cred_user = (!username.is_empty()).then(|| username.clone());
-                        let secret = match method {
+                        let secret = match effective_method {
                             AuthMethod::Password => {
                                 Secret::Password { username: cred_user, password: secret_input }
                             }
@@ -6869,7 +6969,7 @@ impl App {
                     } else if self.vault.unlocked().and_then(|v| v.get(&secret_name)).is_some() {
                         // Keep referencing the existing entry.
                         secret_name
-                    } else if method == AuthMethod::Password {
+                    } else if effective_method == AuthMethod::Password {
                         // Blank password with no entry: prompt at connect time.
                         String::new()
                     } else {
@@ -6879,7 +6979,7 @@ impl App {
                     }
                 }
             };
-            match method {
+            match effective_method {
                 AuthMethod::Password => Auth::Password { secret: secret_name },
                 AuthMethod::Key => Auth::Key { secret: secret_name },
                 AuthMethod::Agent => unreachable!("agent handled above"),
@@ -8078,8 +8178,15 @@ fn session_row(
     let text = {
         let t = RichText::new(format!("{icon} {name}"));
         match row.color {
+            // An explicit per-session color wins.
             Some([r, g, b]) => t.color(Color32::from_rgb(r, g, b)),
-            None => t,
+            // Otherwise distinguish types by a default color (SSH keeps the
+            // theme's default text color, which reads white on the dark theme).
+            None => match row.protocol {
+                Protocol::Ssh => t,
+                Protocol::Rdp => t.color(Color32::from_rgb(90, 170, 255)),
+                Protocol::Vnc => t.color(Color32::from_rgb(240, 160, 60)),
+            },
         }
     };
     // The row drags with the primary button; right-click still opens the menu.
@@ -8093,7 +8200,7 @@ fn session_row(
             *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
             ui.close();
         }
-        if row.protocol == Protocol::Ssh && ui.button("Connect as…").clicked() {
+        if row.protocol != Protocol::Vnc && ui.button("Connect as…").clicked() {
             *action = Some(TreeAction::ConnectAs(store.clone(), id.to_owned()));
             ui.close();
         }
@@ -8162,10 +8269,19 @@ fn web_gui_url(host: &str, scheme: WebScheme) -> String {
     }
 }
 
-/// Builds the argument list to launch an RDP client against `host:port`.
-/// The client's binary name selects the argument style (FreeRDP, Remmina, or
-/// the Windows `mstsc`); unknown clients fall back to the FreeRDP style.
-fn rdp_command(client: &str, host: &str, port: u16, username: &str, domain: &str) -> Vec<String> {
+/// Builds the args to launch an RDP client against `host:port`, plus an optional
+/// string to feed on the client's stdin (used to pass a password without
+/// exposing it in the process list). The binary name selects the style
+/// (FreeRDP, Remmina, Windows `mstsc`); FreeRDP reads the password via
+/// `/from-stdin`, the others prompt for it themselves.
+fn rdp_command(
+    client: &str,
+    host: &str,
+    port: u16,
+    username: &str,
+    domain: &str,
+    password: Option<&str>,
+) -> (Vec<String>, Option<String>) {
     let host = host.trim();
     let user = username.trim();
     let domain = domain.trim();
@@ -8177,9 +8293,9 @@ fn rdp_command(client: &str, host: &str, port: u16, username: &str, domain: &str
         } else {
             format!("rdp://{user}@{authority}")
         };
-        vec!["-c".to_owned(), uri]
+        (vec!["-c".to_owned(), uri], None)
     } else if base.starts_with("mstsc") {
-        vec![format!("/v:{authority}")]
+        (vec![format!("/v:{authority}")], None)
     } else {
         // FreeRDP family (xfreerdp / xfreerdp3 / wlfreerdp) and fallback.
         let mut args = vec![format!("/v:{authority}")];
@@ -8189,7 +8305,13 @@ fn rdp_command(client: &str, host: &str, port: u16, username: &str, domain: &str
         if !domain.is_empty() {
             args.push(format!("/d:{domain}"));
         }
-        args
+        match password {
+            Some(pw) if !pw.is_empty() => {
+                args.push("/from-stdin".to_owned());
+                (args, Some(pw.to_owned()))
+            }
+            _ => (args, None),
+        }
     }
 }
 
@@ -8207,19 +8329,46 @@ fn detect_vnc_client() -> Option<String> {
     VNC_CLIENTS.iter().find(|name| has_bin(name)).map(|name| (*name).to_owned())
 }
 
-/// Builds the argument list to launch a VNC viewer against `host:port`. The
-/// binary name selects the style: Remmina (vnc:// URI), macOS `open` (vnc://
-/// URL), or the common `vncviewer`/TigerVNC `host::port` form.
-fn vnc_command(client: &str, host: &str, port: u16) -> Vec<String> {
+/// Builds the args to launch a VNC viewer against `host:port`, plus an optional
+/// string to feed on the viewer's stdin. TigerVNC's `vncviewer` reads the
+/// password from stdin with `-autopass`; Remmina and macOS `open` prompt.
+fn vnc_command(
+    client: &str,
+    host: &str,
+    port: u16,
+    password: Option<&str>,
+) -> (Vec<String>, Option<String>) {
     let host = host.trim();
     let base = client.rsplit(['/', '\\']).next().unwrap_or(client);
     if base.starts_with("remmina") {
-        vec!["-c".to_owned(), format!("vnc://{host}:{port}")]
+        (vec!["-c".to_owned(), format!("vnc://{host}:{port}")], None)
     } else if base == "open" {
-        vec![format!("vnc://{host}:{port}")]
+        (vec![format!("vnc://{host}:{port}")], None)
     } else {
-        // vncviewer / xtigervncviewer: explicit "host::port".
-        vec![format!("{host}::{port}")]
+        // vncviewer / xtigervncviewer: explicit "host::port", password via stdin.
+        match password {
+            Some(pw) if !pw.is_empty() => {
+                (vec!["-autopass".to_owned(), format!("{host}::{port}")], Some(pw.to_owned()))
+            }
+            _ => (vec![format!("{host}::{port}")], None),
+        }
+    }
+}
+
+/// Spawns a GUI client detached, optionally writing `stdin_data` (a password) to
+/// its stdin so it never appears in the process list. Returns a launch error.
+fn spawn_client(mut cmd: std::process::Command, stdin_data: Option<String>) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(data) = stdin_data {
+        cmd.stdin(std::process::Stdio::piped());
+        let mut child = cmd.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{data}");
+        }
+        // stdin dropped here → EOF; the GUI child keeps running detached.
+        Ok(())
+    } else {
+        cmd.spawn().map(|_| ())
     }
 }
 
@@ -8533,28 +8682,54 @@ mod tests {
     #[test]
     fn rdp_command_freerdp_style() {
         assert_eq!(
-            rdp_command("xfreerdp", "10.0.0.5", 3389, "admin", ""),
-            ["/v:10.0.0.5", "/u:admin"]
+            rdp_command("xfreerdp", "10.0.0.5", 3389, "admin", "", None),
+            (vec!["/v:10.0.0.5".to_owned(), "/u:admin".to_owned()], None)
         );
-        assert_eq!(rdp_command("/usr/bin/xfreerdp3", "host", 3389, "", ""), ["/v:host"]);
         assert_eq!(
-            rdp_command("wlfreerdp", "host", 3390, "u", "CORP"),
-            ["/v:host:3390", "/u:u", "/d:CORP"]
+            rdp_command("/usr/bin/xfreerdp3", "host", 3389, "", "", None),
+            (vec!["/v:host".to_owned()], None)
         );
+        assert_eq!(
+            rdp_command("wlfreerdp", "host", 3390, "u", "CORP", None),
+            (vec!["/v:host:3390".to_owned(), "/u:u".to_owned(), "/d:CORP".to_owned()], None)
+        );
+    }
+
+    #[test]
+    fn rdp_command_password_via_stdin() {
+        let (args, stdin) = rdp_command("xfreerdp", "host", 3389, "u", "", Some("s3cret"));
+        assert_eq!(args, ["/v:host", "/u:u", "/from-stdin"]);
+        assert_eq!(stdin.as_deref(), Some("s3cret"));
     }
 
     #[test]
     fn rdp_command_remmina_and_mstsc() {
-        assert_eq!(rdp_command("remmina", "host", 3389, "bob", ""), ["-c", "rdp://bob@host"]);
-        assert_eq!(rdp_command("remmina", "host", 3390, "", ""), ["-c", "rdp://host:3390"]);
-        assert_eq!(rdp_command("mstsc", "host", 3389, "bob", ""), ["/v:host"]);
+        assert_eq!(
+            rdp_command("remmina", "host", 3389, "bob", "", Some("pw")),
+            (vec!["-c".to_owned(), "rdp://bob@host".to_owned()], None)
+        );
+        assert_eq!(
+            rdp_command("mstsc", "host", 3389, "bob", "", Some("pw")),
+            (vec!["/v:host".to_owned()], None)
+        );
     }
 
     #[test]
     fn vnc_command_styles() {
-        assert_eq!(vnc_command("vncviewer", "host", 5900), ["host::5900"]);
-        assert_eq!(vnc_command("xtigervncviewer", "host", 5901), ["host::5901"]);
-        assert_eq!(vnc_command("remmina", "host", 5900), ["-c", "vnc://host:5900"]);
-        assert_eq!(vnc_command("open", "host", 5900), ["vnc://host:5900"]);
+        assert_eq!(
+            vnc_command("vncviewer", "host", 5900, None),
+            (vec!["host::5900".to_owned()], None)
+        );
+        let (args, stdin) = vnc_command("xtigervncviewer", "host", 5901, Some("pw"));
+        assert_eq!(args, ["-autopass", "host::5901"]);
+        assert_eq!(stdin.as_deref(), Some("pw"));
+        assert_eq!(
+            vnc_command("remmina", "host", 5900, None),
+            (vec!["-c".to_owned(), "vnc://host:5900".to_owned()], None)
+        );
+        assert_eq!(
+            vnc_command("open", "host", 5900, None),
+            (vec!["vnc://host:5900".to_owned()], None)
+        );
     }
 }
