@@ -399,19 +399,18 @@ impl FileBrowser {
                         act = Some(if is_dir { Act::Navigate(name.clone()) } else { Act::Open(name.clone()) });
                         ui.close();
                     }
-                    if !is_dir {
-                        if ui.button("Download…").clicked() {
-                            act = Some(Act::Download(name.clone()));
-                            ui.close();
-                        }
-                        if ui.button("Duplicate…").clicked() {
-                            act = Some(Act::Duplicate(name.clone()));
-                            ui.close();
-                        }
+                    if !is_dir && ui.button("Download…").clicked() {
+                        act = Some(Act::Download(name.clone()));
+                        ui.close();
                     }
                     ui.separator();
+                    // Generic actions, in alphanumeric order.
                     if ui.button("Delete").clicked() {
                         act = Some(Act::Delete(name.clone(), is_dir));
+                        ui.close();
+                    }
+                    if !is_dir && ui.button("Duplicate…").clicked() {
+                        act = Some(Act::Duplicate(name.clone()));
                         ui.close();
                     }
                 });

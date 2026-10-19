@@ -9,6 +9,7 @@ mod keybinds;
 mod macros;
 mod network;
 mod panes;
+mod remote_view;
 mod settings;
 mod sftp_ui;
 mod sources;

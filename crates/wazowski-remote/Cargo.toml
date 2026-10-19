@@ -1,0 +1,20 @@
+[package]
+name = "wazowski-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+tokio = { workspace = true }
+vnc-rs = "0.6"
+# TLS for VNC VeNCrypt (X509) and RDP — rustls+ring (no system OpenSSL/cmake).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# RDP (native, in-window). Versions kept in lockstep with the `ironrdp` meta crate
+# (connector 0.10 / session 0.11 / pdu 0.9). The connector's transitive `picky` is
+# patched (see the workspace `[patch.crates-io]`) to drop a pre-release curve25519
+# pin that otherwise conflicts with russh.
+ironrdp = { version = "0.17", default-features = false, features = ["connector", "session", "graphics", "input", "svc", "dvc", "pdu", "core"] }
+ironrdp-tokio = "0.10"
+ironrdp-tls = { version = "0.2", features = ["rustls-ring"] }

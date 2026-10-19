@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Wazowski
+GenericName=Terminal & Remote Sessions
+Comment=MobaXterm-style terminal, SSH/SFTP, quick servers and network tools
+# install-linux.sh rewrites Exec to the absolute path of the installed binary.
+Exec=wazowski
+Icon=wazowski
+Terminal=false
+Categories=Network;RemoteAccess;TerminalEmulator;
+Keywords=terminal;ssh;sftp;serial;rdp;vnc;console;
+# Must equal the app id set via with_app_id("wazowski") in main.rs, so the
+# compositor associates the running window with this launcher (and its icon).
+StartupWMClass=wazowski
+StartupNotify=true

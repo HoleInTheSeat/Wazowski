@@ -6,7 +6,10 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, RichText};
 use wazowski_core::session::Auth;
-use wazowski_core::{FolderStyle, Protocol, Secret, Session, SessionStore, Vault, VaultError};
+use wazowski_core::{
+    FolderStyle, Protocol, Secret, Session, SessionStore, Vault, VaultError, VncQuality,
+};
+use wazowski_remote::{RemoteOptions, VncQuality as RemoteQuality, connect_rdp, connect_vnc};
 use wazowski_ssh::{
     AuthMaterial, ConnectParams, HostKeyPolicy, UnknownHostKey, trust_host,
 };
@@ -21,6 +24,7 @@ use crate::keybinds::{Action, Keymap};
 use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
 use crate::network::{self, HostHit, LocalPort, PortHit, ScanHandle};
 use crate::panes::{Home, PaneAction, Panes, SplitDir, SwapTarget};
+use crate::remote_view::{RemoteKind, RemoteTab};
 use crate::settings::{NewTabPlacement, Settings, StartupTab, WebScheme};
 use crate::sftp_ui::FileBrowser;
 use crate::servers_ui::{ServerEntry, ServersStore};
@@ -76,6 +80,8 @@ enum TabContent {
     Connecting(Box<Connecting>),
     /// One or more working terminals, arranged as a splittable layout.
     Terminal(Box<Panes>),
+    /// An in-window remote desktop (RDP/VNC) rendered from a native client.
+    Remote(Box<RemoteTab>),
     /// This tab's session has been moved into a split pane on another tab.
     Detached { host_tab: u64 },
 }
@@ -131,13 +137,23 @@ impl Default for NetworkState {
 /// A split-pane action requested from the tab strip, applied after the UI pass.
 enum SplitButton {
     Split(SplitDir),
-    Close,
+}
+
+/// A remote-desktop toolbar action for the active RDP/VNC tab.
+#[derive(Clone, Copy)]
+enum RemoteOp {
+    Screenshot,
+    TypeClipboard,
+    CtrlAltDel,
+    WinKey,
 }
 
 /// A tab context-menu action, applied after the tab strip is drawn.
 enum TabAct {
     Duplicate(usize),
     CloseOthers(usize),
+    SaveOutput(usize),
+    PrintOutput(usize),
 }
 
 /// An Extras-settings action, applied after the settings page is drawn.
@@ -392,11 +408,14 @@ enum Dialog {
     QuickConnect(ConnectAuthForm),
     VaultManager(VaultManagerState),
     CreateCredential(CredentialPrompt),
-    NewFolder { target: StoreId, parent: String, name: String },
-    RenameFolder { target: StoreId, old: String, name: String },
-    FolderAppearance { target: StoreId, folder: String, icon: String, color: Option<[u8; 3]> },
+    NewFolder { target: StoreId, parent: String, name: String, icon: String, color: Option<[u8; 3]> },
+    /// Edit a folder: rename it and/or change its icon/color, in one dialog.
+    EditFolder { target: StoreId, old: String, name: String, icon: String, color: Option<[u8; 3]> },
     ConfirmDeleteVault,
     ConfirmQuit,
+    /// Confirm typing multi-line clipboard text into a remote session (the
+    /// embedded newlines act as Enter presses, which can run commands).
+    ConfirmTypeText(String),
     ConfirmImportVault { src: PathBuf },
     SerialConnect(SerialForm),
     StartServer { id: String, auto_stop: bool, minutes: String },
@@ -428,6 +447,8 @@ struct MacroForm {
     index: Option<usize>,
     name: String,
     steps: Vec<Step>,
+    icon: String,
+    color: Option<[u8; 3]>,
     error: Option<String>,
 }
 
@@ -660,6 +681,13 @@ struct SessionForm {
     /// Custom icon (emoji) and label color for the sidebar.
     icon: String,
     color: Option<[u8; 3]>,
+    /// VNC: observe only (don't send input).
+    vnc_view_only: bool,
+    /// VNC: encoding/quality preference.
+    vnc_quality: VncQuality,
+    /// RDP: desired width/height in pixels as text; blank/"0" means fit window.
+    rdp_width: String,
+    rdp_height: String,
     error: Option<String>,
     /// Which store to save into.
     target: StoreId,
@@ -747,6 +775,14 @@ pub struct App {
     admin_task: Option<AdminTask>,
     /// Multi-exec: mirror typing in the active terminal to all other terminals.
     broadcast: bool,
+    /// The active-tab index seen last frame, to notice tab switches (which turn
+    /// broadcast off so it can't fire into a tab the user just moved away from).
+    last_active: usize,
+    /// Frames remaining to wait for a requested clipboard paste (for the remote
+    /// "Paste text" op). `0` means no paste is pending. We use the windowing
+    /// system's clipboard (via `RequestPaste`) rather than a separate crate so it
+    /// works across X11/Wayland compositors.
+    pending_remote_paste: u8,
     /// Configurable keyboard shortcuts.
     keymap: Keymap,
     /// User-defined macros.
@@ -946,6 +982,39 @@ enum RunPhase {
     Expecting { text: String, deadline: std::time::Instant },
 }
 
+/// Which panes a *broadcasting* macro should write to, scoped to one tab.
+///
+/// `panes` describes the panes of a single tab as `(id, excluded)`; callers pass
+/// only the currently active tab, so panes elsewhere are never candidates.
+/// `targets` are the macro's original target ids.
+///
+/// A pane receives when it is an explicit target (even if excluded — an explicit
+/// target is honoured), or when broadcast expansion is in effect and the pane is
+/// not excluded. Expansion happens only when the tab has more than one pane and
+/// holds at least one original target, so a macro never "spreads" into a tab it
+/// was never aimed at (e.g. after the user switches tabs mid-run).
+fn broadcast_macro_recipients(panes: &[(u64, bool)], targets: &[u64]) -> Vec<u64> {
+    let has_target = panes.iter().any(|(id, _)| targets.contains(id));
+    let expand = panes.len() > 1 && has_target;
+    panes
+        .iter()
+        .filter(|(id, excluded)| targets.contains(id) || (expand && !*excluded))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Which panes typed/pasted input should mirror to while broadcast is on,
+/// scoped to one tab. `panes` is the active tab's `(id, excluded)` list and
+/// `source` is the pane the input came from. Every non-excluded pane other than
+/// the source receives; the source already has the input.
+fn broadcast_typed_recipients(panes: &[(u64, bool)], source: u64) -> Vec<u64> {
+    panes
+        .iter()
+        .filter(|(id, excluded)| *id != source && !*excluded)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// A privileged helper command running via a worker thread.
 struct AdminTask {
     label: String,
@@ -1048,6 +1117,8 @@ impl App {
             servers,
             admin_task: None,
             broadcast: false,
+            last_active: 0,
+            pending_remote_paste: 0,
             keymap,
             macros,
             macro_run: None,
@@ -1446,17 +1517,123 @@ impl App {
             Protocol::Ssh => self.start_connect(session, ctx),
             Protocol::Rdp => {
                 let (user, password) = self.resolve_launch_creds(session);
-                self.launch_rdp(
+                let handle = connect_rdp(
                     &session.host,
                     session.port,
                     &user,
+                    password,
                     &session.domain,
-                    password.as_deref(),
+                    session.rdp_width,
+                    session.rdp_height,
+                    false,
                 );
+                let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
+                self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
             }
             Protocol::Vnc => {
                 let (_user, password) = self.resolve_launch_creds(session);
-                self.launch_vnc(&session.host, session.port, password.as_deref());
+                let options = RemoteOptions {
+                    view_only: session.vnc_view_only,
+                    shared: true,
+                    quality: match session.vnc_quality {
+                        VncQuality::Auto => RemoteQuality::Auto,
+                        VncQuality::High => RemoteQuality::High,
+                        VncQuality::Low => RemoteQuality::Low,
+                    },
+                };
+                let handle = connect_vnc(&session.host, session.port, password, options);
+                let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc);
+                self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
+            }
+        }
+    }
+
+    /// The active tab's remote-desktop view, if it is one.
+    fn active_remote_tab(&mut self) -> Option<&mut RemoteTab> {
+        match self.tabs.get_mut(self.active).map(|t| &mut t.content) {
+            Some(TabContent::Remote(r)) => Some(r.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Runs a remote-desktop toolbar action against the active RDP/VNC tab.
+    fn apply_remote_op(&mut self, op: RemoteOp, ctx: &egui::Context) {
+        match op {
+            RemoteOp::Screenshot => self.remote_screenshot(),
+            RemoteOp::TypeClipboard => self.remote_type_clipboard(ctx),
+            // Ctrl, Alt, Delete.
+            RemoteOp::CtrlAltDel => {
+                if let Some(r) = self.active_remote_tab() {
+                    r.send_chord(&[0xffe3, 0xffe9, 0xffff]);
+                }
+            }
+            // Super / Windows key.
+            RemoteOp::WinKey => {
+                if let Some(r) = self.active_remote_tab() {
+                    r.send_chord(&[0xffeb]);
+                }
+            }
+        }
+    }
+
+    /// Captures the active session's framebuffer and saves it as a PNG.
+    fn remote_screenshot(&mut self) {
+        let snap = self.active_remote_tab().and_then(|r| r.snapshot());
+        let Some((w, h, rgba)) = snap else {
+            self.error = Some("No frame to capture yet — wait for the session to draw.".into());
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("screenshot.png")
+            .add_filter("PNG image", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+        if let Err(e) = save_png(&path, w as u32, h as u32, &rgba) {
+            self.error = Some(format!("Could not save screenshot: {e:#}"));
+        }
+    }
+
+    /// Begins the remote "Paste text" op: asks the windowing system for the
+    /// clipboard (delivered as an `Event::Paste` over the next few frames, handled
+    /// in [`Self::drain_remote_paste`]). Using the window system's clipboard keeps
+    /// this working across X11/Wayland compositors.
+    fn remote_type_clipboard(&mut self, ctx: &egui::Context) {
+        self.pending_remote_paste = 10;
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        ctx.request_repaint();
+    }
+
+    /// If a remote paste is pending, consume any `Event::Paste` and type it into
+    /// the active session (confirming first when it spans multiple lines).
+    fn drain_remote_paste(&mut self, ctx: &egui::Context) {
+        if self.pending_remote_paste == 0 {
+            return;
+        }
+        let pasted = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(text) => Some(text.clone()),
+                _ => None,
+            })
+        });
+        match pasted {
+            Some(text) => {
+                self.pending_remote_paste = 0;
+                if text.is_empty() {
+                    self.error = Some("The clipboard has no text to type.".into());
+                } else if text.contains('\n') {
+                    self.dialog = Dialog::ConfirmTypeText(text);
+                } else if let Some(r) = self.active_remote_tab() {
+                    r.type_text(&text);
+                }
+            }
+            None => {
+                self.pending_remote_paste -= 1;
+                if self.pending_remote_paste == 0 {
+                    self.error = Some("Could not read the clipboard (no text available).".into());
+                }
+                ctx.request_repaint();
             }
         }
     }
@@ -2771,17 +2948,17 @@ impl App {
                     act = Some(RowAct::Open(name.to_owned()));
                 }
                 resp.context_menu(|ui| {
-                    if ui.button("Edit").clicked() {
-                        act = Some(RowAct::Open(name.to_owned()));
+                    // Generic actions only, in alphanumeric order.
+                    if ui.button("Delete").clicked() {
+                        act = Some(RowAct::Delete(name.to_owned()));
                         ui.close();
                     }
                     if ui.button("Duplicate").clicked() {
                         act = Some(RowAct::Duplicate(name.to_owned()));
                         ui.close();
                     }
-                    ui.separator();
-                    if ui.button("Delete").clicked() {
-                        act = Some(RowAct::Delete(name.to_owned()));
+                    if ui.button("Edit").clicked() {
+                        act = Some(RowAct::Open(name.to_owned()));
                         ui.close();
                     }
                 });
@@ -2957,7 +3134,12 @@ impl App {
                 if !needle.is_empty() && !m.name.to_lowercase().contains(&needle) {
                     continue;
                 }
-                let resp = ui.selectable_label(false, format!("⚙ {}", m.name));
+                let glyph = if m.icon.is_empty() { "⚙" } else { m.icon.as_str() };
+                let mut text = RichText::new(format!("{glyph} {}", m.name));
+                if let Some([r, g, b]) = m.color {
+                    text = text.color(Color32::from_rgb(r, g, b));
+                }
+                let resp = ui.selectable_label(false, text);
                 if resp.double_clicked() {
                     act = Some(Act::Run(i, MacroTarget::ActivePane));
                 }
@@ -2976,16 +3158,17 @@ impl App {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Edit…").clicked() {
-                            act = Some(Act::Edit(i));
+                        // Generic actions, in alphanumeric order.
+                        if ui.button("Delete").clicked() {
+                            act = Some(Act::Delete(i));
                             ui.close();
                         }
                         if ui.button("Duplicate").clicked() {
                             act = Some(Act::Duplicate(i));
                             ui.close();
                         }
-                        if ui.button("Delete").clicked() {
-                            act = Some(Act::Delete(i));
+                        if ui.button("Edit…").clicked() {
+                            act = Some(Act::Edit(i));
                             ui.close();
                         }
                     });
@@ -2999,6 +3182,8 @@ impl App {
                     index: Some(i),
                     name: m.name.clone(),
                     steps: m.steps.clone(),
+                    icon: m.icon.clone(),
+                    color: m.color,
                     error: None,
                 });
             }
@@ -3017,6 +3202,8 @@ impl App {
                     index: None,
                     name: String::new(),
                     steps: Vec::new(),
+                    icon: String::new(),
+                    color: None,
                     error: None,
                 });
             }
@@ -3106,7 +3293,7 @@ impl App {
                     }
                 }
                 ui.separator();
-                if ui.button("Edit source…").clicked() {
+                if ui.button("Edit…").clicked() {
                     action = Some(TreeAction::EditSource(source.id().to_owned()));
                     ui.close();
                 }
@@ -3272,19 +3459,21 @@ impl App {
                 Ok(())
             }
             TreeAction::NewFolderIn(store, parent) => {
-                self.dialog = Dialog::NewFolder { target: store, parent, name: String::new() };
-                Ok(())
-            }
-            TreeAction::RenameFolder(store, name) => {
-                self.dialog =
-                    Dialog::RenameFolder { target: store, old: name.clone(), name };
-                Ok(())
-            }
-            TreeAction::FolderAppearance(store, folder) => {
-                let style = self.store_folder_style(&store, &folder);
-                self.dialog = Dialog::FolderAppearance {
+                self.dialog = Dialog::NewFolder {
                     target: store,
-                    folder,
+                    parent,
+                    name: String::new(),
+                    icon: String::new(),
+                    color: None,
+                };
+                Ok(())
+            }
+            TreeAction::EditFolder(store, folder) => {
+                let style = self.store_folder_style(&store, &folder);
+                self.dialog = Dialog::EditFolder {
+                    target: store,
+                    old: folder.clone(),
+                    name: folder,
                     icon: style.as_ref().map(|s| s.icon.clone()).unwrap_or_default(),
                     color: style.and_then(|s| s.color),
                 };
@@ -3551,6 +3740,9 @@ impl App {
         let active = self.active;
         let tab_count = self.tabs.len();
         let hints: Vec<String> = self.tabs.iter().map(|t| self.tab_hint(t)).collect();
+        // Which tabs have terminal output to save/print (not Connecting/Detached).
+        let has_output: Vec<bool> =
+            (0..self.tabs.len()).map(|i| self.tab_output_text(i).is_some()).collect();
         let labels: Vec<String> = self
             .tabs
             .iter()
@@ -3560,16 +3752,23 @@ impl App {
                     TabContent::Connecting(c) if c.error.is_some() => format!("⚠ {name}"),
                     TabContent::Connecting(_) => format!("⏳ {name}"),
                     TabContent::Terminal(_) => name,
+                    TabContent::Remote(_) => name,
                     TabContent::Detached { .. } => format!("⇄ {name}"),
                 }
             })
             .collect();
         let serial_baud = self.active_serial_baud();
-        let (show_split, can_close_pane) = match self.tabs.get(self.active).map(|t| &t.content) {
+        let (show_split, has_multiple_panes) = match self.tabs.get(self.active).map(|t| &t.content) {
             Some(TabContent::Terminal(p)) => (true, p.count() > 1),
             _ => (false, false),
         };
         let mut broadcast = self.broadcast;
+        // Remote-desktop (RDP/VNC) toolbar ops for the active tab, if any.
+        let active_remote: Option<RemoteKind> = match self.tabs.get(self.active).map(|t| &t.content) {
+            Some(TabContent::Remote(r)) => Some(r.kind()),
+            _ => None,
+        };
+        let mut remote_op: Option<RemoteOp> = None;
         let mut clicked_tab = None;
         let mut new_shell = false;
 
@@ -3590,16 +3789,28 @@ impl App {
                                 }
                                 delayed_tooltip(ui, &resp, &hints[i]);
                                 resp.context_menu(|ui| {
-                                    if ui.button("Duplicate").clicked() {
-                                        tab_action = Some(TabAct::Duplicate(i));
-                                        ui.close();
-                                    }
-                                    if ui.button("Close").clicked() {
-                                        close = Some(i);
-                                        ui.close();
-                                    }
                                     if tab_count > 1 && ui.button("Close others").clicked() {
                                         tab_action = Some(TabAct::CloseOthers(i));
+                                        ui.close();
+                                    }
+                                    if has_output[i] {
+                                        if ui.button("Save output…").clicked() {
+                                            tab_action = Some(TabAct::SaveOutput(i));
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .button("Print output")
+                                            .on_hover_text("Send the output to a printer")
+                                            .clicked()
+                                        {
+                                            tab_action = Some(TabAct::PrintOutput(i));
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
+                                    // Generic actions, in alphanumeric order.
+                                    if ui.button("Duplicate").clicked() {
+                                        tab_action = Some(TabAct::Duplicate(i));
                                         ui.close();
                                     }
                                 });
@@ -3631,11 +3842,25 @@ impl App {
                     }
                     ui.separator();
                 }
+                // Sides renders right-to-left, so the first widget added is the
+                // rightmost. Add Broadcast first so the visible order reads
+                // Split right | Split down | Broadcast, with Broadcast on the right.
                 if show_split {
-                    if can_close_pane
-                        && ui.button("⊟").on_hover_text("Close focused pane").clicked()
-                    {
-                        pane_action = Some(SplitButton::Close);
+                    // Broadcast only makes sense with more than one pane in this
+                    // tab; otherwise it's greyed out (and clicks are ignored), but
+                    // its state is still shown and a tooltip explains why.
+                    let resp = ui.add_enabled(
+                        has_multiple_panes,
+                        egui::Button::new("⇉").selected(broadcast && has_multiple_panes),
+                    );
+                    let resp = resp
+                        .on_hover_text("Broadcast: send input to eligible panes in this tab")
+                        .on_disabled_hover_text(
+                            "Broadcast sends input to eligible panes in this tab. \
+                             Split this tab into multiple panes to enable it.",
+                        );
+                    if resp.clicked() {
+                        broadcast = !broadcast;
                     }
                     if ui.button("⇩").on_hover_text("Split pane down").clicked() {
                         pane_action = Some(SplitButton::Split(SplitDir::Vertical));
@@ -3644,17 +3869,43 @@ impl App {
                         pane_action = Some(SplitButton::Split(SplitDir::Horizontal));
                     }
                 }
-                // Broadcast is a plain button that shows its on/off state, so it
-                // looks the same as the split buttons.
-                if ui
-                    .add(egui::Button::new("⇉").selected(broadcast))
-                    .on_hover_text("Broadcast (multi-exec): send typing to every terminal")
-                    .clicked()
-                {
-                    broadcast = !broadcast;
+                // Remote-desktop ops. Sides is right-to-left, so add rightmost
+                // first; visible order ends up Screenshot | Paste text | (RDP:
+                // Ctrl+Alt+Del | Win).
+                if let Some(kind) = active_remote {
+                    if kind == RemoteKind::Rdp {
+                        if ui.button("Win").on_hover_text("Send the Windows (Super) key").clicked() {
+                            remote_op = Some(RemoteOp::WinKey);
+                        }
+                        if ui
+                            .button("Ctrl+Alt+Del")
+                            .on_hover_text("Send Ctrl+Alt+Delete to the session")
+                            .clicked()
+                        {
+                            remote_op = Some(RemoteOp::CtrlAltDel);
+                        }
+                    }
+                    if ui
+                        .button("Paste text")
+                        .on_hover_text("Type this computer's clipboard text into the session")
+                        .clicked()
+                    {
+                        remote_op = Some(RemoteOp::TypeClipboard);
+                    }
+                    if ui
+                        .button("Screenshot")
+                        .on_hover_text("Save a PNG image of the session")
+                        .clicked()
+                    {
+                        remote_op = Some(RemoteOp::Screenshot);
+                    }
                 }
             },
         );
+        if let Some(op) = remote_op {
+            let ctx = ui.ctx().clone();
+            self.apply_remote_op(op, &ctx);
+        }
         self.broadcast = broadcast;
         if let Some(i) = clicked_tab {
             self.active = i;
@@ -3667,7 +3918,6 @@ impl App {
         }
         match pane_action {
             Some(SplitButton::Split(dir)) => self.split_active_pane(dir, ui.ctx()),
-            Some(SplitButton::Close) => self.close_active_pane(),
             None => {}
         }
         if let Some(delta) = baud_delta {
@@ -3678,6 +3928,8 @@ impl App {
                 let ctx = ui.ctx().clone();
                 self.duplicate_tab(i, &ctx);
             }
+            Some(TabAct::SaveOutput(i)) => self.save_tab_output(i),
+            Some(TabAct::PrintOutput(i)) => self.print_tab_output(i),
             Some(TabAct::CloseOthers(i)) => {
                 let keep_id = self.tabs[i].id;
                 let mut j = 0;
@@ -3789,6 +4041,7 @@ impl App {
                         retry = Some(action);
                     }
                 }
+                TabContent::Remote(remote) => remote.ui(ui),
                 TabContent::Detached { .. } => {}
             },
             None => {
@@ -3840,21 +4093,25 @@ impl App {
         if zoom != 0.0 {
             self.nudge_active_font_size(zoom.signum());
         }
-        // Multi-exec: mirror the focused pane's input to every other terminal
-        // that isn't the source and hasn't been excluded from broadcast.
+        // Multi-exec: mirror the focused pane's input to the OTHER panes in the
+        // *active tab only*. Broadcast must never reach a tab the user can't see,
+        // so this deliberately touches `self.tabs[active]` and nothing else. The
+        // source only ever comes from the active tab (only it renders), and with a
+        // single pane there are no other panes, so broadcast can't expand input.
         if broadcast
             && let Some((src_id, bytes)) = broadcast_src
             && !bytes.is_empty()
+            && let Some(tab) = self.tabs.get_mut(active)
+            && let TabContent::Terminal(panes) = &mut tab.content
         {
-            for tab in self.tabs.iter_mut() {
-                if let TabContent::Terminal(panes) = &mut tab.content {
-                    panes.for_each(|t| {
-                        if t.id() != src_id && !t.broadcast_excluded() {
-                            t.write(&bytes);
-                        }
-                    });
+            let mut meta = Vec::new();
+            panes.for_each(|t| meta.push((t.id(), t.broadcast_excluded())));
+            let recipients = broadcast_typed_recipients(&meta, src_id);
+            panes.for_each(|t| {
+                if recipients.contains(&t.id()) {
+                    t.write(&bytes);
                 }
-            }
+            });
         }
     }
 
@@ -4224,65 +4481,6 @@ impl App {
             password = Some(pw.clone());
         }
         (user, password)
-    }
-
-    /// Launches an external RDP client for `host:port` (using the session's
-    /// username/domain when present, and a vault password when available). Uses
-    /// the preferred client from Settings if still installed, else the first
-    /// detected one; prompts to install if none.
-    fn launch_rdp(&mut self, host: &str, port: u16, username: &str, domain: &str, password: Option<&str>) {
-        if host.trim().is_empty() {
-            self.error = Some("This session has no host to open over RDP.".into());
-            return;
-        }
-        let client = self
-            .settings
-            .rdp_client
-            .clone()
-            .filter(|c| has_bin(c))
-            .or_else(detect_rdp_client);
-        let Some(client) = client else {
-            self.error = Some(format!(
-                "No RDP client found. Install one of: {} (see Settings ▸ Extras).",
-                RDP_CLIENTS.join(", ")
-            ));
-            return;
-        };
-        let (args, stdin) = rdp_command(&client, host, port, username, domain, password);
-        let mut cmd = std::process::Command::new(&client);
-        cmd.args(&args);
-        if let Err(e) = spawn_client(cmd, stdin) {
-            self.error = Some(format!("Could not launch {client}: {e}"));
-        }
-    }
-
-    /// Launches an external VNC viewer for `host:port` (with a vault password
-    /// when available). Uses the preferred client from Settings if still
-    /// installed, else the first detected one.
-    fn launch_vnc(&mut self, host: &str, port: u16, password: Option<&str>) {
-        if host.trim().is_empty() {
-            self.error = Some("This session has no host to open over VNC.".into());
-            return;
-        }
-        let client = self
-            .settings
-            .vnc_client
-            .clone()
-            .filter(|c| has_bin(c))
-            .or_else(detect_vnc_client);
-        let Some(client) = client else {
-            self.error = Some(format!(
-                "No VNC viewer found. Install one of: {} (see Settings ▸ Extras).",
-                VNC_CLIENTS.join(", ")
-            ));
-            return;
-        };
-        let (args, stdin) = vnc_command(&client, host, port, password);
-        let mut cmd = std::process::Command::new(&client);
-        cmd.args(&args);
-        if let Err(e) = spawn_client(cmd, stdin) {
-            self.error = Some(format!("Could not launch {client}: {e}"));
-        }
     }
 
     /// The Tools view (left-rail): servers, network tools, host tools.
@@ -4970,10 +5168,10 @@ impl App {
             Dialog::VaultManager(_) => self.show_vault_manager(ctx),
             Dialog::CreateCredential(_) => self.show_create_credential(ctx),
             Dialog::NewFolder { .. } => self.show_new_folder(ctx),
-            Dialog::RenameFolder { .. } => self.show_rename_folder(ctx),
-            Dialog::FolderAppearance { .. } => self.show_folder_appearance(ctx),
+            Dialog::EditFolder { .. } => self.show_edit_folder(ctx),
             Dialog::ConfirmDeleteVault => self.show_confirm_delete_vault(ctx),
             Dialog::ConfirmQuit => self.show_confirm_quit(ctx),
+            Dialog::ConfirmTypeText(_) => self.show_confirm_type_text(ctx),
             Dialog::ConfirmImportVault { .. } => self.show_confirm_import_vault(ctx),
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
             Dialog::AddSource(_) => self.show_add_source(ctx),
@@ -5076,7 +5274,18 @@ impl App {
         // opens a terminal tab.
         if session.protocol == Protocol::Rdp {
             let pw = (!form.password.is_empty()).then(|| form.password.clone());
-            self.launch_rdp(&session.host, session.port, &username, &session.domain, pw.as_deref());
+            let handle = connect_rdp(
+                &session.host,
+                session.port,
+                &username,
+                pw,
+                &session.domain,
+                session.rdp_width,
+                session.rdp_height,
+                false,
+            );
+            let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
+            self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
             return;
         }
         let resolved = ResolvedAuth {
@@ -5244,6 +5453,8 @@ impl App {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 }
                 ui.separator();
+                appearance_picker(ui, "macro-appearance", &mut form.icon, &mut form.color, "⚙");
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         save = true;
@@ -5260,7 +5471,12 @@ impl App {
                 form.error = Some("Give the macro a name.".to_owned());
                 return;
             }
-            let m = Macro { name: form.name.trim().to_owned(), steps: form.steps.clone() };
+            let m = Macro {
+                name: form.name.trim().to_owned(),
+                steps: form.steps.clone(),
+                icon: form.icon.clone(),
+                color: form.color,
+            };
             match form.index {
                 Some(i) if i < self.macros.macros.len() => self.macros.macros[i] = m,
                 _ => self.macros.macros.push(m),
@@ -5387,17 +5603,43 @@ impl App {
         });
     }
 
-    /// Sends `bytes` to each target terminal. When broadcast is on, it also
-    /// mirrors to every other non-excluded terminal, like typed input does.
+    /// Sends `bytes` to the macro's target terminals.
+    ///
+    /// Broadcast scope is enforced here, not just in the toolbar: a stored
+    /// broadcast flag or the keyboard shortcut can be on with the button greyed.
+    ///
+    /// * **Broadcast off** — send to exactly `ids`. These may legitimately span
+    ///   tabs (e.g. the macro's "all open terminals" target); that explicit
+    ///   choice is preserved and is distinct from automatic broadcast expansion.
+    /// * **Broadcast on** — clamp delivery to the *currently active tab*, re-read
+    ///   on every dispatch so a delayed macro can never leak into a tab the user
+    ///   switched away to. Within that tab, deliver to any of `ids` present (even
+    ///   if excluded — an explicit target still receives), and expand to the other
+    ///   non-excluded panes only when the tab has more than one pane and actually
+    ///   contains at least one of the macro's original targets. Each recipient is
+    ///   written to once (we visit each pane once).
     fn macro_send(&mut self, ids: &[u64], bytes: &[u8]) {
-        let broadcast = self.broadcast;
-        for tab in &mut self.tabs {
-            if let TabContent::Terminal(panes) = &mut tab.content {
-                panes.for_each(|t| {
-                    if ids.contains(&t.id()) || (broadcast && !t.broadcast_excluded()) {
-                        t.write(bytes);
-                    }
-                });
+        if self.broadcast {
+            let active = self.active;
+            let Some(tab) = self.tabs.get_mut(active) else { return };
+            let TabContent::Terminal(panes) = &mut tab.content else { return };
+            let mut meta = Vec::new();
+            panes.for_each(|t| meta.push((t.id(), t.broadcast_excluded())));
+            let recipients = broadcast_macro_recipients(&meta, ids);
+            panes.for_each(|t| {
+                if recipients.contains(&t.id()) {
+                    t.write(bytes);
+                }
+            });
+        } else {
+            for tab in &mut self.tabs {
+                if let TabContent::Terminal(panes) = &mut tab.content {
+                    panes.for_each(|t| {
+                        if ids.contains(&t.id()) {
+                            t.write(bytes);
+                        }
+                    });
+                }
             }
         }
     }
@@ -5926,7 +6168,7 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
-                appearance_picker(ui, &mut f.icon, &mut f.color, "🌐");
+                appearance_picker(ui, "web-appearance", &mut f.icon, &mut f.color, "🌐");
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     add |= ui.button(if editing { "Save" } else { "Add" }).clicked();
@@ -6100,6 +6342,46 @@ impl App {
         }
     }
 
+    /// Confirms typing multi-line clipboard text into the active remote session.
+    fn show_confirm_type_text(&mut self, ctx: &egui::Context) {
+        let Dialog::ConfirmTypeText(text) = &self.dialog else { return };
+        let text = text.clone();
+        let lines = text.lines().count();
+        let mut send = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("confirm-type-text")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Type clipboard text?");
+            ui.label(format!(
+                "The clipboard has {lines} lines. Typing it will send {} Enter press{} to \
+                 the session, which may run commands.",
+                lines.saturating_sub(1).max(1),
+                if lines.saturating_sub(1).max(1) == 1 { "" } else { "es" },
+            ));
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(&text).monospace()).wrap());
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Type it").clicked() {
+                    send = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if send {
+            if let Some(r) = self.active_remote_tab() {
+                r.type_text(&text);
+            }
+            self.dialog = Dialog::None;
+        } else if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
     /// Picks a vault file to import; confirms if one already exists.
     fn import_vault(&mut self) {
         let Some(src) = rfd::FileDialog::new().pick_file() else { return };
@@ -6235,7 +6517,7 @@ impl App {
     fn show_new_folder(&mut self, ctx: &egui::Context) {
         let mut submit = false;
         let mut cancel = false;
-        if let Dialog::NewFolder { parent, name, .. } = &mut self.dialog {
+        if let Dialog::NewFolder { parent, name, icon, color, .. } = &mut self.dialog {
             let heading =
                 if parent.is_empty() { "New folder".to_owned() } else { format!("New folder in {parent}") };
             egui::Modal::new(egui::Id::new("new-folder")).show(ctx, |ui| {
@@ -6245,6 +6527,8 @@ impl App {
                 autofocus(ui, &field);
                 submit |= entered(ui, &field);
                 ui.add_space(6.0);
+                appearance_picker(ui, "new-folder-appearance", icon, color, "📁");
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     submit |= ui.button("Create").clicked();
                     cancel |= ui.button("Cancel").clicked();
@@ -6252,16 +6536,19 @@ impl App {
             });
         }
         if submit
-            && let Dialog::NewFolder { target, parent, name } = &self.dialog
+            && let Dialog::NewFolder { target, parent, name, icon, color } = &self.dialog
         {
             let name = name.trim().trim_matches('/');
             // Nest under the parent folder when creating a subfolder.
             let full = if parent.is_empty() { name.to_owned() } else { format!("{parent}/{name}") };
             let target = target.clone();
-            if !name.is_empty()
-                && let Err(e) = self.store_add_folder(&target, &full)
-            {
-                self.error = Some(format!("{e:#}"));
+            let style = FolderStyle { icon: icon.clone(), color: *color };
+            if !name.is_empty() {
+                if let Err(e) = self.store_add_folder(&target, &full) {
+                    self.error = Some(format!("{e:#}"));
+                } else if !style.icon.is_empty() || style.color.is_some() {
+                    let _ = self.store_set_folder_style(&target, &full, style);
+                }
             }
             self.dialog = Dialog::None;
         }
@@ -6270,49 +6557,22 @@ impl App {
         }
     }
 
-    fn show_rename_folder(&mut self, ctx: &egui::Context) {
-        let mut submit = false;
-        let mut cancel = false;
-        if let Dialog::RenameFolder { name, .. } = &mut self.dialog {
-            egui::Modal::new(egui::Id::new("rename-folder")).show(ctx, |ui| {
-                ui.set_width(300.0);
-                ui.heading("Rename folder");
-                let field = ui.add(egui::TextEdit::singleline(name));
-                autofocus(ui, &field);
-                submit |= entered(ui, &field);
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    submit |= ui.button("Rename").clicked();
-                    cancel |= ui.button("Cancel").clicked();
-                });
-            });
-        }
-        if submit
-            && let Dialog::RenameFolder { target, old, name } = &self.dialog
-        {
-            let (target, old, name) = (target.clone(), old.clone(), name.clone());
-            if let Err(e) = self.store_rename_folder(&target, &old, &name) {
-                self.error = Some(format!("{e:#}"));
-            }
-            self.dialog = Dialog::None;
-        }
-        if cancel {
-            self.dialog = Dialog::None;
-        }
-    }
-
-    /// Dialog to set a folder's custom icon and color.
-    fn show_folder_appearance(&mut self, ctx: &egui::Context) {
+    /// Dialog to edit a folder: rename it and/or change its icon and color.
+    fn show_edit_folder(&mut self, ctx: &egui::Context) {
         let mut save = false;
         let mut cancel = false;
-        if let Dialog::FolderAppearance { folder, icon, color, .. } = &mut self.dialog {
-            let folder = folder.clone();
-            egui::Modal::new(egui::Id::new("folder-appearance")).show(ctx, |ui| {
+        if let Dialog::EditFolder { name, icon, color, .. } = &mut self.dialog {
+            egui::Modal::new(egui::Id::new("edit-folder")).show(ctx, |ui| {
                 ui.set_width(340.0);
-                ui.heading("Folder appearance");
-                ui.label(RichText::new(folder).weak());
+                ui.heading("Edit folder");
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    let field = ui.add(egui::TextEdit::singleline(name));
+                    autofocus(ui, &field);
+                    save |= entered(ui, &field);
+                });
                 ui.add_space(6.0);
-                appearance_picker(ui, icon, color, "📁");
+                appearance_picker(ui, "folder-appearance", icon, color, "📁");
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     save |= ui.button("Save").clicked();
@@ -6321,11 +6581,19 @@ impl App {
             });
         }
         if save
-            && let Dialog::FolderAppearance { target, folder, icon, color } = &self.dialog
+            && let Dialog::EditFolder { target, old, name, icon, color } = &self.dialog
         {
-            let (target, folder) = (target.clone(), folder.clone());
+            let (target, old, name) = (target.clone(), old.clone(), name.clone());
             let style = FolderStyle { icon: icon.clone(), color: *color };
-            if let Err(e) = self.store_set_folder_style(&target, &folder, style) {
+            // Rename first (if changed); apply the style to the final path.
+            if name != old
+                && let Err(e) = self.store_rename_folder(&target, &old, &name)
+            {
+                self.error = Some(format!("{e:#}"));
+                self.dialog = Dialog::None;
+                return;
+            }
+            if let Err(e) = self.store_set_folder_style(&target, &name, style) {
                 self.error = Some(format!("{e:#}"));
             }
             self.dialog = Dialog::None;
@@ -6643,7 +6911,7 @@ impl App {
                     for (proto, icon, tip) in [
                         (Protocol::Ssh, "🖥", "SSH terminal"),
                         (Protocol::Rdp, "🖵", "Remote Desktop (external client)"),
-                        (Protocol::Vnc, "👁", "VNC (external viewer)"),
+                        (Protocol::Vnc, "👁", "VNC (in-window)"),
                     ] {
                         let selected = form.protocol == proto;
                         if ui
@@ -6692,6 +6960,48 @@ impl App {
                     if form.protocol == Protocol::Rdp {
                         ui.label("Domain");
                         line(ui, &mut form.domain, false);
+                        ui.end_row();
+                        ui.label("Resolution");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.rdp_width)
+                                    .desired_width(56.0)
+                                    .hint_text("width"),
+                            );
+                            ui.label("×");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.rdp_height)
+                                    .desired_width(56.0)
+                                    .hint_text("height"),
+                            );
+                            ui.label(RichText::new("(blank = fit)").weak());
+                        });
+                        ui.end_row();
+                    }
+                    if form.protocol == Protocol::Vnc {
+                        ui.label("View only");
+                        ui.checkbox(&mut form.vnc_view_only, "Observe without sending input");
+                        ui.end_row();
+                        ui.label("Quality");
+                        egui::ComboBox::from_id_salt("vnc-quality")
+                            .selected_text(vnc_quality_label(form.vnc_quality))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut form.vnc_quality,
+                                    VncQuality::Auto,
+                                    "Auto (balanced)",
+                                );
+                                ui.selectable_value(
+                                    &mut form.vnc_quality,
+                                    VncQuality::High,
+                                    "High (more bandwidth)",
+                                );
+                                ui.selectable_value(
+                                    &mut form.vnc_quality,
+                                    VncQuality::Low,
+                                    "Low (less bandwidth)",
+                                );
+                            });
                         ui.end_row();
                     }
                     // SSH-only authentication (RDP/VNC use the external client's
@@ -6843,7 +7153,7 @@ impl App {
                     Protocol::Rdp => "🖵",
                     Protocol::Vnc => "👁",
                 };
-                appearance_picker(ui, &mut form.icon, &mut form.color, default_icon);
+                appearance_picker(ui, "session-appearance", &mut form.icon, &mut form.color, default_icon);
                 let uses_vault = match form.protocol {
                     Protocol::Ssh => form.method != AuthMethod::Agent,
                     Protocol::Rdp | Protocol::Vnc => true,
@@ -6897,6 +7207,10 @@ impl App {
         );
         let (protocol, domain) = (form.protocol, form.domain.trim().to_owned());
         let (icon, color) = (form.icon.clone(), form.color);
+        let (vnc_view_only, vnc_quality) = (form.vnc_view_only, form.vnc_quality);
+        // Blank or unparsable resolution means "fit the window" (0).
+        let rdp_width = form.rdp_width.trim().parse().unwrap_or(0);
+        let rdp_height = form.rdp_height.trim().parse().unwrap_or(0);
         let (source, existing_name, new_name, secret_input, key_passphrase) = (
             form.source,
             form.existing_name.clone(),
@@ -6926,6 +7240,10 @@ impl App {
         session.legacy = legacy;
         session.icon = icon;
         session.color = color;
+        session.vnc_view_only = vnc_view_only;
+        session.vnc_quality = vnc_quality;
+        session.rdp_width = rdp_width;
+        session.rdp_height = rdp_height;
 
         // SSH supports agent/password/key; RDP/VNC only an optional vault
         // Password (the external client handles the rest). A blank credential
@@ -7537,6 +7855,17 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // Switching tabs disarms broadcast so it can't fire into a tab the user
+        // just moved away from. Detected frame-to-frame so every path that changes
+        // the active tab (clicks, Ctrl+Tab, closing a tab) is covered at once.
+        if self.active != self.last_active {
+            self.broadcast = false;
+            self.last_active = self.active;
+        }
+
+        // Deliver a requested clipboard paste to the active remote session.
+        self.drain_remote_paste(&ctx);
+
         // Confirm before closing the window while sessions/shells are open.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             if self.tabs.is_empty() {
@@ -7770,6 +8099,10 @@ impl SessionForm {
             legacy: false,
             icon: String::new(),
             color: None,
+            vnc_view_only: false,
+            vnc_quality: VncQuality::Auto,
+            rdp_width: String::new(),
+            rdp_height: String::new(),
             error: None,
             target: StoreId::Local,
         }
@@ -7801,6 +8134,10 @@ impl SessionForm {
             legacy: session.legacy,
             icon: session.icon.clone(),
             color: session.color,
+            vnc_view_only: session.vnc_view_only,
+            vnc_quality: session.vnc_quality,
+            rdp_width: if session.rdp_width == 0 { String::new() } else { session.rdp_width.to_string() },
+            rdp_height: if session.rdp_height == 0 { String::new() } else { session.rdp_height.to_string() },
             error: None,
             target: StoreId::Local,
         }
@@ -7834,8 +8171,7 @@ enum TreeAction {
     CopyFolder { from: StoreId, folder: String, to: StoreId, parent: String },
     NewSessionIn(StoreId, String),
     NewFolderIn(StoreId, String),
-    RenameFolder(StoreId, String),
-    FolderAppearance(StoreId, String),
+    EditFolder(StoreId, String),
     DeleteFolder(StoreId, String),
     SyncSource(String),
     OpenSource(String),
@@ -8018,23 +8354,9 @@ fn render_folder(
                 *action = Some(TreeAction::NewFolderIn(store.clone(), full.to_owned()));
                 ui.close();
             }
-            if ui.button("Rename folder").clicked() {
-                *action = Some(TreeAction::RenameFolder(store.clone(), full.to_owned()));
-                ui.close();
-            }
-            if ui.button("Appearance…").clicked() {
-                *action = Some(TreeAction::FolderAppearance(store.clone(), full.to_owned()));
-                ui.close();
-            }
-            // Move/copy the whole folder (subfolders and sessions included).
-            destination_menu(ui, "Move folder to", destinations, |to, parent| {
-                *action = Some(TreeAction::MoveFolder {
-                    from: store.clone(),
-                    folder: full.to_owned(),
-                    to,
-                    parent,
-                });
-            });
+            ui.separator();
+            // Generic actions, in alphanumeric order. (Move/copy act on the whole
+            // folder, subfolders and sessions included.)
             destination_menu(ui, "Copy folder to", destinations, |to, parent| {
                 *action = Some(TreeAction::CopyFolder {
                     from: store.clone(),
@@ -8043,11 +8365,22 @@ fn render_folder(
                     parent,
                 });
             });
-            ui.separator();
             if ui.button("Delete folder").clicked() {
                 *action = Some(TreeAction::DeleteFolder(store.clone(), full.to_owned()));
                 ui.close();
             }
+            if ui.button("Edit…").clicked() {
+                *action = Some(TreeAction::EditFolder(store.clone(), full.to_owned()));
+                ui.close();
+            }
+            destination_menu(ui, "Move folder to", destinations, |to, parent| {
+                *action = Some(TreeAction::MoveFolder {
+                    from: store.clone(),
+                    folder: full.to_owned(),
+                    to,
+                    parent,
+                });
+            });
         });
     }
 }
@@ -8126,7 +8459,13 @@ fn session_hint(s: &Session) -> String {
             hint.push_str("\nopens in external client");
             hint
         }
-        Protocol::Vnc => format!("VNC · {where_to}\nopens in external viewer"),
+        Protocol::Vnc => {
+            let mut hint = format!("VNC · {where_to}\nopens in a Wazowski tab");
+            if s.vnc_view_only {
+                hint.push_str("\nview only");
+            }
+            hint
+        }
     }
 }
 
@@ -8222,24 +8561,10 @@ fn session_row(
             }
         });
         if editable {
-            if ui.button("Edit…").clicked() {
-                *action = Some(TreeAction::Edit(store.clone(), id.to_owned()));
-                ui.close();
-            }
-            if ui.button("Duplicate").clicked() {
-                *action = Some(TreeAction::Duplicate(store.clone(), id.to_owned()));
-                ui.close();
-            }
-            // Move/Copy to a store + folder. A single destination collapses the
-            // store level; multiple destinations nest store → folder.
-            destination_menu(ui, "Move to", destinations, |to, folder| {
-                *action = Some(TreeAction::MoveTo {
-                    from: store.clone(),
-                    id: id.to_owned(),
-                    to,
-                    folder,
-                });
-            });
+            ui.separator();
+            // Generic actions, in alphanumeric order. Move/Copy target a store +
+            // folder: a single destination collapses the store level; multiple
+            // destinations nest store → folder.
             destination_menu(ui, "Copy to", destinations, |to, folder| {
                 *action = Some(TreeAction::CopyTo {
                     from: store.clone(),
@@ -8248,13 +8573,37 @@ fn session_row(
                     folder,
                 });
             });
-            ui.separator();
             if ui.button("Delete").clicked() {
                 *action = Some(TreeAction::Delete(store.clone(), id.to_owned()));
                 ui.close();
             }
+            if ui.button("Duplicate").clicked() {
+                *action = Some(TreeAction::Duplicate(store.clone(), id.to_owned()));
+                ui.close();
+            }
+            if ui.button("Edit…").clicked() {
+                *action = Some(TreeAction::Edit(store.clone(), id.to_owned()));
+                ui.close();
+            }
+            destination_menu(ui, "Move to", destinations, |to, folder| {
+                *action = Some(TreeAction::MoveTo {
+                    from: store.clone(),
+                    id: id.to_owned(),
+                    to,
+                    folder,
+                });
+            });
         }
     });
+}
+
+/// Human-readable label for a VNC quality preference.
+fn vnc_quality_label(q: VncQuality) -> &'static str {
+    match q {
+        VncQuality::Auto => "Auto (balanced)",
+        VncQuality::High => "High (more bandwidth)",
+        VncQuality::Low => "Low (less bandwidth)",
+    }
 }
 
 /// Builds the URL for a session's web management page. If the host already
@@ -8269,51 +8618,6 @@ fn web_gui_url(host: &str, scheme: WebScheme) -> String {
     }
 }
 
-/// Builds the args to launch an RDP client against `host:port`, plus an optional
-/// string to feed on the client's stdin (used to pass a password without
-/// exposing it in the process list). The binary name selects the style
-/// (FreeRDP, Remmina, Windows `mstsc`); FreeRDP reads the password via
-/// `/from-stdin`, the others prompt for it themselves.
-fn rdp_command(
-    client: &str,
-    host: &str,
-    port: u16,
-    username: &str,
-    domain: &str,
-    password: Option<&str>,
-) -> (Vec<String>, Option<String>) {
-    let host = host.trim();
-    let user = username.trim();
-    let domain = domain.trim();
-    let base = client.rsplit(['/', '\\']).next().unwrap_or(client);
-    let authority = if port == 3389 { host.to_owned() } else { format!("{host}:{port}") };
-    if base.starts_with("remmina") {
-        let uri = if user.is_empty() {
-            format!("rdp://{authority}")
-        } else {
-            format!("rdp://{user}@{authority}")
-        };
-        (vec!["-c".to_owned(), uri], None)
-    } else if base.starts_with("mstsc") {
-        (vec![format!("/v:{authority}")], None)
-    } else {
-        // FreeRDP family (xfreerdp / xfreerdp3 / wlfreerdp) and fallback.
-        let mut args = vec![format!("/v:{authority}")];
-        if !user.is_empty() {
-            args.push(format!("/u:{user}"));
-        }
-        if !domain.is_empty() {
-            args.push(format!("/d:{domain}"));
-        }
-        match password {
-            Some(pw) if !pw.is_empty() => {
-                args.push("/from-stdin".to_owned());
-                (args, Some(pw.to_owned()))
-            }
-            _ => (args, None),
-        }
-    }
-}
 
 /// The common VNC viewers Wazowski can launch, most-preferred first.
 const VNC_CLIENTS: &[&str] = if cfg!(windows) {
@@ -8329,48 +8633,6 @@ fn detect_vnc_client() -> Option<String> {
     VNC_CLIENTS.iter().find(|name| has_bin(name)).map(|name| (*name).to_owned())
 }
 
-/// Builds the args to launch a VNC viewer against `host:port`, plus an optional
-/// string to feed on the viewer's stdin. TigerVNC's `vncviewer` reads the
-/// password from stdin with `-autopass`; Remmina and macOS `open` prompt.
-fn vnc_command(
-    client: &str,
-    host: &str,
-    port: u16,
-    password: Option<&str>,
-) -> (Vec<String>, Option<String>) {
-    let host = host.trim();
-    let base = client.rsplit(['/', '\\']).next().unwrap_or(client);
-    if base.starts_with("remmina") {
-        (vec!["-c".to_owned(), format!("vnc://{host}:{port}")], None)
-    } else if base == "open" {
-        (vec![format!("vnc://{host}:{port}")], None)
-    } else {
-        // vncviewer / xtigervncviewer: explicit "host::port", password via stdin.
-        match password {
-            Some(pw) if !pw.is_empty() => {
-                (vec!["-autopass".to_owned(), format!("{host}::{port}")], Some(pw.to_owned()))
-            }
-            _ => (vec![format!("{host}::{port}")], None),
-        }
-    }
-}
-
-/// Spawns a GUI client detached, optionally writing `stdin_data` (a password) to
-/// its stdin so it never appears in the process list. Returns a launch error.
-fn spawn_client(mut cmd: std::process::Command, stdin_data: Option<String>) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(data) = stdin_data {
-        cmd.stdin(std::process::Stdio::piped());
-        let mut child = cmd.spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = writeln!(stdin, "{data}");
-        }
-        // stdin dropped here → EOF; the GUI child keeps running detached.
-        Ok(())
-    } else {
-        cmd.spawn().map(|_| ())
-    }
-}
 
 /// A nested "Move to / Copy to" menu over destinations (store → folder).
 fn destination_menu(
@@ -8523,38 +8785,105 @@ const ICON_CHOICES: &[&str] = &[
     "🍎", "🔧", "🚦", "📦",
 ];
 
-/// An icon (emoji) + optional color picker row, shared by sessions and folders.
-/// `default_icon` is shown as the "no custom icon" choice.
+/// A compact appearance control shared by sessions, folders, shared sources and
+/// macros: a single button showing the current icon tinted with the current
+/// color. Clicking it opens a picker with an inline color selector above a grid
+/// of icons that recolors live as the color changes, plus a field for a custom
+/// glyph. `default_icon` is shown (and selectable) as the "no custom icon" choice;
+/// an empty `icon` means "use the default". `id_salt` keeps multiple pickers on
+/// one screen distinct.
 fn appearance_picker(
     ui: &mut egui::Ui,
+    id_salt: &str,
     icon: &mut String,
     color: &mut Option<[u8; 3]>,
     default_icon: &str,
 ) {
-    ui.horizontal(|ui| {
-        ui.label("Icon:");
-        egui::ComboBox::from_id_salt("icon-pick")
-            .selected_text(if icon.is_empty() { default_icon } else { icon.as_str() })
-            .show_ui(ui, |ui| {
-                if ui.selectable_label(icon.is_empty(), format!("{default_icon} (default)")).clicked()
+    let tint = color
+        .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+        .unwrap_or_else(|| ui.visuals().text_color());
+    let shown = if icon.is_empty() { default_icon } else { icon.as_str() };
+    let button = egui::RichText::new(format!("{shown} ▾")).size(18.0).color(tint);
+    ui.push_id(id_salt, |ui| {
+        let btn = ui.button(button);
+        // A plain popup (not a menu button): a menu closes on *any* click inside,
+        // which would dismiss it the moment you touch the color sliders or the
+        // custom-emoji field. CloseOnClickOutside keeps it open until you click away.
+        egui::Popup::menu(&btn)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+            ui.set_min_width(230.0);
+
+            // Color — inline, so the icon grid below recolors as it changes.
+            ui.label(RichText::new("Color").strong());
+            let mut c = color
+                .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+                .unwrap_or_else(|| ui.visuals().text_color());
+            if egui::color_picker::color_picker_color32(
+                ui,
+                &mut c,
+                egui::color_picker::Alpha::Opaque,
+            ) {
+                *color = Some([c.r(), c.g(), c.b()]);
+            }
+            if color.is_some() && ui.button("Use default color").clicked() {
+                *color = None;
+            }
+
+            ui.separator();
+
+            // Icon grid, tinted with the current color in real time.
+            ui.label(RichText::new("Icon").strong());
+            let grid_tint = color
+                .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+                .unwrap_or_else(|| ui.visuals().text_color());
+            egui::Grid::new("icon-grid").spacing([2.0, 2.0]).show(ui, |ui| {
+                let default_cell =
+                    RichText::new(default_icon).size(22.0).color(grid_tint);
+                if ui
+                    .selectable_label(icon.is_empty(), default_cell)
+                    .on_hover_text("Default")
+                    .clicked()
                 {
                     icon.clear();
                 }
+                let mut in_row = 1;
                 for choice in ICON_CHOICES {
-                    if ui.selectable_label(icon == choice, *choice).clicked() {
+                    let cell = RichText::new(*choice).size(22.0).color(grid_tint);
+                    if ui.selectable_label(icon == choice, cell).clicked() {
                         *icon = (*choice).to_owned();
+                    }
+                    in_row += 1;
+                    if in_row % 7 == 0 {
+                        ui.end_row();
                     }
                 }
             });
-        ui.label("Color:");
-        let mut rgb = color.unwrap_or([200, 200, 200]);
-        if ui.color_edit_button_srgb(&mut rgb).changed() {
-            *color = Some(rgb);
-        }
-        if color.is_some() && ui.small_button("✕").on_hover_text("Clear color").clicked() {
-            *color = None;
-        }
+
+            ui.separator();
+
+            // Custom glyph: any emoji/character the user wants to paste in.
+            ui.horizontal(|ui| {
+                ui.label("Custom:");
+                ui.add(
+                    egui::TextEdit::singleline(icon)
+                        .desired_width(70.0)
+                        .hint_text("emoji"),
+                );
+            });
+        });
     });
+}
+
+/// Encodes `rgba` (tightly packed, `w`×`h`) as a PNG at `path`.
+fn save_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> anyhow::Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
+    Ok(())
 }
 
 /// Writes `text` to a temp file and prints it via the platform's print command
@@ -8679,57 +9008,71 @@ mod tests {
         assert_eq!(web_gui_url("  10.0.0.1/  ", WebScheme::Https), "https://10.0.0.1");
     }
 
+    // --- Broadcast recipient selection (scope must never leave the active tab) ---
+    //
+    // These helpers are fed only the *active tab's* panes by their callers, so the
+    // tab-scoping guarantee is structural; the tests pin the within-tab rules.
+
     #[test]
-    fn rdp_command_freerdp_style() {
-        assert_eq!(
-            rdp_command("xfreerdp", "10.0.0.5", 3389, "admin", "", None),
-            (vec!["/v:10.0.0.5".to_owned(), "/u:admin".to_owned()], None)
-        );
-        assert_eq!(
-            rdp_command("/usr/bin/xfreerdp3", "host", 3389, "", "", None),
-            (vec!["/v:host".to_owned()], None)
-        );
-        assert_eq!(
-            rdp_command("wlfreerdp", "host", 3390, "u", "CORP", None),
-            (vec!["/v:host:3390".to_owned(), "/u:u".to_owned(), "/d:CORP".to_owned()], None)
-        );
+    fn typed_broadcast_mirrors_to_other_non_excluded_panes() {
+        // Three panes, source = 1, pane 3 excluded.
+        let panes = [(1u64, false), (2, false), (3, true)];
+        assert_eq!(broadcast_typed_recipients(&panes, 1), vec![2]);
     }
 
     #[test]
-    fn rdp_command_password_via_stdin() {
-        let (args, stdin) = rdp_command("xfreerdp", "host", 3389, "u", "", Some("s3cret"));
-        assert_eq!(args, ["/v:host", "/u:u", "/from-stdin"]);
-        assert_eq!(stdin.as_deref(), Some("s3cret"));
+    fn typed_broadcast_single_pane_has_no_recipients() {
+        // One pane that is also the source → nothing to mirror to, so broadcast
+        // cannot expand input even if the flag/shortcut left it on.
+        let panes = [(1u64, false)];
+        assert!(broadcast_typed_recipients(&panes, 1).is_empty());
     }
 
     #[test]
-    fn rdp_command_remmina_and_mstsc() {
-        assert_eq!(
-            rdp_command("remmina", "host", 3389, "bob", "", Some("pw")),
-            (vec!["-c".to_owned(), "rdp://bob@host".to_owned()], None)
-        );
-        assert_eq!(
-            rdp_command("mstsc", "host", 3389, "bob", "", Some("pw")),
-            (vec!["/v:host".to_owned()], None)
-        );
+    fn macro_broadcast_expands_only_within_a_targeted_multi_pane_tab() {
+        // Active tab has panes 1,2,3; the macro originally targeted pane 1.
+        // Expansion reaches the other non-excluded panes (2), not excluded (3),
+        // and the explicit target (1) always receives.
+        let panes = [(1u64, false), (2, false), (3, true)];
+        let mut got = broadcast_macro_recipients(&panes, &[1]);
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
     }
 
     #[test]
-    fn vnc_command_styles() {
-        assert_eq!(
-            vnc_command("vncviewer", "host", 5900, None),
-            (vec!["host::5900".to_owned()], None)
-        );
-        let (args, stdin) = vnc_command("xtigervncviewer", "host", 5901, Some("pw"));
-        assert_eq!(args, ["-autopass", "host::5901"]);
-        assert_eq!(stdin.as_deref(), Some("pw"));
-        assert_eq!(
-            vnc_command("remmina", "host", 5900, None),
-            (vec!["-c".to_owned(), "vnc://host:5900".to_owned()], None)
-        );
-        assert_eq!(
-            vnc_command("open", "host", 5900, None),
-            (vec!["vnc://host:5900".to_owned()], None)
-        );
+    fn macro_broadcast_honours_excluded_explicit_target() {
+        // An excluded pane that is an explicit target still receives it.
+        let panes = [(1u64, true), (2, false)];
+        let mut got = broadcast_macro_recipients(&panes, &[1]);
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
+    }
+
+    #[test]
+    fn macro_broadcast_does_not_spread_into_untargeted_tab() {
+        // Simulates the user switching to a different multi-pane tab (panes 9,10)
+        // mid-run, where none of the macro's targets (1) live. No pane here is a
+        // target, so there is no expansion and nothing is delivered — the macro
+        // never leaks into an unrelated tab.
+        let panes = [(9u64, false), (10, false)];
+        assert!(broadcast_macro_recipients(&panes, &[1]).is_empty());
+    }
+
+    #[test]
+    fn macro_broadcast_single_pane_target_does_not_expand() {
+        // A single-pane active tab that *is* the target: delivers only to that
+        // pane, never expands (needs more than one pane).
+        let panes = [(1u64, false)];
+        assert_eq!(broadcast_macro_recipients(&panes, &[1]), vec![1]);
+    }
+
+    #[test]
+    fn macro_broadcast_delivers_each_recipient_once() {
+        let panes = [(1u64, false), (2, false), (3, false)];
+        let got = broadcast_macro_recipients(&panes, &[1, 2]);
+        let mut unique = got.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(got.len(), unique.len(), "no recipient should appear twice");
     }
 }

@@ -45,7 +45,19 @@ wazowski-servers = { path = "crates/wazowski-servers" }
 rfd = "0.15"
 wazowski-core = { path = "crates/wazowski-core" }
 wazowski-term = { path = "crates/wazowski-term" }
+wazowski-remote = { path = "crates/wazowski-remote" }
 
 [profile.release]
 strip = true
 lto = "thin"
+
+# Vendored vnc-rs with VncClient::new / AuthHelper exposed, so wazowski-remote can
+# run the RFB handshake itself (needed for VeNCrypt + TLS, which upstream lacks).
+[patch.crates-io]
+vnc-rs = { path = "vendor/vnc-rs" }
+# picky rc.25 with its `curve25519-dalek =5.0.0-rc.1` pin relaxed to `^5`, so
+# ironrdp's connector can coexist with russh (which needs curve25519-dalek ^5).
+# Same crate version (7.0.0-rc.25), so it still satisfies ironrdp's exact req.
+picky = { path = "vendor/picky" }
+# sspi rc.X with the same pre-release crypto pins relaxed, for the same reason.
+sspi = { path = "vendor/sspi" }

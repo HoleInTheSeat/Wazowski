@@ -544,7 +544,9 @@ fn show_pane(mut cx: Ctx, ui: &mut Ui, pane: &mut Pane, area: Rect) {
             if let Some(bar) = bar {
                 title_bar(&mut cx, ui, bar, leaf, id);
             }
-            if cx.broadcast_active {
+            // The per-pane exclude toggle is only meaningful when broadcasting
+            // across more than one pane; with a single pane it has nothing to do.
+            if cx.broadcast_active && cx.multi {
                 exclude_toggle(ui, &mut leaf.term, bar.unwrap_or(area));
             }
             if cx.multi && id == cx.focused {

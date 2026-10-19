@@ -71,6 +71,12 @@ pub struct Macro {
     pub name: String,
     #[serde(default, rename = "step")]
     pub steps: Vec<Step>,
+    /// Custom icon glyph; empty means the default gear icon.
+    #[serde(default)]
+    pub icon: String,
+    /// Custom RGB tint; `None` means the theme's default text color.
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
 }
 
 /// Persisted list of macros (`macros.toml`).
@@ -212,6 +218,8 @@ mod tests {
                 Step::Key { chord: "Ctrl+C".into() },
                 Step::Delay { ms: 200 },
             ],
+            icon: String::new(),
+            color: None,
         };
         let file = MacrosFile { macros: vec![m] };
         let text = toml::to_string_pretty(&file).unwrap();

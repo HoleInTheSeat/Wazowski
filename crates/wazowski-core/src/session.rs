@@ -92,6 +92,31 @@ pub struct Session {
     /// Remembered SFTP auto-refresh state for this session.
     #[serde(default)]
     pub sftp_auto_refresh: bool,
+    /// VNC: observe only (don't send input).
+    #[serde(default)]
+    pub vnc_view_only: bool,
+    /// VNC: encoding/quality preference.
+    #[serde(default)]
+    pub vnc_quality: VncQuality,
+    /// RDP: desired width in pixels; `0` means fit the window.
+    #[serde(default)]
+    pub rdp_width: u16,
+    /// RDP: desired height in pixels; `0` means fit the window.
+    #[serde(default)]
+    pub rdp_height: u16,
+}
+
+/// VNC encoding/quality preference (maps to the backend's encoding set).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VncQuality {
+    /// Balanced ZRLE-based encodings.
+    #[default]
+    Auto,
+    /// Favor image fidelity (more bandwidth).
+    High,
+    /// Favor bandwidth over fidelity.
+    Low,
 }
 
 fn default_port() -> u16 {
@@ -115,6 +140,10 @@ impl Session {
             icon: String::new(),
             color: None,
             sftp_auto_refresh: false,
+            vnc_view_only: false,
+            vnc_quality: VncQuality::default(),
+            rdp_width: 0,
+            rdp_height: 0,
         }
     }
 
