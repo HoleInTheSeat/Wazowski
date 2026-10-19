@@ -7,9 +7,12 @@ use std::path::PathBuf;
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, RichText};
 use wazowski_core::session::Auth;
 use wazowski_core::{
-    FolderStyle, Protocol, Secret, Session, SessionStore, Vault, VaultError, VncQuality,
+    FolderStyle, Protocol, RdpQuality, Secret, Session, SessionStore, Vault, VaultError, VncQuality,
 };
-use wazowski_remote::{RemoteOptions, VncQuality as RemoteQuality, connect_rdp, connect_vnc};
+use wazowski_remote::{
+    RdpQuality as RemoteRdpQuality, RemoteOptions, VncQuality as RemoteQuality, connect_rdp,
+    connect_vnc,
+};
 use wazowski_ssh::{
     AuthMaterial, ConnectParams, HostKeyPolicy, UnknownHostKey, trust_host,
 };
@@ -43,6 +46,8 @@ struct Tab {
     content: TabContent,
     /// Present for SSH tabs: the SFTP file browser for the same session.
     files: Option<FileBrowser>,
+    /// Present for RDP tabs: the SMB file browser for `\\host\C$`.
+    smb: Option<crate::smb_ui::SmbBrowser>,
     /// How to restart this tab's session once it ends. SSH/serial tabs stay open
     /// when their session closes; local shells auto-close.
     restart: Option<RestartKind>,
@@ -93,6 +98,56 @@ enum PortMode {
     Custom,
 }
 
+/// State for the web/API tools (JSON puller, API tool) and IP viewer.
+#[derive(Default)]
+struct WebToolsState {
+    // JSON/jq puller.
+    json_url: String,
+    json_filter: String,
+    json_job: Option<network::Job<Result<String, String>>>,
+    json_raw: String,
+    json_output: String,
+    json_error: Option<String>,
+    // API tool.
+    api_method: ApiMethod,
+    api_url: String,
+    api_headers: String,
+    api_body: String,
+    api_job: Option<network::Job<Result<network::HttpResponse, String>>>,
+    api_response: Option<network::HttpResponse>,
+    api_error: Option<String>,
+    // IP address viewer.
+    ip_info: Option<network::IpInfo>,
+    public_ip: Option<String>,
+    public_ip_job: Option<network::Job<Result<String, String>>>,
+}
+
+/// HTTP method for the API tool.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ApiMethod {
+    #[default]
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+impl ApiMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            ApiMethod::Get => "GET",
+            ApiMethod::Post => "POST",
+            ApiMethod::Put => "PUT",
+            ApiMethod::Patch => "PATCH",
+            ApiMethod::Delete => "DELETE",
+        }
+    }
+    fn has_body(self) -> bool {
+        matches!(self, ApiMethod::Post | ApiMethod::Put | ApiMethod::Patch)
+    }
+}
+
 /// State for the network toolbox tab.
 struct NetworkState {
     port_target: String,
@@ -137,6 +192,14 @@ impl Default for NetworkState {
 /// A split-pane action requested from the tab strip, applied after the UI pass.
 enum SplitButton {
     Split(SplitDir),
+}
+
+/// Which saved-history list an entry belongs to (for deletion).
+#[derive(Clone, Copy)]
+enum HistoryList {
+    JsonUrl,
+    JqFilter,
+    ApiUrl,
 }
 
 /// A remote-desktop toolbar action for the active RDP/VNC tab.
@@ -238,6 +301,85 @@ fn eye_button(ui: &mut egui::Ui, shown: bool) -> bool {
 /// A full-width quick-filter text field with a magnifier hint.
 fn filter_box(ui: &mut egui::Ui, buf: &mut String) {
     ui.add(egui::TextEdit::singleline(buf).hint_text("🔍 filter").desired_width(f32::INFINITY));
+}
+
+/// A single-line field with history autocomplete: as the user types, a dropdown
+/// of saved `options` matching the text appears; a ▾ button browses them all.
+/// A left-clicked entry is written into `buf`; a right-clicked entry is returned
+/// (so the caller can confirm and delete it).
+fn history_box(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    buf: &mut String,
+    options: &[String],
+    hint: &str,
+) -> Option<String> {
+    ui.push_id(id_salt, |ui| {
+        let mut cmd: Option<egui::SetOpenCommand> = None;
+        let (resp, toggled) = ui
+            .horizontal(|ui| {
+                let resp = ui
+                    .add(egui::TextEdit::singleline(buf).desired_width(360.0).hint_text(hint));
+                let toggled = ui.button("▾").on_hover_text("Saved entries").clicked();
+                (resp, toggled)
+            })
+            .inner;
+        // Open while typing; the ▾ button toggles browsing them all.
+        if resp.changed() {
+            cmd = Some(egui::SetOpenCommand::Bool(true));
+        }
+        if toggled {
+            cmd = Some(egui::SetOpenCommand::Toggle);
+        }
+        let needle = buf.to_lowercase();
+        let matches: Vec<&String> = options
+            .iter()
+            .filter(|o| needle.is_empty() || o.to_lowercase().contains(&needle))
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        let width = resp.rect.width().max(320.0);
+        let mut delete = None;
+        egui::Popup::from_response(&resp)
+            .open_memory(cmd)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .gap(2.0)
+            .show(|ui| {
+                ui.set_min_width(width);
+                // Each entry fills the row and truncates with an ellipsis rather
+                // than wrapping onto multiple lines.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    let row_w = ui.available_width();
+                    let row_h = ui.spacing().interact_size.y;
+                    for opt in &matches {
+                        let r = ui
+                            .add_sized([row_w, row_h], egui::Button::selectable(false, opt.as_str()))
+                            .on_hover_ui(|ui| {
+                                // Show the full entry untruncated on one line (may
+                                // extend past the screen edge for long values).
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                                ui.label(opt.as_str());
+                                ui.label(
+                                    egui::RichText::new("Click to use · right-click to delete")
+                                        .weak()
+                                        .small(),
+                                );
+                            });
+                        if r.clicked() {
+                            *buf = (*opt).clone();
+                            ui.close();
+                        } else if r.secondary_clicked() {
+                            delete = Some((*opt).clone());
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        delete
+    })
+    .inner
 }
 
 /// Loads the embedded app icon as an egui texture, for the custom title bar.
@@ -349,6 +491,8 @@ fn compute_env_checks() -> EnvChecks {
     EnvChecks {
         iperf3: has_bin("iperf3"),
         printing: has_bin("lp") || has_bin("lpr"),
+        jq: has_bin("jq"),
+        smbclient: has_bin("smbclient"),
         low_port: low_port_granted(),
         rdp_client: detect_rdp_client(),
         vnc_client: detect_vnc_client(),
@@ -416,6 +560,8 @@ enum Dialog {
     /// Confirm typing multi-line clipboard text into a remote session (the
     /// embedded newlines act as Enter presses, which can run commands).
     ConfirmTypeText(String),
+    /// Confirm deleting a saved URL/filter history entry.
+    ConfirmDeleteHistory { list: HistoryList, value: String },
     ConfirmImportVault { src: PathBuf },
     SerialConnect(SerialForm),
     StartServer { id: String, auto_stop: bool, minutes: String },
@@ -688,6 +834,8 @@ struct SessionForm {
     /// RDP: desired width/height in pixels as text; blank/"0" means fit window.
     rdp_width: String,
     rdp_height: String,
+    /// RDP: visual-quality / bandwidth trade-off.
+    rdp_quality: RdpQuality,
     error: Option<String>,
     /// Which store to save into.
     target: StoreId,
@@ -800,6 +948,7 @@ pub struct App {
     sidebar_view: SidebarView,
     /// The network toolbox state.
     network: NetworkState,
+    webtools: WebToolsState,
     /// Serial devices detected on the system, refreshed periodically for the
     /// sidebar's "Serial connections" group.
     serial_ports: Vec<SerialDevice>,
@@ -899,7 +1048,10 @@ enum ToolsItem {
     IpScanner,
     PortScan,
     WakeOnLan,
+    JsonPull,
+    ApiTool,
     OpenPorts,
+    IpInfo,
 }
 
 /// A settings page category (left-rail selection).
@@ -919,6 +1071,10 @@ enum SettingsCategory {
 struct EnvChecks {
     iperf3: bool,
     printing: bool,
+    /// `jq` for the JSON/jq puller's filter box.
+    jq: bool,
+    /// `smbclient` for browsing an RDP host's files over SMB.
+    smbclient: bool,
     /// `Some(granted)` on Linux; `None` where not applicable.
     low_port: Option<bool>,
     /// Name of the first detected RDP client, if any (for launching saved RDP sessions).
@@ -1127,6 +1283,7 @@ impl App {
             find: None,
             sidebar_view: SidebarView::Sessions,
             network: NetworkState::default(),
+            webtools: WebToolsState::default(),
             serial_ports: sorted_serial_devices(),
             serial_ports_at: std::time::Instant::now(),
             dark_mode: true,
@@ -1399,6 +1556,7 @@ impl App {
             label: label.into(),
             content,
             files,
+            smb: None,
             restart: None,
             origin_term,
             session_id: None,
@@ -1517,6 +1675,12 @@ impl App {
             Protocol::Ssh => self.start_connect(session, ctx),
             Protocol::Rdp => {
                 let (user, password) = self.resolve_launch_creds(session);
+                let smb = crate::smb_ui::SmbBrowser::new(
+                    &session.host,
+                    &user,
+                    password.as_deref().unwrap_or(""),
+                    &session.domain,
+                );
                 let handle = connect_rdp(
                     &session.host,
                     session.port,
@@ -1526,9 +1690,11 @@ impl App {
                     session.rdp_width,
                     session.rdp_height,
                     false,
+                    to_remote_rdp_quality(session.rdp_quality),
                 );
                 let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
                 self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
+                self.tabs[self.active].smb = Some(smb);
             }
             Protocol::Vnc => {
                 let (_user, password) = self.resolve_launch_creds(session);
@@ -2590,6 +2756,22 @@ impl App {
                 ui.label(RichText::new("install CUPS to enable Print output").weak());
             }
             ui.end_row();
+            // jq (for the JSON/jq puller's filter box).
+            status(ui, "jq (JSON filtering)", checks.jq);
+            if checks.jq {
+                ui.label("");
+            } else {
+                ui.label(RichText::new("install jq to filter in the JSON puller").weak());
+            }
+            ui.end_row();
+            // smbclient (for browsing an RDP host's files over SMB).
+            status(ui, "smbclient (SMB file browser)", checks.smbclient);
+            if checks.smbclient {
+                ui.label("");
+            } else {
+                ui.label(RichText::new("install Samba's client for RDP file browsing").weak());
+            }
+            ui.end_row();
             // RDP client (for launching saved RDP sessions).
             status(ui, "RDP client", checks.rdp_client.is_some());
             match &checks.rdp_client {
@@ -2808,9 +2990,17 @@ impl App {
                     (ToolsItem::IpScanner, "IP Scanner"),
                     (ToolsItem::PortScan, "Port Scan"),
                     (ToolsItem::WakeOnLan, "Wake-on-LAN"),
+                    (ToolsItem::JsonPull, "JSON/jq Puller"),
+                    (ToolsItem::ApiTool, "API Tool"),
                 ],
             ),
-            ("Host Tools", &[(ToolsItem::OpenPorts, "Open Ports")]),
+            (
+                "Host Tools",
+                &[
+                    (ToolsItem::OpenPorts, "Open Ports"),
+                    (ToolsItem::IpInfo, "IP Address Viewer"),
+                ],
+            ),
         ];
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (category, items) in categories {
@@ -3045,24 +3235,46 @@ impl App {
 
     /// The Files view: the SFTP browser for the active single-pane SSH tab.
     fn sidebar_files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Files (SFTP)");
-        filter_box(ui, &mut self.filter_files);
-        ui.separator();
-        let single_pane = matches!(
-            self.tabs.get(self.active).map(|t| &t.content),
-            Some(TabContent::Terminal(p)) if p.count() == 1
-        );
         let highlight = self.filter_files.clone();
-        if single_pane
-            && let Some(tab) = self.tabs.get_mut(self.active)
-            && let Some(files) = &mut tab.files
-        {
-            files.set_highlight(&highlight);
-            files.ui(ui, ctx);
+        // An RDP tab browses its host over SMB; an unsplit SSH tab uses SFTP.
+        let has_smb = self.tabs.get(self.active).is_some_and(|t| t.smb.is_some());
+        let has_sftp = self.tabs.get(self.active).is_some_and(|t| {
+            t.files.is_some() && matches!(&t.content, TabContent::Terminal(p) if p.count() == 1)
+        });
+
+        if has_smb {
+            let loc = self.tabs[self.active].smb.as_ref().map(|s| s.location()).unwrap_or_default();
+            ui.heading("Files (SMB)");
+            ui.label(RichText::new(loc).monospace().weak());
+            filter_box(ui, &mut self.filter_files);
+            ui.separator();
+            if let Some(tab) = self.tabs.get_mut(self.active)
+                && let Some(smb) = &mut tab.smb
+            {
+                smb.set_highlight(&highlight);
+                smb.ui(ui, ctx);
+            }
+        } else if has_sftp {
+            ui.heading("Files (SFTP)");
+            filter_box(ui, &mut self.filter_files);
+            ui.separator();
+            if let Some(tab) = self.tabs.get_mut(self.active)
+                && let Some(files) = &mut tab.files
+            {
+                files.set_highlight(&highlight);
+                files.ui(ui, ctx);
+            }
         } else {
+            ui.heading("Files");
+            filter_box(ui, &mut self.filter_files);
+            ui.separator();
             ui.add_space(8.0);
             ui.label(
-                RichText::new("Open an SSH session (unsplit) to browse its files here.").weak(),
+                RichText::new(
+                    "Open an SSH session (unsplit) for SFTP, or an RDP session for SMB (\\\\host\\C$), \
+                     to browse files here.",
+                )
+                .weak(),
             );
         }
     }
@@ -4494,7 +4706,10 @@ impl App {
             ToolsItem::IpScanner => self.tools_ip_scanner(ui),
             ToolsItem::PortScan => self.tools_port_scan(ui),
             ToolsItem::WakeOnLan => self.tools_wol(ui),
+            ToolsItem::JsonPull => self.tools_json_pull(ui),
+            ToolsItem::ApiTool => self.tools_api(ui),
             ToolsItem::OpenPorts => self.tools_open_ports(ui),
+            ToolsItem::IpInfo => self.tools_ip_info(ui),
         }
     }
 
@@ -4737,6 +4952,359 @@ impl App {
                 Err(e) => self.error = Some(e),
             }
         }
+    }
+
+    /// Re-runs the current jq filter (or pretty-prints) against the fetched JSON.
+    fn apply_json_filter(&mut self) {
+        let w = &mut self.webtools;
+        if w.json_raw.is_empty() {
+            return;
+        }
+        let filter = w.json_filter.trim();
+        if filter.is_empty() {
+            w.json_output = network::pretty_json(&w.json_raw);
+            w.json_error = None;
+        } else {
+            match network::jq_filter(&w.json_raw, filter) {
+                Ok(out) => {
+                    w.json_output = out;
+                    w.json_error = None;
+                }
+                Err(e) => w.json_error = Some(e),
+            }
+        }
+    }
+
+    /// Network Tools ▸ JSON/jq Puller: fetch JSON from a URL and filter with jq.
+    fn tools_json_pull(&mut self, ui: &mut egui::Ui) {
+        let polled = self.webtools.json_job.as_ref().and_then(|j| j.poll());
+        if let Some(result) = polled {
+            self.webtools.json_job = None;
+            match result {
+                Ok(body) => {
+                    self.webtools.json_raw = body;
+                    self.apply_json_filter();
+                }
+                Err(e) => {
+                    self.webtools.json_error = Some(e);
+                    self.webtools.json_output.clear();
+                }
+            }
+        } else if self.webtools.json_job.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
+
+        ui.add_space(6.0);
+        ui.heading("JSON / jq Puller");
+        ui.label(RichText::new("Fetch JSON from a URL, then optionally filter it with jq.").weak());
+        ui.separator();
+        let fetching = self.webtools.json_job.is_some();
+        let mut fetch = false;
+        let mut apply = false;
+        let mut delete_req: Option<(HistoryList, String)> = None;
+        egui::Grid::new("json-pull").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("URL");
+            if let Some(v) = history_box(
+                ui,
+                "json-url",
+                &mut self.webtools.json_url,
+                &self.settings.json_urls,
+                "https://example.com/api.json",
+            ) {
+                delete_req = Some((HistoryList::JsonUrl, v));
+            }
+            ui.end_row();
+            ui.label("jq filter");
+            if let Some(v) = history_box(
+                ui,
+                "json-filter",
+                &mut self.webtools.json_filter,
+                &self.settings.jq_filters,
+                ".buildNumber   (blank = pretty-print)",
+            ) {
+                delete_req = Some((HistoryList::JqFilter, v));
+            }
+            ui.end_row();
+        });
+        if let Some((list, value)) = delete_req {
+            self.dialog = Dialog::ConfirmDeleteHistory { list, value };
+        }
+        ui.horizontal(|ui| {
+            let can_fetch = !fetching && !self.webtools.json_url.trim().is_empty();
+            if ui.add_enabled(can_fetch, egui::Button::new("Fetch")).clicked() {
+                fetch = true;
+            }
+            if ui
+                .add_enabled(!self.webtools.json_raw.is_empty(), egui::Button::new("Apply filter"))
+                .on_hover_text("Re-run the filter on the last response without re-fetching")
+                .clicked()
+            {
+                apply = true;
+            }
+            if fetching {
+                ui.spinner();
+                ui.label("Fetching…");
+            }
+            if !self.webtools.json_output.is_empty() && ui.button("Copy output").clicked() {
+                ui.ctx().copy_text(self.webtools.json_output.clone());
+            }
+        });
+        if let Some(e) = &self.webtools.json_error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        ui.separator();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.webtools.json_output.as_str())
+                    .code_editor()
+                    .desired_width(f32::INFINITY),
+            );
+        });
+
+        if fetch {
+            let url = self.webtools.json_url.trim().to_owned();
+            crate::settings::remember_in(&mut self.settings.json_urls, &url);
+            let filter = self.webtools.json_filter.trim().to_owned();
+            if !filter.is_empty() {
+                crate::settings::remember_in(&mut self.settings.jq_filters, &filter);
+            }
+            let _ = self.settings.save();
+            self.webtools.json_error = None;
+            self.webtools.json_job = Some(network::spawn_job(move || {
+                network::http_fetch(network::HttpRequest {
+                    method: "GET".to_owned(),
+                    url,
+                    headers: Vec::new(),
+                    body: None,
+                })
+                .map(|r| r.body)
+            }));
+        } else if apply {
+            self.apply_json_filter();
+        }
+    }
+
+    /// Network Tools ▸ API Tool: a minimal HTTP client (push/pull).
+    fn tools_api(&mut self, ui: &mut egui::Ui) {
+        let polled = self.webtools.api_job.as_ref().and_then(|j| j.poll());
+        if let Some(result) = polled {
+            self.webtools.api_job = None;
+            match result {
+                Ok(resp) => {
+                    self.webtools.api_response = Some(resp);
+                    self.webtools.api_error = None;
+                }
+                Err(e) => self.webtools.api_error = Some(e),
+            }
+        } else if self.webtools.api_job.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
+
+        ui.add_space(6.0);
+        ui.heading("API Tool");
+        ui.label(RichText::new("Send an HTTP request and view the response.").weak());
+        ui.separator();
+        let sending = self.webtools.api_job.is_some();
+        let mut send = false;
+        let mut api_delete: Option<(HistoryList, String)> = None;
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("api-method")
+                .selected_text(self.webtools.api_method.as_str())
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for m in [
+                        ApiMethod::Get,
+                        ApiMethod::Post,
+                        ApiMethod::Put,
+                        ApiMethod::Patch,
+                        ApiMethod::Delete,
+                    ] {
+                        ui.selectable_value(&mut self.webtools.api_method, m, m.as_str());
+                    }
+                });
+            if let Some(v) = history_box(
+                ui,
+                "api-url",
+                &mut self.webtools.api_url,
+                &self.settings.api_urls,
+                "https://api.example.com/v1/thing",
+            ) {
+                api_delete = Some((HistoryList::ApiUrl, v));
+            }
+        });
+        if let Some((list, value)) = api_delete {
+            self.dialog = Dialog::ConfirmDeleteHistory { list, value };
+        }
+        ui.add_space(4.0);
+        ui.label("Headers (one per line, `Key: Value`)");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.webtools.api_headers)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("Authorization: Bearer …"),
+        );
+        if self.webtools.api_method.has_body() {
+            ui.add_space(4.0);
+            ui.label("Body");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.webtools.api_body)
+                    .code_editor()
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let can_send = !sending && !self.webtools.api_url.trim().is_empty();
+            if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
+                send = true;
+            }
+            if sending {
+                ui.spinner();
+                ui.label("Sending…");
+            }
+        });
+        if let Some(e) = &self.webtools.api_error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        ui.separator();
+        if let Some(resp) = &self.webtools.api_response {
+            let body = resp.body.clone();
+            ui.horizontal(|ui| {
+                let color = if resp.status < 400 {
+                    Color32::from_rgb(90, 200, 90)
+                } else {
+                    ui.visuals().error_fg_color
+                };
+                ui.label(RichText::new(format!("{} {}", resp.status, resp.status_text)).color(color).strong());
+                if ui.button("Copy body").clicked() {
+                    ui.ctx().copy_text(body.clone());
+                }
+            });
+            egui::CollapsingHeader::new("Response headers").id_salt("api-resp-headers").show(ui, |ui| {
+                for (k, v) in &resp.headers {
+                    ui.label(format!("{k}: {v}"));
+                }
+            });
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let pretty = network::pretty_json(&body);
+                ui.add(
+                    egui::TextEdit::multiline(&mut pretty.as_str())
+                        .code_editor()
+                        .desired_width(f32::INFINITY),
+                );
+            });
+        }
+
+        if send {
+            let headers = self
+                .webtools
+                .api_headers
+                .lines()
+                .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())))
+                .filter(|(k, _)| !k.is_empty())
+                .collect();
+            let body = self
+                .webtools
+                .api_method
+                .has_body()
+                .then(|| self.webtools.api_body.clone())
+                .filter(|b| !b.is_empty());
+            let url = self.webtools.api_url.trim().to_owned();
+            crate::settings::remember_in(&mut self.settings.api_urls, &url);
+            let _ = self.settings.save();
+            let req = network::HttpRequest {
+                method: self.webtools.api_method.as_str().to_owned(),
+                url,
+                headers,
+                body,
+            };
+            self.webtools.api_error = None;
+            self.webtools.api_job = Some(network::spawn_job(move || network::http_fetch(req)));
+        }
+    }
+
+    /// Host Tools ▸ IP Address Viewer: public + private addressing.
+    fn tools_ip_info(&mut self, ui: &mut egui::Ui) {
+        let polled = self.webtools.public_ip_job.as_ref().and_then(|j| j.poll());
+        if let Some(result) = polled {
+            self.webtools.public_ip_job = None;
+            self.webtools.public_ip =
+                Some(result.unwrap_or_else(|e| format!("(lookup failed: {e})")));
+        } else if self.webtools.public_ip_job.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        if self.webtools.ip_info.is_none() {
+            self.webtools.ip_info = Some(network::ip_info());
+        }
+
+        ui.add_space(6.0);
+        ui.heading("IP Address Viewer");
+        ui.horizontal(|ui| {
+            if ui.button("Refresh").clicked() {
+                self.webtools.ip_info = Some(network::ip_info());
+            }
+            let looking = self.webtools.public_ip_job.is_some();
+            if ui
+                .add_enabled(!looking, egui::Button::new("Look up public IP"))
+                .on_hover_text("Makes an external request to api.ipify.org")
+                .clicked()
+            {
+                self.webtools.public_ip = None;
+                self.webtools.public_ip_job = Some(network::spawn_job(network::public_ip));
+            }
+            if looking {
+                ui.spinner();
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Public IP:").strong());
+                match &self.webtools.public_ip {
+                    Some(ip) => {
+                        ui.monospace(ip);
+                        if ui.small_button("Copy").clicked() {
+                            ui.ctx().copy_text(ip.clone());
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new("— click “Look up public IP”").weak());
+                    }
+                }
+            });
+            if let Some(info) = &self.webtools.ip_info {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Gateway:").strong());
+                    ui.monospace(info.gateway.as_deref().unwrap_or("—"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("DNS:").strong());
+                    ui.monospace(if info.dns.is_empty() { "—".to_owned() } else { info.dns.join(", ") });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Domain:").strong());
+                    ui.monospace(info.domain.as_deref().unwrap_or("—"));
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new("Private addresses").strong());
+                if info.interfaces.is_empty() {
+                    ui.label(RichText::new("No non-loopback interfaces found.").weak());
+                } else {
+                    egui::Grid::new("ip-ifaces").num_columns(2).striped(true).show(ui, |ui| {
+                        ui.label(RichText::new("Interface").strong());
+                        ui.label(RichText::new("Address").strong());
+                        ui.end_row();
+                        for iface in &info.interfaces {
+                            ui.label(&iface.name);
+                            ui.monospace(format!("{}/{}", iface.ip, iface.prefix));
+                            ui.end_row();
+                        }
+                    });
+                }
+            }
+        });
     }
 
     /// A single protocol server: config row at top, live console below.
@@ -5172,6 +5740,7 @@ impl App {
             Dialog::ConfirmDeleteVault => self.show_confirm_delete_vault(ctx),
             Dialog::ConfirmQuit => self.show_confirm_quit(ctx),
             Dialog::ConfirmTypeText(_) => self.show_confirm_type_text(ctx),
+            Dialog::ConfirmDeleteHistory { .. } => self.show_confirm_delete_history(ctx),
             Dialog::ConfirmImportVault { .. } => self.show_confirm_import_vault(ctx),
             Dialog::AskUsername(_) => self.show_ask_username(ctx),
             Dialog::AddSource(_) => self.show_add_source(ctx),
@@ -5274,6 +5843,12 @@ impl App {
         // opens a terminal tab.
         if session.protocol == Protocol::Rdp {
             let pw = (!form.password.is_empty()).then(|| form.password.clone());
+            let smb = crate::smb_ui::SmbBrowser::new(
+                &session.host,
+                &username,
+                &form.password,
+                &session.domain,
+            );
             let handle = connect_rdp(
                 &session.host,
                 session.port,
@@ -5283,9 +5858,11 @@ impl App {
                 session.rdp_width,
                 session.rdp_height,
                 false,
+                to_remote_rdp_quality(session.rdp_quality),
             );
             let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
             self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
+            self.tabs[self.active].smb = Some(smb);
             return;
         }
         let resolved = ResolvedAuth {
@@ -6382,6 +6959,36 @@ impl App {
         }
     }
 
+    /// Confirms removing a saved URL/filter history entry.
+    fn show_confirm_delete_history(&mut self, ctx: &egui::Context) {
+        let Dialog::ConfirmDeleteHistory { list, value } = &self.dialog else { return };
+        let (list, value) = (*list, value.clone());
+        let mut delete = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("confirm-delete-history")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Delete saved entry?");
+            ui.add(egui::Label::new(egui::RichText::new(&value).monospace()).wrap());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                delete = ui.button("Delete").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if delete {
+            let saved = match list {
+                HistoryList::JsonUrl => &mut self.settings.json_urls,
+                HistoryList::JqFilter => &mut self.settings.jq_filters,
+                HistoryList::ApiUrl => &mut self.settings.api_urls,
+            };
+            saved.retain(|v| v != &value);
+            let _ = self.settings.save();
+            self.dialog = Dialog::None;
+        } else if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
     /// Picks a vault file to import; confirms if one already exists.
     fn import_vault(&mut self) {
         let Some(src) = rfd::FileDialog::new().pick_file() else { return };
@@ -6977,6 +7584,17 @@ impl App {
                             ui.label(RichText::new("(blank = fit)").weak());
                         });
                         ui.end_row();
+                        ui.label("Quality");
+                        egui::ComboBox::from_id_salt("rdp-quality")
+                            .selected_text(rdp_quality_label(form.rdp_quality))
+                            .show_ui(ui, |ui| {
+                                for q in
+                                    [RdpQuality::Performance, RdpQuality::Balanced, RdpQuality::Quality]
+                                {
+                                    ui.selectable_value(&mut form.rdp_quality, q, rdp_quality_label(q));
+                                }
+                            });
+                        ui.end_row();
                     }
                     if form.protocol == Protocol::Vnc {
                         ui.label("View only");
@@ -7211,6 +7829,7 @@ impl App {
         // Blank or unparsable resolution means "fit the window" (0).
         let rdp_width = form.rdp_width.trim().parse().unwrap_or(0);
         let rdp_height = form.rdp_height.trim().parse().unwrap_or(0);
+        let rdp_quality = form.rdp_quality;
         let (source, existing_name, new_name, secret_input, key_passphrase) = (
             form.source,
             form.existing_name.clone(),
@@ -7244,6 +7863,7 @@ impl App {
         session.vnc_quality = vnc_quality;
         session.rdp_width = rdp_width;
         session.rdp_height = rdp_height;
+        session.rdp_quality = rdp_quality;
 
         // SSH supports agent/password/key; RDP/VNC only an optional vault
         // Password (the external client handles the rest). A blank credential
@@ -8103,6 +8723,7 @@ impl SessionForm {
             vnc_quality: VncQuality::Auto,
             rdp_width: String::new(),
             rdp_height: String::new(),
+            rdp_quality: RdpQuality::default(),
             error: None,
             target: StoreId::Local,
         }
@@ -8138,6 +8759,7 @@ impl SessionForm {
             vnc_quality: session.vnc_quality,
             rdp_width: if session.rdp_width == 0 { String::new() } else { session.rdp_width.to_string() },
             rdp_height: if session.rdp_height == 0 { String::new() } else { session.rdp_height.to_string() },
+            rdp_quality: session.rdp_quality,
             error: None,
             target: StoreId::Local,
         }
@@ -8595,6 +9217,24 @@ fn session_row(
             });
         }
     });
+}
+
+/// Maps the stored RDP quality to the remote crate's enum.
+fn to_remote_rdp_quality(q: RdpQuality) -> RemoteRdpQuality {
+    match q {
+        RdpQuality::Performance => RemoteRdpQuality::Performance,
+        RdpQuality::Balanced => RemoteRdpQuality::Balanced,
+        RdpQuality::Quality => RemoteRdpQuality::Quality,
+    }
+}
+
+/// Human-readable label for an RDP quality preference.
+fn rdp_quality_label(q: RdpQuality) -> &'static str {
+    match q {
+        RdpQuality::Performance => "Performance (fastest)",
+        RdpQuality::Balanced => "Balanced",
+        RdpQuality::Quality => "Quality (best looking)",
+    }
 }
 
 /// Human-readable label for a VNC quality preference.

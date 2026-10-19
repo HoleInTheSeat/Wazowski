@@ -295,6 +295,10 @@ impl SignatureAlgorithm {
 
                         let signature = ed25519_dalek::hazmat::raw_sign::<sha2::Sha512>(&esk, msg, &verifying_key);
 
+                        // Brings `to_vec` into scope; rustc's unused-import lint
+                        // misfires on this `as _` trait import, so silence it.
+                        #[allow(unused_imports)]
+                        use rsa::signature::SignatureEncoding as _;
                         Ok(signature.to_vec())
                     }
                     NamedEdAlgorithm::Known(EdAlgorithm::X25519) => Err(SignatureError::Ed {

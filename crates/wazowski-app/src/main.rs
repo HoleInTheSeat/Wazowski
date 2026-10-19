@@ -12,6 +12,7 @@ mod panes;
 mod remote_view;
 mod settings;
 mod sftp_ui;
+mod smb_ui;
 mod sources;
 mod servers_ui;
 

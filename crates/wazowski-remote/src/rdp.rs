@@ -30,6 +30,7 @@ pub struct RdpParams {
     pub width: u16,
     pub height: u16,
     pub view_only: bool,
+    pub quality: crate::RdpQuality,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -69,6 +70,32 @@ fn build_config(params: &RdpParams) -> anyhow::Result<Config> {
     let (width, height) =
         if params.width == 0 || params.height == 0 { (1280, 800) } else { (params.width, params.height) };
 
+    // Quality → color depth + server performance flags (disabling eye-candy the
+    // server would otherwise render and stream, which is the biggest bandwidth win).
+    let (color_depth, performance_flags) = match params.quality {
+        crate::RdpQuality::Performance => (
+            16,
+            PerformanceFlags::DISABLE_WALLPAPER
+                | PerformanceFlags::DISABLE_FULLWINDOWDRAG
+                | PerformanceFlags::DISABLE_MENUANIMATIONS
+                | PerformanceFlags::DISABLE_THEMING
+                | PerformanceFlags::DISABLE_CURSOR_SHADOW
+                | PerformanceFlags::DISABLE_CURSORSETTINGS,
+        ),
+        crate::RdpQuality::Balanced => (
+            32,
+            PerformanceFlags::DISABLE_WALLPAPER
+                | PerformanceFlags::DISABLE_FULLWINDOWDRAG
+                | PerformanceFlags::DISABLE_MENUANIMATIONS,
+        ),
+        crate::RdpQuality::Quality => (
+            32,
+            PerformanceFlags::DISABLE_FULLWINDOWDRAG
+                | PerformanceFlags::DISABLE_MENUANIMATIONS
+                | PerformanceFlags::ENABLE_FONT_SMOOTHING,
+        ),
+    };
+
     Ok(Config {
         desktop_size: DesktopSize { width, height },
         desktop_scale_factor: 0,
@@ -87,7 +114,7 @@ fn build_config(params: &RdpParams) -> anyhow::Result<Config> {
         keyboard_layout: 0,
         ime_file_name: String::new(),
         bitmap: Some(ironrdp::connector::BitmapConfig {
-            color_depth: 32,
+            color_depth,
             lossy_compression: true,
             codecs,
         }),
@@ -100,7 +127,7 @@ fn build_config(params: &RdpParams) -> anyhow::Result<Config> {
         request_data: None,
         autologon: false,
         enable_audio_playback: false,
-        performance_flags: PerformanceFlags::default(),
+        performance_flags,
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
         compression_type: Some(CompressionType::K64),
@@ -175,16 +202,26 @@ async fn run_inner(
     let mut keyboard = Keyboard::default();
     let mut mouse_buttons = 0u8;
 
+    // Graphics updates are coalesced: each one just marks the image dirty, and a
+    // timer publishes the latest frame at ~60 Hz. Cloning the whole framebuffer on
+    // every PDU (there can be hundreds per second while text scrolls) was the main
+    // cause of input lag — this caps it to one clone per displayed frame.
+    let mut dirty = false;
+    let mut publish_timer = tokio::time::interval(Duration::from_millis(16));
+    publish_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     'session: loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
         let outputs = tokio::select! {
-            frame = upgraded_framed.read_pdu() => {
-                let (action, payload) = frame.map_err(|e| anyhow::anyhow!("RDP read: {e}"))?;
-                active.process(&mut image, action, &payload)
-                    .map_err(|e| anyhow::anyhow!("RDP process: {e}"))?
+            _ = publish_timer.tick() => {
+                if dirty {
+                    publish(frame, &image);
+                    dirty = false;
+                }
+                Vec::new()
             }
             input = in_rx.recv() => {
                 let Some(input) = input else { break };
@@ -200,22 +237,23 @@ async fn run_inner(
                     }
                 }
             }
-            // Wake periodically so shutdown is noticed even with no traffic.
-            _ = tokio::time::sleep(Duration::from_millis(200)) => Vec::new(),
+            pdu = upgraded_framed.read_pdu() => {
+                let (action, payload) = pdu.map_err(|e| anyhow::anyhow!("RDP read: {e}"))?;
+                active.process(&mut image, action, &payload)
+                    .map_err(|e| anyhow::anyhow!("RDP process: {e}"))?
+            }
         };
 
         for out in outputs {
             match out {
-                ActiveStageOutput::ResponseFrame(frame) => {
+                ActiveStageOutput::ResponseFrame(response) => {
                     use ironrdp_tokio::FramedWrite;
                     upgraded_framed
-                        .write_all(&frame)
+                        .write_all(&response)
                         .await
                         .map_err(|e| anyhow::anyhow!("RDP write: {e}"))?;
                 }
-                ActiveStageOutput::GraphicsUpdate(_) => {
-                    publish(frame, &image);
-                }
+                ActiveStageOutput::GraphicsUpdate(_) => dirty = true,
                 ActiveStageOutput::Terminate(_) => break 'session,
                 ActiveStageOutput::DeactivateAll => {
                     anyhow::bail!("the RDP server re-initialized the session (resolution change?) — reconnect")

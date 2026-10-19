@@ -4,5 +4,5 @@
 pub mod session;
 pub mod vault;
 
-pub use session::{Auth, FolderStyle, Protocol, Session, SessionStore, VncQuality};
+pub use session::{Auth, FolderStyle, Protocol, RdpQuality, Session, SessionStore, VncQuality};
 pub use vault::{Secret, Vault, VaultError};

@@ -67,6 +67,18 @@ impl Default for RemoteOptions {
     }
 }
 
+/// RDP visual-quality / bandwidth trade-off (maps to color depth + the server
+/// performance flags that disable wallpaper, themes, animations, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RdpQuality {
+    /// Fastest: 16-bit color; disable wallpaper, themes, animations, cursor FX.
+    Performance,
+    /// Balanced: 32-bit color; disable the heaviest effects.
+    Balanced,
+    /// Best looking: 32-bit color; keep themes and font smoothing.
+    Quality,
+}
+
 /// VNC encoding preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VncQuality {
@@ -155,6 +167,7 @@ pub fn connect_rdp(
     width: u16,
     height: u16,
     view_only: bool,
+    quality: RdpQuality,
 ) -> RemoteHandle {
     let frame = Arc::new(Mutex::new(FrameBuf::default()));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -170,6 +183,7 @@ pub fn connect_rdp(
         width,
         height,
         view_only,
+        quality,
     };
     let frame_bg = Arc::clone(&frame);
     let shutdown_bg = Arc::clone(&shutdown);

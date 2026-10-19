@@ -104,6 +104,22 @@ pub struct Session {
     /// RDP: desired height in pixels; `0` means fit the window.
     #[serde(default)]
     pub rdp_height: u16,
+    /// RDP: visual-quality / bandwidth trade-off.
+    #[serde(default)]
+    pub rdp_quality: RdpQuality,
+}
+
+/// RDP visual-quality / bandwidth trade-off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RdpQuality {
+    /// Fastest: low color depth, all eye-candy disabled.
+    Performance,
+    /// Balanced (default): full color, heaviest effects disabled.
+    #[default]
+    Balanced,
+    /// Best looking: full color, themes and font smoothing on.
+    Quality,
 }
 
 /// VNC encoding/quality preference (maps to the backend's encoding set).
@@ -144,6 +160,7 @@ impl Session {
             vnc_quality: VncQuality::default(),
             rdp_width: 0,
             rdp_height: 0,
+            rdp_quality: RdpQuality::default(),
         }
     }
 

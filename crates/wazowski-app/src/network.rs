@@ -375,6 +375,202 @@ pub fn send_wol(mac: [u8; 6]) -> Result<(), String> {
     Ok(())
 }
 
+
+// ─── Web/API tools ──────────────────────────────────────────────────────────
+
+/// A one-shot background job whose single result is polled from the UI thread.
+pub struct Job<T> {
+    rx: Receiver<T>,
+}
+
+impl<T> Job<T> {
+    /// Returns the result once the job finishes, else `None`.
+    pub fn poll(&self) -> Option<T> {
+        self.rx.try_recv().ok()
+    }
+}
+
+/// Runs `f` on a worker thread; its return value is delivered to [`Job::poll`].
+pub fn spawn_job<T, F>(f: F) -> Job<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    Job { rx }
+}
+
+/// An HTTP request issued by the API tool.
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+}
+
+/// An HTTP response shown by the API tool.
+pub struct HttpResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+fn into_response(resp: ureq::Response) -> HttpResponse {
+    let status = resp.status();
+    let status_text = resp.status_text().to_owned();
+    let headers = resp
+        .headers_names()
+        .iter()
+        .filter_map(|n| resp.header(n).map(|v| (n.clone(), v.to_owned())))
+        .collect();
+    let body = resp.into_string().unwrap_or_default();
+    HttpResponse { status, status_text, headers, body }
+}
+
+/// Performs a blocking HTTP request. Non-2xx responses are returned as `Ok`
+/// (with their status and body) so the UI can display them; only transport
+/// errors become `Err`.
+pub fn http_fetch(req: HttpRequest) -> Result<HttpResponse, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let mut r = agent.request(&req.method, &req.url);
+    for (k, v) in &req.headers {
+        r = r.set(k, v);
+    }
+    let result = match &req.body {
+        Some(b) if !b.is_empty() => r.send_string(b),
+        _ => r.call(),
+    };
+    match result {
+        Ok(resp) => Ok(into_response(resp)),
+        Err(ureq::Error::Status(_, resp)) => Ok(into_response(resp)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Looks up this machine's public IP via api.ipify.org (an external query).
+pub fn public_ip() -> Result<String, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
+    agent
+        .get("https://api.ipify.org")
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_string()
+        .map(|s| s.trim().to_owned())
+        .map_err(|e| e.to_string())
+}
+
+/// Filters `json` through the system `jq` with `filter` (uses `-r` so scalar
+/// results come out raw). Requires `jq` on the PATH.
+pub fn jq_filter(json: &str, filter: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut cmd = Command::new("jq");
+    cmd.arg("-r").arg(filter).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    hide_window(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Could not run jq (is it installed? — see Settings ▸ Extras): {e}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let owned = json.to_owned();
+    let writer = thread::spawn(move || {
+        let _ = stdin.write_all(owned.as_bytes());
+    });
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let _ = writer.join();
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+    }
+}
+
+/// Pretty-prints JSON; returns the input unchanged if it isn't valid JSON.
+pub fn pretty_json(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| text.to_owned())
+}
+
+/// One local interface address.
+pub struct IfaceAddr {
+    pub name: String,
+    pub ip: String,
+    pub prefix: u8,
+}
+
+/// This host's addressing, for the IP Address Viewer.
+pub struct IpInfo {
+    pub interfaces: Vec<IfaceAddr>,
+    pub gateway: Option<String>,
+    pub dns: Vec<String>,
+    pub domain: Option<String>,
+}
+
+/// Gathers local addressing (interfaces via the OS; gateway/DNS/domain on Linux
+/// via `ip route` and `/etc/resolv.conf`; best-effort elsewhere).
+pub fn ip_info() -> IpInfo {
+    let mut interfaces = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            let (ip, prefix) = match iface.addr {
+                if_addrs::IfAddr::V4(v4) => {
+                    (v4.ip.to_string(), u32::from(v4.netmask).count_ones() as u8)
+                }
+                if_addrs::IfAddr::V6(v6) => {
+                    (v6.ip.to_string(), u128::from(v6.netmask).count_ones() as u8)
+                }
+            };
+            interfaces.push(IfaceAddr { name: iface.name, ip, prefix });
+        }
+    }
+    let (dns, domain) = resolv_conf();
+    IpInfo { interfaces, gateway: default_gateway(), dns, domain }
+}
+
+/// Parses the default gateway from `ip route show default` (Linux).
+fn default_gateway() -> Option<String> {
+    let mut cmd = Command::new("ip");
+    cmd.args(["route", "show", "default"]);
+    hide_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut tokens = text.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if tok == "via" {
+            return tokens.next().map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// Reads nameservers and the search/domain from `/etc/resolv.conf` (Linux).
+fn resolv_conf() -> (Vec<String>, Option<String>) {
+    let text = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let mut dns = Vec::new();
+    let mut domain = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(ns) = line.strip_prefix("nameserver ") {
+            dns.push(ns.trim().to_owned());
+        } else if let Some(d) = line.strip_prefix("domain ") {
+            domain = Some(d.trim().to_owned());
+        } else if let Some(s) = line.strip_prefix("search ")
+            && domain.is_none()
+        {
+            domain = Some(s.split_whitespace().next().unwrap_or("").to_owned());
+        }
+    }
+    (dns, domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

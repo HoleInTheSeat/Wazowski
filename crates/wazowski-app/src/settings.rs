@@ -102,6 +102,15 @@ pub struct Settings {
     /// Preferred VNC viewer binary; `None` auto-detects.
     #[serde(default)]
     pub vnc_client: Option<String>,
+    /// Saved URLs for the JSON/jq puller (most-recent first).
+    #[serde(default)]
+    pub json_urls: Vec<String>,
+    /// Saved jq filters for the JSON/jq puller (most-recent first).
+    #[serde(default)]
+    pub jq_filters: Vec<String>,
+    /// Saved URLs for the API tool (most-recent first).
+    #[serde(default)]
+    pub api_urls: Vec<String>,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -122,6 +131,9 @@ impl Default for Settings {
             web_scheme: WebScheme::default(),
             rdp_client: None,
             vnc_client: None,
+            json_urls: Vec::new(),
+            jq_filters: Vec::new(),
+            api_urls: Vec::new(),
             path: None,
         }
     }
@@ -134,6 +146,17 @@ impl Settings {
         self.recent.insert(0, id.to_owned());
         self.recent.truncate(10);
     }
+}
+
+/// Adds `value` to a most-recent-first history list (deduped, capped at 50).
+pub fn remember_in(list: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    list.retain(|v| v != value);
+    list.insert(0, value.to_owned());
+    list.truncate(50);
 }
 
 impl Settings {

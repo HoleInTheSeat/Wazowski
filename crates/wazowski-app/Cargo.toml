@@ -20,12 +20,15 @@ rfd.workspace = true
 directories.workspace = true
 toml.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 anyhow.workspace = true
 keyring.workspace = true
 base64 = "0.22"
 open = "5"
 fs2 = "0.4"
 png = "0.17"
+ureq = "2"
+if-addrs.workspace = true
 regex.workspace = true
 log.workspace = true
 env_logger.workspace = true

@@ -111,6 +111,17 @@ Agreed "do next" items (rough order TBD with the user):
   port-scan button.
 - **List open ports on the host** ✅ (via `ss`/`netstat`).
 - **Wake-on-LAN** ✅ — magic packet to broadcast.
+- **JSON/jq Puller** ✅ — fetch JSON from a URL (ureq) and filter with the system
+  `jq` (or pretty-print when no filter); Apply re-runs without re-fetching.
+- **API Tool** ✅ — minimal HTTP client: method, URL, `Key: Value` headers, body;
+  shows status + headers + (pretty-printed) body. Requests run off-thread.
+- **Saved URLs/filters** ✅ — the JSON puller (URL + jq filter) and API tool (URL)
+  remember what you run in `settings.toml`; a `history_box` shows a type-to-filter
+  dropdown of past entries, with a ▾ button to browse them all.
+- **IP Address Viewer** ✅ (Host Tools) — public IP (via api.ipify.org on demand)
+  plus private interfaces/prefix, gateway, DNS, and domain (Linux: `ip route`
+  + `/etc/resolv.conf`; interfaces via `if-addrs`).
+- Settings ▸ Extras now also checks for `jq`.
 
 ## Shell overhaul (done)
 
@@ -214,9 +225,17 @@ Agreed "do next" items (rough order TBD with the user):
   - **RDP** ✅ — native in-window via `ironrdp` (connect → TLS rustls+ring →
     CredSSP/NLA → `ActiveStage`; decoded RGBA published to the framebuffer; mouse
     + keyboard via fast-path, text sent as Unicode and Ctrl/Alt combos + specials
-    as scancodes). Options: resolution (blank = fit) and vault/connect creds.
+    as scancodes). Options: resolution (blank = fit), a **quality** level
+    (Performance/Balanced/Quality → color depth + server performance flags that
+    disable wallpaper/themes/animations), and vault/connect creds. Graphics updates
+    are coalesced and published to the UI at ~60 Hz — one framebuffer copy per
+    displayed frame instead of one per PDU — which removed the input lag during
+    fast screen changes.
     Tab toolbar ops: Screenshot, Paste text (clipboard → keystrokes, confirm on
-    multi-line), Ctrl+Alt+Del, and Windows (Super) key.
+    multi-line), Ctrl+Alt+Del, and Windows (Super) key. The Files pane browses the
+    RDP host over **SMB** at `\\host\C$` using the session's credentials (via the
+    system `smbclient`; password fed on stdin): list/navigate, download, upload,
+    new folder, delete. (`smb_ui.rs`; Settings ▸ Extras checks for `smbclient`.)
     The ironrdp↔russh `curve25519`/`ecdsa` pre-release conflict was resolved by
     vendoring **`picky`** and **`sspi`** (`vendor/`, via `[patch.crates-io]`) with
     their exact pre-release crypto pins relaxed to caret, so everything resolves to
