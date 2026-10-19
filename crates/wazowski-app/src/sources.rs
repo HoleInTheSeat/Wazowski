@@ -117,8 +117,10 @@ impl Backend {
         }
     }
 
-    /// Publishes bytes to the share.
-    fn publish(&self, bytes: &[u8]) -> Result<()> {
+    /// Records bytes locally without publishing to the remote. For a folder share
+    /// this writes the file directly (there is nothing to push); for git it
+    /// commits locally, leaving the commit to be pushed later via [`push`].
+    fn commit(&self, bytes: &[u8]) -> Result<()> {
         match self {
             Backend::Folder(path) => {
                 if let Some(parent) = path.parent() {
@@ -126,7 +128,39 @@ impl Backend {
                 }
                 fs::write(path, bytes).map_err(Into::into)
             }
+            Backend::Git(repo) => repo.commit(bytes),
+        }
+    }
+
+    /// Publishes bytes to the share immediately (folder write / git commit+push).
+    fn publish(&self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Backend::Folder(_) => self.commit(bytes),
             Backend::Git(repo) => repo.publish(bytes),
+        }
+    }
+
+    /// Pushes locally-committed changes. A folder share has nothing to push.
+    fn push(&self) -> Result<()> {
+        match self {
+            Backend::Folder(_) => Ok(()),
+            Backend::Git(repo) => repo.push(),
+        }
+    }
+
+    /// Whether there are local changes not yet on the remote (git only).
+    fn has_pending(&self) -> bool {
+        match self {
+            Backend::Folder(_) => false,
+            Backend::Git(repo) => repo.has_unpushed().unwrap_or(false),
+        }
+    }
+
+    /// Discards local changes, matching the remote (git only).
+    fn discard(&self) -> Result<()> {
+        match self {
+            Backend::Folder(_) => Ok(()),
+            Backend::Git(repo) => repo.discard(),
         }
     }
 }
@@ -282,16 +316,61 @@ impl SharedSource {
         self.store = SessionStore::load(self.cache_path.clone()).unwrap_or_default();
     }
 
-    /// Writes the current store to the share (and refreshes the cache).
-    fn write_through(&mut self) -> Result<()> {
+    /// Saves the store to the cache and returns its bytes.
+    fn cache_bytes(&self) -> Result<Vec<u8>> {
         self.store
             .save_as(&self.cache_path)
             .context("could not update the local cache")?;
-        let bytes = fs::read(&self.cache_path).context("reading cache")?;
-        self.backend.publish(&bytes)?;
+        fs::read(&self.cache_path).context("reading cache")
+    }
+
+    /// Records a store change: writes the cache and commits it locally. For git
+    /// this does not push — the change becomes "pending" until [`push`] or a sync
+    /// sends it. For a folder share, committing writes the file directly.
+    fn write_through(&mut self) -> Result<()> {
+        let bytes = self.cache_bytes()?;
+        self.backend.commit(&bytes)?;
         self.available = true;
         self.missing = false;
         self.status = None;
+        Ok(())
+    }
+
+    /// This source's free-text description (stored in the shared file, so it
+    /// travels with the sessions and every user sees it). Empty if none.
+    pub fn description(&self) -> &str {
+        self.store.description()
+    }
+
+    /// Sets the description in the shared file (write-through to the share).
+    pub fn set_description(&mut self, description: &str) -> Result<()> {
+        self.mutate(|s| s.set_description(description))
+    }
+
+    /// Sets the description in the in-memory store only, to be persisted by the
+    /// next `create()` — used when first creating a brand-new source's file.
+    pub fn prime_description(&mut self, description: &str) {
+        let _ = self.store.set_description(description);
+    }
+
+    /// Whether there are local changes not yet pushed to the remote (git only).
+    pub fn has_pending(&self) -> bool {
+        self.backend.has_pending()
+    }
+
+    /// Pushes locally-committed changes to the remote.
+    pub fn push(&mut self) -> Result<()> {
+        self.backend.push()?;
+        self.available = true;
+        self.missing = false;
+        self.status = None;
+        Ok(())
+    }
+
+    /// Discards local (unpushed) changes, resetting to the remote, then reloads.
+    pub fn discard(&mut self) -> Result<()> {
+        self.backend.discard()?;
+        self.reload();
         Ok(())
     }
 
@@ -305,9 +384,15 @@ impl SharedSource {
         self.write_through()
     }
 
-    /// (Re)creates the shared file from the current cache contents.
+    /// (Re)creates the shared file from the current cache contents, publishing it
+    /// immediately (this is a deliberate setup action, so it pushes right away).
     pub fn create(&mut self) -> Result<()> {
-        self.write_through()
+        let bytes = self.cache_bytes()?;
+        self.backend.publish(&bytes)?;
+        self.available = true;
+        self.missing = false;
+        self.status = None;
+        Ok(())
     }
 
     /// Whether the shared file is specifically missing (vs the location offline).
@@ -463,14 +548,22 @@ mod tests {
         source.create().unwrap();
         assert!(source.available());
         source.upsert(Session::new("web", "example.com", "root")).unwrap();
+        source.set_description("Team servers").unwrap();
         assert!(share.exists(), "share file should be written");
         assert_eq!(source.store().all().len(), 1);
+
+        // Reopen from the share: the description is stored in the file, so it and
+        // the session both come back.
+        let reopened = SharedSource::open(def.clone(), &cache);
+        assert_eq!(reopened.description(), "Team servers", "description persists in the file");
+        assert_eq!(reopened.store().all().len(), 1);
 
         // Reopen from cache with the share removed: session still present, offline.
         fs::remove_dir_all(dir.path().join("share")).unwrap();
         let offline = SharedSource::open(def, &cache);
         assert!(!offline.available());
         assert_eq!(offline.store().all().len(), 1, "cache keeps sessions when offline");
+        assert_eq!(offline.description(), "Team servers", "description available offline too");
     }
 
     #[test]
@@ -555,6 +648,11 @@ mod tests {
         a.create().unwrap();
         a.upsert(Session::new("web", "example.com", "root")).unwrap();
         assert!(a.available());
+        // Mutations now commit locally without pushing, so the change is pending
+        // until an explicit push.
+        assert!(a.has_pending(), "the local commit should be pending a push");
+        a.push().unwrap();
+        assert!(!a.has_pending(), "pushing clears the pending state");
 
         // A second clone of the same remote sees the pushed session.
         let cache_b = dir.path().join("cache-b");

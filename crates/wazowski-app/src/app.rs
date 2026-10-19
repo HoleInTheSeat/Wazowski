@@ -284,6 +284,16 @@ fn settings_category_terms(cat: SettingsCategory) -> &'static [&'static str] {
             "rdp client",
             "default web browser",
         ],
+        SettingsCategory::Backup => &[
+            "backup",
+            "back up",
+            "restore",
+            "export",
+            "import",
+            "settings file",
+            "migrate",
+            "transfer settings",
+        ],
     }
 }
 
@@ -576,6 +586,12 @@ enum Dialog {
     AskUsername(UsernamePrompt),
     AddSource(AddSourceForm),
     MissingShare { id: String },
+    /// Confirm pushing a shared source's local changes to its remote (on "Sync now").
+    ConfirmSyncPush { id: String },
+    /// Confirm importing a settings backup (overwrites the current config).
+    ImportSettings { path: PathBuf },
+    /// A plain informational modal (title + body) with an OK button.
+    Notice { title: String, body: String },
     DropMenu { payload: DragPayload, to: StoreId, folder: String },
     /// The macro editor (new or existing).
     MacroEdit(MacroForm),
@@ -603,6 +619,8 @@ struct AddSourceForm {
     /// `Some` when editing an existing source (keeps its id); `None` to add.
     edit_id: Option<String>,
     name: String,
+    /// Optional free-text description, surfaced in the source's hover tooltip.
+    description: String,
     kind: SourceKind,
     // Folder:
     path: String,
@@ -623,6 +641,7 @@ impl Default for AddSourceForm {
         Self {
             edit_id: None,
             name: String::new(),
+            description: String::new(),
             kind: SourceKind::Folder,
             path: String::new(),
             url: String::new(),
@@ -639,11 +658,13 @@ impl Default for AddSourceForm {
 }
 
 impl AddSourceForm {
-    /// Prefills the form from an existing source (and its stored HTTPS token).
-    fn from_def(def: &SourceDef, token: Option<String>) -> Self {
+    /// Prefills the form from an existing source (and its stored HTTPS token). The
+    /// description lives in the shared file, so it's passed in from the live store.
+    fn from_def(def: &SourceDef, token: Option<String>, description: &str) -> Self {
         Self {
             edit_id: Some(def.id.clone()),
             name: def.name.clone(),
+            description: description.to_owned(),
             kind: def.kind,
             path: def.path.to_string_lossy().into_owned(),
             url: def.url.clone(),
@@ -911,11 +932,12 @@ pub struct App {
     next_tab_id: u64,
     /// Set once the user has confirmed quitting, so the window is allowed to close.
     quitting: bool,
+    /// Shared sources with unpushed changes at the last close attempt, as
+    /// `(id, name)`, so the quit dialog can offer to push or discard them.
+    quit_pending: Vec<(String, String)>,
     /// Configured shared sources and their live state.
     sources_config: SourcesConfig,
     shared: Vec<SharedSource>,
-    /// When shared sources were last auto-synced.
-    last_sync: std::time::Instant,
     /// Quick-server configs plus their running state.
     servers_store: ServersStore,
     servers: Vec<ServerEntry>,
@@ -1064,6 +1086,7 @@ enum SettingsCategory {
     Terminal,
     Keybindings,
     Extras,
+    Backup,
 }
 
 /// Cached results of the Extras environment checks.
@@ -1266,9 +1289,9 @@ impl App {
             quick_connect: String::new(),
             next_tab_id: 1,
             quitting: false,
+            quit_pending: Vec::new(),
             sources_config,
             shared,
-            last_sync: std::time::Instant::now(),
             servers_store,
             servers,
             admin_task: None,
@@ -2480,6 +2503,7 @@ impl App {
                 }
                 SettingsCategory::Keybindings => self.settings_keybindings(ui),
                 SettingsCategory::Extras => self.settings_extras(ui, &mut extras_action),
+                SettingsCategory::Backup => self.settings_backup(ui),
             }
         });
 
@@ -2860,6 +2884,170 @@ impl App {
         }
     }
 
+    /// The Backup category: export all settings to one portable file, or import
+    /// such a file into this instance.
+    fn settings_backup(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Backup & restore").strong());
+        ui.label(
+            RichText::new(
+                "Export your settings — general preferences, shared-source setup, sessions, \
+                 macros, quick servers, keybindings and highlights — to a single file you can \
+                 back up or import into another Wazowski instance.",
+            )
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "The encrypted vault (passwords and keys) is not included — back it up from \
+                 the Vault section. Git tokens live in your OS keyring and are re-entered after \
+                 importing.",
+            )
+            .weak(),
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button("💾  Export settings…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_file_name(crate::backup::DEFAULT_FILENAME)
+                    .add_filter("TOML", &["toml"])
+                    .save_file()
+            {
+                match crate::backup::export_to(&path) {
+                    Ok(()) => {
+                        self.dialog = Dialog::Notice {
+                            title: "Settings exported".into(),
+                            body: format!("Saved your settings backup to:\n{}", path.display()),
+                        };
+                    }
+                    Err(e) => self.error = Some(format!("Export failed: {e:#}")),
+                }
+            }
+            if ui.button("📥  Import settings…").clicked()
+                && let Some(path) =
+                    rfd::FileDialog::new().add_filter("TOML", &["toml"]).pick_file()
+            {
+                self.dialog = Dialog::ImportSettings { path };
+            }
+        });
+    }
+
+    /// Confirms importing a settings backup, then applies it and reloads.
+    fn show_import_settings(&mut self, ctx: &egui::Context) {
+        let Dialog::ImportSettings { path } = &self.dialog else { return };
+        let path = path.clone();
+        let mut import = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("import-settings")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading("Import settings?");
+            ui.label(format!("From: {}", path.display()));
+            ui.add_space(6.0);
+            ui.label(
+                "This replaces your current settings, shared sources, sessions, macros, \
+                 quick servers, keybindings and highlights with the ones in the backup. Your \
+                 vault is left untouched.",
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                import |= ui.button("Import").clicked();
+                cancel |= ui.button("Cancel").clicked();
+            });
+        });
+        if import {
+            match crate::backup::import_from(&path) {
+                Ok(restored) => {
+                    self.reload_all_config();
+                    self.dialog = Dialog::Notice {
+                        title: "Settings imported".into(),
+                        body: format!(
+                            "Restored {} file(s). Everything is applied now; restart Wazowski \
+                             if anything looks out of date.",
+                            restored.len()
+                        ),
+                    };
+                }
+                Err(e) => {
+                    self.error = Some(format!("Import failed: {e:#}"));
+                    self.dialog = Dialog::None;
+                }
+            }
+        } else if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// A plain informational modal with a single OK button.
+    fn show_notice(&mut self, ctx: &egui::Context) {
+        let Dialog::Notice { title, body } = &self.dialog else { return };
+        let (title, body) = (title.clone(), body.clone());
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("notice")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading(title);
+            ui.add_space(4.0);
+            ui.label(body);
+            ui.add_space(8.0);
+            close |= ui.button("OK").clicked();
+        });
+        if close {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// Reloads every on-disk config into the running app (after a settings
+    /// import). Running quick-servers keep their handles so they aren't orphaned.
+    fn reload_all_config(&mut self) {
+        self.sessions = SessionStore::default_path()
+            .and_then(SessionStore::load)
+            .unwrap_or_default();
+        self.settings = Settings::load_or_default();
+        self.highlights = HighlightStore::load_or_default();
+        self.keymap = Keymap::default_path().and_then(Keymap::load).unwrap_or_else(|_| Keymap::defaults());
+        self.macros =
+            MacroStore::default_path().and_then(MacroStore::load).unwrap_or_else(|_| MacroStore::empty());
+
+        // Shared sources: reopen each from the (possibly new) config.
+        self.sources_config = SourcesConfig::default_path()
+            .and_then(SourcesConfig::load)
+            .or_else(|_| SourcesConfig::load("sources.toml".into()))
+            .expect("loading a missing sources file yields an empty config");
+        let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
+        self.shared =
+            self.sources_config.defs.iter().map(|def| SharedSource::open(def.clone(), &cache)).collect();
+
+        // Quick servers: reload configs, but carry over any still-running server's
+        // handle so importing settings doesn't orphan a running server.
+        self.servers_store = ServersStore::default_path()
+            .and_then(ServersStore::load)
+            .or_else(|_| ServersStore::load("servers.toml".into()))
+            .expect("loading a missing servers file yields an empty store");
+        let mut old: std::collections::HashMap<String, ServerEntry> = std::mem::take(&mut self.servers)
+            .into_iter()
+            .map(|e| (e.config.id.clone(), e))
+            .collect();
+        self.servers = self
+            .servers_store
+            .configs
+            .iter()
+            .cloned()
+            .map(|cfg| match old.remove(&cfg.id) {
+                // Keep the running handle; refresh the config from the import.
+                Some(mut existing) if existing.is_running() => {
+                    existing.config = cfg;
+                    existing
+                }
+                _ => ServerEntry::new(cfg),
+            })
+            .collect();
+        // Preserve any running server whose config the import dropped.
+        for (_, entry) in old {
+            if entry.is_running() {
+                self.servers.push(entry);
+            }
+        }
+    }
+
     /// Deletes the vault file and any saved key, after confirmation.
     fn delete_vault(&mut self) {
         let _ = Vault::disable_keyring_unlock();
@@ -2945,6 +3133,7 @@ impl App {
             (SettingsCategory::Terminal, "Terminal"),
             (SettingsCategory::Keybindings, "Keybindings"),
             (SettingsCategory::Extras, "Extras"),
+            (SettingsCategory::Backup, "Backup"),
         ];
         // A category matches on its name or the terms of the settings it holds.
         let matches = |cat: SettingsCategory, label: &str| {
@@ -3314,8 +3503,25 @@ impl App {
         });
         ui.separator();
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            self.session_tree(ui, ctx);
+        // Serial connections: a short panel fixed below the sessions list, with a
+        // separator line across its top. It spans the pane's full width, and the
+        // sessions list (with its scroll bar) stays within the area above it.
+        egui::Panel::bottom("serial-panel")
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::symmetric(6, 4)),
+            )
+            .show(ui, |ui| {
+                self.serial_bar(ui);
+            });
+
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                self.session_tree(ui, ctx);
+            });
         });
     }
 
@@ -3425,7 +3631,6 @@ impl App {
 
     fn session_tree(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut action: Option<TreeAction> = None;
-        let mut open_serial: Option<String> = None;
         let filter = self.filter_sessions.to_lowercase();
 
         // Destinations for move/copy: the local store plus every reachable share.
@@ -3470,7 +3675,16 @@ impl App {
                 }
                 render_store(ui, &store, source.store(), editable, &destinations, &mut action, &filter);
             });
-            delayed_tooltip(ui, &resp.header_response, &source_hint(source.def()));
+            let desc = source.description().to_owned();
+            let hint = source_hint(source.def());
+            delayed_tooltip_ui(ui, &resp.header_response, |ui| {
+                // Optional description on top, then a separator, then the details.
+                if !desc.is_empty() {
+                    ui.label(&desc);
+                    ui.separator();
+                }
+                ui.label(hint);
+            });
             // Dropping onto the source header targets that store's root.
             if editable
                 && let Some(payload) = resp.header_response.dnd_release_payload::<DragPayload>()
@@ -3516,38 +3730,6 @@ impl App {
             });
         }
 
-        // Detected serial devices, always below everything else. Collapsed by
-        // default; grouped by kind; double-click a device to open a connection.
-        egui::CollapsingHeader::new("🔌 Serial connections")
-            .id_salt("serial-devices")
-            .default_open(false)
-            .show(ui, |ui| {
-                if self.serial_ports.is_empty() {
-                    ui.label(RichText::new("No serial devices detected.").weak());
-                }
-                for kind in [SerialKind::Usb, SerialKind::Bluetooth, SerialKind::Pci, SerialKind::Other]
-                {
-                    let group: Vec<&SerialDevice> =
-                        self.serial_ports.iter().filter(|d| d.kind == kind).collect();
-                    if group.is_empty() {
-                        continue;
-                    }
-                    egui::CollapsingHeader::new(kind.label())
-                        .id_salt(("serial-kind", kind.label()))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            for dev in group {
-                                let short = dev.name.rsplit(['/', '\\']).next().unwrap_or(&dev.name);
-                                let resp = ui.selectable_label(false, format!("🔌 {short}"));
-                                delayed_tooltip(ui, &resp, &dev.name);
-                                if resp.double_clicked() {
-                                    open_serial = Some(dev.name.clone());
-                                }
-                            }
-                        });
-                }
-            });
-
         // Fill the remaining blank space as a drop zone + right-click menu for
         // the local store, so the whole empty pane is usable.
         let bg = ui.allocate_response(ui.available_size(), egui::Sense::click());
@@ -3577,14 +3759,52 @@ impl App {
         if add_source {
             self.dialog = Dialog::AddSource(AddSourceForm::default());
         }
+
+        self.apply_tree_action(action, ctx);
+    }
+
+    /// The contents of the serial-connections panel: a button that opens a menu
+    /// with a submenu per device kind (USB, Bluetooth, …); clicking a device
+    /// starts a serial connection.
+    fn serial_bar(&mut self, ui: &mut egui::Ui) {
+        // Snapshot the device list (kind, short name, full path) so the menu
+        // closure borrows nothing from `self`.
+        let devices: Vec<(SerialKind, String, String)> = self
+            .serial_ports
+            .iter()
+            .map(|d| {
+                let short = d.name.rsplit(['/', '\\']).next().unwrap_or(&d.name).to_owned();
+                (d.kind, short, d.name.clone())
+            })
+            .collect();
+
+        let mut open_serial: Option<String> = None;
+        ui.menu_button("🔌 Serial connections", |ui| {
+            if devices.is_empty() {
+                ui.label(RichText::new("No serial devices detected.").weak());
+            }
+            for kind in [SerialKind::Usb, SerialKind::Bluetooth, SerialKind::Pci, SerialKind::Other] {
+                let group: Vec<&(SerialKind, String, String)> =
+                    devices.iter().filter(|d| d.0 == kind).collect();
+                if group.is_empty() {
+                    continue;
+                }
+                ui.menu_button(kind.label(), |ui| {
+                    for (_, short, full) in group {
+                        if ui.button(format!("🔌 {short}")).on_hover_text(full.as_str()).clicked() {
+                            open_serial = Some(full.clone());
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        });
         if let Some(port) = open_serial {
             let mut form = SerialForm::new();
             form.path = port;
             form.locked_port = true;
             self.dialog = Dialog::SerialConnect(form);
         }
-
-        self.apply_tree_action(action, ctx);
     }
 
     fn apply_tree_action(&mut self, action: Option<TreeAction>, ctx: &egui::Context) {
@@ -3694,9 +3914,14 @@ impl App {
             TreeAction::DeleteFolder(store, name) => self.store_remove_folder(&store, &name),
             TreeAction::SyncSource(id) => {
                 if let Some(source) = self.shared.iter_mut().find(|s| s.id() == id) {
+                    // Pull incoming changes first.
                     source.reload();
                     if !source.available() {
                         self.dialog = Dialog::MissingShare { id };
+                    } else if source.has_pending() {
+                        // There are outgoing changes to push — confirm first. If the
+                        // sync was purely incoming, has_pending() is false and we're done.
+                        self.dialog = Dialog::ConfirmSyncPush { id };
                     }
                 }
                 Ok(())
@@ -3711,12 +3936,14 @@ impl App {
             TreeAction::EditSource(id) => {
                 if let Some(source) = self.shared.iter().find(|s| s.id() == id) {
                     let def = source.def().clone();
+                    let description = source.description().to_owned();
                     let token = if def.auth == GitAuthKind::Https {
                         sources::load_git_token(&def.id)
                     } else {
                         None
                     };
-                    self.dialog = Dialog::AddSource(AddSourceForm::from_def(&def, token));
+                    self.dialog =
+                        Dialog::AddSource(AddSourceForm::from_def(&def, token, &description));
                 }
                 Ok(())
             }
@@ -5748,6 +5975,9 @@ impl App {
             Dialog::StartServer { .. } => self.show_start_server(ctx),
             Dialog::ServerFix { .. } => self.show_server_fix(ctx),
             Dialog::MissingShare { .. } => self.show_missing_share(ctx),
+            Dialog::ConfirmSyncPush { .. } => self.show_confirm_sync_push(ctx),
+            Dialog::ImportSettings { .. } => self.show_import_settings(ctx),
+            Dialog::Notice { .. } => self.show_notice(ctx),
             Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
             Dialog::MacroEdit(_) => self.show_macro_edit(ctx),
             Dialog::ConfirmMacro { .. } => self.show_confirm_macro(ctx),
@@ -6643,6 +6873,44 @@ impl App {
         }
     }
 
+    /// Confirms pushing a shared source's local changes to its remote, from the
+    /// "Sync now" action. Only shown when there are outgoing changes to push.
+    fn show_confirm_sync_push(&mut self, ctx: &egui::Context) {
+        let Dialog::ConfirmSyncPush { id } = &self.dialog else { return };
+        let id = id.clone();
+        let name = self
+            .shared
+            .iter()
+            .find(|s| s.id() == id)
+            .map(|s| s.name().to_owned())
+            .unwrap_or_default();
+        let mut push = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("confirm-sync-push")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Push changes?");
+            ui.label(format!(
+                "\u{201c}{name}\u{201d} has local changes that are not yet on the remote. \
+                 Push them now?"
+            ));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                push |= ui.button("Push").clicked();
+                cancel |= ui.button("Cancel").clicked();
+            });
+        });
+        if push {
+            if let Some(source) = self.shared.iter_mut().find(|s| s.id() == id)
+                && let Err(e) = source.push()
+            {
+                self.error = Some(format!("Push failed: {e:#}"));
+            }
+            self.dialog = Dialog::None;
+        } else if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
     fn show_add_source(&mut self, ctx: &egui::Context) {
         let mut add = false;
         let mut cancel = false;
@@ -6664,6 +6932,14 @@ impl App {
                 egui::Grid::new("add-source-fields").num_columns(2).show(ui, |ui| {
                     ui.label("Name");
                     ui.text_edit_singleline(&mut f.name);
+                    ui.end_row();
+                    ui.label("Description");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut f.description)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Optional; shown in the hover tooltip"),
+                    );
                     ui.end_row();
                     ui.label("Type");
                     ui.horizontal(|ui| {
@@ -6771,12 +7047,13 @@ impl App {
             && let Dialog::AddSource(f) = &self.dialog
         {
             let editing = f.edit_id.is_some();
+            let description = f.description.trim().to_owned();
             match self.build_source_def(f) {
                 Ok((def, token)) => {
                     if editing {
-                        self.update_source(def, token);
+                        self.update_source(def, token, &description);
                     } else {
-                        self.add_source(def, token);
+                        self.add_source(def, token, &description);
                     }
                     self.dialog = Dialog::None;
                 }
@@ -6837,7 +7114,7 @@ impl App {
         Ok((def, token))
     }
 
-    fn add_source(&mut self, def: SourceDef, token: Option<String>) {
+    fn add_source(&mut self, def: SourceDef, token: Option<String>, description: &str) {
         if let Some(token) = token
             && let Err(e) = sources::store_git_token(&def.id, &token)
         {
@@ -6850,20 +7127,26 @@ impl App {
         }
         let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
         let mut source = SharedSource::open(def, &cache);
-        // A new source's file usually doesn't exist yet; create it so the share
-        // is immediately usable (and later deletion registers as offline).
-        if !source.available()
-            && source.missing()
-            && let Err(e) = source.create()
+        // A new source's file usually doesn't exist yet; create it (with the
+        // description baked in) so the share is immediately usable.
+        if !source.available() && source.missing() {
+            source.prime_description(description);
+            if let Err(e) = source.create() {
+                self.error = Some(format!("Added, but could not create the shared file: {e:#}"));
+            }
+        } else if source.available()
+            && source.description() != description
+            && let Err(e) = source.set_description(description)
         {
-            self.error = Some(format!("Added, but could not create the shared file: {e:#}"));
+            self.error = Some(format!("Added, but could not save the description: {e:#}"));
         }
         self.shared.push(source);
     }
 
     /// Applies edits to an existing shared source: updates its token, config
-    /// entry, and live state (re-opening from the new definition).
-    fn update_source(&mut self, def: SourceDef, token: Option<String>) {
+    /// entry, live state (re-opening from the new definition), and the shared
+    /// description (which lives in the shared file, not the local config).
+    fn update_source(&mut self, def: SourceDef, token: Option<String>, description: &str) {
         if def.auth == GitAuthKind::Https {
             if let Some(token) = token
                 && let Err(e) = sources::store_git_token(&def.id, &token)
@@ -6879,43 +7162,108 @@ impl App {
             return;
         }
         let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
-        let source = SharedSource::open(def.clone(), &cache);
+        let mut source = SharedSource::open(def.clone(), &cache);
+        if source.available()
+            && source.description() != description
+            && let Err(e) = source.set_description(description)
+        {
+            self.error = Some(format!("Saved, but could not update the description: {e:#}"));
+        }
         match self.shared.iter_mut().find(|s| s.id() == def.id) {
             Some(slot) => *slot = source,
             None => self.shared.push(source),
         }
     }
 
+    /// Shared sources with unpushed local changes, as `(id, name)`. Runs git
+    /// per source, so call it sparingly (e.g. once per close attempt).
+    fn collect_pending_shared(&self) -> Vec<(String, String)> {
+        self.shared
+            .iter()
+            .filter(|s| s.has_pending())
+            .map(|s| (s.id().to_owned(), s.name().to_owned()))
+            .collect()
+    }
+
+    /// Finishes quitting: clears state and lets the window close.
+    fn finish_quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        self.quit_pending.clear();
+        self.dialog = Dialog::None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     fn show_confirm_quit(&mut self, ctx: &egui::Context) {
+        enum Act {
+            Quit,
+            Push,
+            Discard,
+            Cancel,
+        }
         let open = self.tabs.len();
-        let mut quit = false;
-        let mut cancel = false;
+        let pending = self.quit_pending.clone();
+        let has_pending = !pending.is_empty();
+        let mut act: Option<Act> = None;
         egui::Modal::new(egui::Id::new("confirm-quit")).show(ctx, |ui| {
-            ui.set_width(340.0);
+            ui.set_width(380.0);
             ui.heading("Quit Wazowski?");
-            ui.label(format!(
-                "{open} tab{} open. Closing the window will end {} session{}.",
-                if open == 1 { " is" } else { "s are" },
-                if open == 1 { "that" } else { "those" },
-                if open == 1 { "" } else { "s" },
-            ));
-            ui.add_space(6.0);
+            if open > 0 {
+                ui.label(format!(
+                    "{open} tab{} open. Closing the window will end {} session{}.",
+                    if open == 1 { " is" } else { "s are" },
+                    if open == 1 { "that" } else { "those" },
+                    if open == 1 { "" } else { "s" },
+                ));
+            }
+            if has_pending {
+                ui.add_space(4.0);
+                ui.label("These shared sources have changes not yet pushed:");
+                for (_, name) in &pending {
+                    ui.label(format!("   • {name}"));
+                }
+            }
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Quit").clicked() {
-                    quit = true;
+                if has_pending {
+                    if ui.button("Push & quit").clicked() {
+                        act = Some(Act::Push);
+                    }
+                    if ui.button("Discard & quit").clicked() {
+                        act = Some(Act::Discard);
+                    }
+                } else if ui.button("Quit").clicked() {
+                    act = Some(Act::Quit);
                 }
                 if ui.button("Cancel").clicked() {
-                    cancel = true;
+                    act = Some(Act::Cancel);
                 }
             });
         });
-        if quit {
-            self.quitting = true;
-            self.dialog = Dialog::None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if cancel {
-            self.dialog = Dialog::None;
+        match act {
+            Some(Act::Push) => {
+                // Best effort: a failed push keeps the local commits, which are
+                // offered again next launch, so nothing is lost.
+                for (id, _) in &pending {
+                    if let Some(source) = self.shared.iter_mut().find(|s| s.id() == *id) {
+                        let _ = source.push();
+                    }
+                }
+                self.finish_quit(ctx);
+            }
+            Some(Act::Discard) => {
+                for (id, _) in &pending {
+                    if let Some(source) = self.shared.iter_mut().find(|s| s.id() == *id) {
+                        let _ = source.discard();
+                    }
+                }
+                self.finish_quit(ctx);
+            }
+            Some(Act::Quit) => self.finish_quit(ctx),
+            Some(Act::Cancel) => {
+                self.quit_pending.clear();
+                self.dialog = Dialog::None;
+            }
+            None => {}
         }
     }
 
@@ -8486,29 +8834,24 @@ impl eframe::App for App {
         // Deliver a requested clipboard paste to the active remote session.
         self.drain_remote_paste(&ctx);
 
-        // Confirm before closing the window while sessions/shells are open.
+        // Confirm before closing the window while sessions/shells are open, or
+        // while shared sources have unpushed changes. Pending changes are computed
+        // once per close attempt (git calls), not every frame.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
-            if self.tabs.is_empty() {
+            if !matches!(self.dialog, Dialog::ConfirmQuit) {
+                self.quit_pending = self.collect_pending_shared();
+            }
+            if self.tabs.is_empty() && self.quit_pending.is_empty() {
                 self.quitting = true;
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                if !matches!(self.dialog, Dialog::ConfirmQuit) {
-                    self.dialog = Dialog::ConfirmQuit;
-                }
+                self.dialog = Dialog::ConfirmQuit;
             }
         }
 
-        // Periodically re-read shared sources so others' changes appear.
-        if !self.shared.is_empty() {
-            const SYNC_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-            if self.last_sync.elapsed() >= SYNC_EVERY {
-                for source in &mut self.shared {
-                    source.reload();
-                }
-                self.last_sync = std::time::Instant::now();
-            }
-            ctx.request_repaint_after(SYNC_EVERY);
-        }
+        // Shared sources are never auto-synced: they refresh only on an explicit
+        // "Sync now" (and once when first opened), so incoming changes and pushes
+        // stay under the user's control.
 
         // A borrowed session (shown in another tab's split) that has exited
         // returns to its own tab, which then shows the "ended" banner with the
@@ -8912,12 +9255,6 @@ fn render_folder(
 ) {
     use egui::containers::collapsing_header::CollapsingState;
 
-    let id = egui::Id::new((store_salt(store), "folder", full));
-    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
-    // While filtering, force folders open so matches are visible.
-    if !filter.is_empty() {
-        state.set_open(true);
-    }
     let style = data.folder_style(full);
     let icon = style.map(|s| s.icon.as_str()).filter(|i| !i.is_empty()).unwrap_or("📁");
     let text = {
@@ -8927,36 +9264,62 @@ fn render_folder(
             None => t,
         }
     };
-    // Header: a draggable folder label next to the collapse triangle.
-    let (_toggle, header_inner, _body) = state
-        .show_header(ui, |ui| {
-            drag_label(
-                ui,
-                text,
-                DragPayload::Folder { store: store.clone(), path: full.to_owned() },
-            )
-        })
-        .body(|ui| {
-            for row in &node.sessions {
-                session_row(ui, store, row, destinations, editable, action);
-            }
-            for (child_segment, child) in &node.children {
-                if !filter.is_empty() && !child.has_sessions() {
-                    continue;
-                }
-                let child_full = format!("{full}/{child_segment}");
-                render_folder(
-                    ui, store, data, child_segment, &child_full, child, destinations, editable,
-                    action, filter,
-                );
-            }
-        });
 
-    // The header row is a drop target for sessions/folders dragged onto it.
-    let header_row = header_inner.response;
-    // The menu goes on the label (the hit widget), not the whole row, so a
-    // right-click on the folder name actually opens it.
-    let header_label = header_inner.inner;
+    // An empty folder (no sessions and no subfolders) has nothing to expand, so
+    // it's drawn as a plain row with no collapse triangle — a visual cue that it
+    // is empty. It stays a drop target and context-menu host.
+    let (header_row, header_label) = if node.sessions.is_empty() && node.children.is_empty() {
+        let resp = ui
+            .horizontal(|ui| {
+                // Align the label with collapsible siblings (reserve the triangle's slot).
+                let indent = ui.spacing().indent;
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_space(indent);
+                drag_label(
+                    ui,
+                    text,
+                    DragPayload::Folder { store: store.clone(), path: full.to_owned() },
+                )
+            })
+            .inner;
+        (resp.clone(), resp)
+    } else {
+        let id = egui::Id::new((store_salt(store), "folder", full));
+        // Folders start collapsed so large session trees stay readable.
+        let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        // While filtering, force folders open so matches are visible.
+        if !filter.is_empty() {
+            state.set_open(true);
+        }
+        // Header: a draggable folder label next to the collapse triangle.
+        let (_toggle, header_inner, _body) = state
+            .show_header(ui, |ui| {
+                drag_label(
+                    ui,
+                    text,
+                    DragPayload::Folder { store: store.clone(), path: full.to_owned() },
+                )
+            })
+            .body(|ui| {
+                for row in &node.sessions {
+                    session_row(ui, store, row, destinations, editable, action);
+                }
+                for (child_segment, child) in &node.children {
+                    if !filter.is_empty() && !child.has_sessions() {
+                        continue;
+                    }
+                    let child_full = format!("{full}/{child_segment}");
+                    render_folder(
+                        ui, store, data, child_segment, &child_full, child, destinations,
+                        editable, action, filter,
+                    );
+                }
+            });
+
+        // The header row is a drop target; the menu goes on the label (the hit
+        // widget), not the whole row, so a right-click on the name opens it.
+        (header_inner.response, header_inner.inner)
+    };
     if editable
         && let Some(payload) = header_row.dnd_release_payload::<DragPayload>()
     {
@@ -9112,6 +9475,29 @@ fn delayed_tooltip(ui: &egui::Ui, response: &egui::Response, text: &str) {
     }
 }
 
+/// Like [`delayed_tooltip`], but renders arbitrary tooltip contents after the
+/// same hover delay. Used for session rows, whose tooltip shows an optional
+/// description above the connection details, separated by a line.
+fn delayed_tooltip_ui(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    const DELAY: f64 = 1.5;
+    let id = response.id.with("wz-hover-since");
+    if response.hovered() {
+        let now = ui.input(|i| i.time);
+        let since: f64 = ui.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || now));
+        if now - since >= DELAY {
+            response.clone().on_hover_ui(add_contents);
+        } else {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    } else {
+        ui.data_mut(|d| d.remove::<f64>(id));
+    }
+}
+
 /// A stable salt per store so folder headers in different stores don't collide.
 fn store_salt(store: &StoreId) -> String {
     match store {
@@ -9150,8 +9536,17 @@ fn session_row(
             },
         }
     };
-    // The row drags with the primary button; right-click still opens the menu.
-    let resp = drag_label(ui, text, DragPayload::Session { store: store.clone(), id: id.to_owned() });
+    // Indent so the session name lines up with folder names, which sit after the
+    // collapse triangle. The row drags with the primary button; right-click still
+    // opens the menu.
+    let resp = ui
+        .horizontal(|ui| {
+            let indent = ui.spacing().indent;
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(indent);
+            drag_label(ui, text, DragPayload::Session { store: store.clone(), id: id.to_owned() })
+        })
+        .inner;
     delayed_tooltip(ui, &resp, &row.hint);
     if resp.double_clicked() {
         *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));

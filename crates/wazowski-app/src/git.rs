@@ -60,8 +60,9 @@ impl GitRepo {
         }
     }
 
-    /// Writes the sessions file, commits, and pushes.
-    pub fn publish(&self, bytes: &[u8]) -> Result<()> {
+    /// Writes the sessions file and commits it locally, without pushing. The
+    /// commit becomes an "unpushed change" until [`push`](Self::push) runs.
+    pub fn commit(&self, bytes: &[u8]) -> Result<()> {
         self.ensure_clone()?;
         let path = self.work_dir.join(&self.file);
         if let Some(parent) = path.parent() {
@@ -82,8 +83,59 @@ impl GitRepo {
         if committed.is_err() && !self.is_clean()? {
             committed.context("git commit failed")?;
         }
-        // Push the current branch, setting upstream so later pushes are simple.
-        self.git(&["push", "--set-upstream", "origin", "HEAD"]).context("git push failed")?;
+        Ok(())
+    }
+
+    /// Pushes committed changes to the remote (setting upstream on first push).
+    pub fn push(&self) -> Result<()> {
+        self.ensure_clone()?;
+        self.git(&["push", "--set-upstream", "origin", "HEAD"]).context("git push failed")
+    }
+
+    /// Writes the sessions file, commits, and pushes in one step.
+    pub fn publish(&self, bytes: &[u8]) -> Result<()> {
+        self.commit(bytes)?;
+        self.push()
+    }
+
+    /// Whether the local clone has changes not yet on the remote: uncommitted
+    /// working-tree changes, or commits ahead of the upstream (or, before the
+    /// first push, any local commits at all).
+    pub fn has_unpushed(&self) -> Result<bool> {
+        if !self.work_dir.join(".git").is_dir() {
+            return Ok(false);
+        }
+        if !self.is_clean()? {
+            return Ok(true);
+        }
+        // Ahead of the tracked upstream?
+        let out = self
+            .command(Some(&self.work_dir))
+            .args(["rev-list", "--count", "@{u}..HEAD"])
+            .output()?;
+        if out.status.success() {
+            let n: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+            return Ok(n > 0);
+        }
+        // No upstream yet (never pushed): any commit on HEAD is unpushed.
+        let out =
+            self.command(Some(&self.work_dir)).args(["rev-list", "--count", "HEAD"]).output()?;
+        if !out.status.success() {
+            return Ok(false); // no commits at all
+        }
+        let n: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+        Ok(n > 0)
+    }
+
+    /// Discards local commits/changes, resetting the clone to match the remote.
+    pub fn discard(&self) -> Result<()> {
+        self.ensure_clone()?;
+        let _ = self.git(&["fetch", "--prune"]);
+        if self.git(&["reset", "--hard", "@{u}"]).is_err() {
+            let branch = if self.branch.is_empty() { "HEAD" } else { self.branch.as_str() };
+            let _ = self.git(&["reset", "--hard", &format!("origin/{branch}")]);
+        }
+        let _ = self.git(&["clean", "-fd"]);
         Ok(())
     }
 

@@ -198,11 +198,16 @@ pub struct SessionStore {
     folders: Vec<String>,
     /// Per-folder custom icon/color, keyed by folder path.
     folder_styles: BTreeMap<String, FolderStyle>,
+    /// Optional free-text description of this collection (used by shared sources,
+    /// so it travels with the file and every user sees it).
+    description: String,
 }
 
 /// The serialized file shape: `[[session]]` tables plus a `folders` list.
 #[derive(Default, Serialize, Deserialize)]
 struct StoreFile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    description: String,
     #[serde(default, rename = "session")]
     sessions: Vec<Session>,
     #[serde(default)]
@@ -232,7 +237,19 @@ impl SessionStore {
             sessions: file.sessions,
             folders: file.folders,
             folder_styles: file.folder_styles,
+            description: file.description,
         })
+    }
+
+    /// This collection's free-text description (empty if none).
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// Sets the collection's description and saves.
+    pub fn set_description(&mut self, description: impl Into<String>) -> Result<()> {
+        self.description = description.into();
+        self.save()
     }
 
     /// The custom appearance for a folder, if any.
@@ -381,6 +398,7 @@ impl SessionStore {
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
         let file = StoreFile {
+            description: self.description.clone(),
             sessions: self.sessions.clone(),
             folders: self.folders.clone(),
             folder_styles: self.folder_styles.clone(),
