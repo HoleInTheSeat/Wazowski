@@ -10,14 +10,14 @@ line per session. Wazowski reads a TOML "store file" (the same shape as
 Usage:
     mxt2wazowski.py INPUT.mxtsessions [MORE.mxtsessions ...]
     mxt2wazowski.py INPUT.mxtsessions -o wazowski-sessions.toml
-    mxt2wazowski.py *.mxtsessions --outdir converted/ --prefix CORP
+    mxt2wazowski.py *.mxtsessions --outdir converted/ --prefix Work
 
 Each input produces one output TOML (named `<input-stem>.toml` by default),
 ready to point a Wazowski shared source at (folder kind: the file path; git
 kind: commit it as the source's `file`). Passwords are never in MobaXterm
 session files, so every converted session uses the default `agent` auth and you
 set a vault password/key in Wazowski afterwards; sessions that referenced a
-MobaXterm credential (e.g. `[CORP_AD]`) are reported so you know which need one.
+MobaXterm credential (e.g. `[corp-ad]`) are reported so you know which need one.
 
 Only SSH, RDP and VNC map to a Wazowski protocol (SFTP folds into SSH, since a
 Wazowski SSH session has an SFTP files tab). Web, FTP, Telnet and Serial have no
