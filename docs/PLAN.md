@@ -66,10 +66,14 @@ implements a `Backend` trait and is plugged into a `Terminal`.
    delayed hover tooltips, find-in-terminals, keep-ended-tabs-open, recent-sessions
    launcher, versioned release filenames, and session-aware split panes.
 7. **Extras and packaging** — RDP/VNC, RPM + Flatpak, Windows installer, macOS app bundle.
-   (First step done: `packaging/linux/` ships a `wazowski.desktop` launcher +
-   `install-linux.sh` that installs the hicolor icons, so Linux app menus/docks show
-   the real icon. `StartupWMClass` matches the `with_app_id("wazowski")` window id.
-   Full RPM/Flatpak/installer/bundle work is still future.)
+   Done: `packaging/linux/` ships a `wazowski.desktop` launcher +
+   `install-linux.sh`; `StartupWMClass` matches `with_app_id("wazowski")`. The
+   release workflow builds a **Fedora RPM** (`cargo-generate-rpm`; weak deps on
+   samba-client/jq/iperf3/cups) and a portable **AppImage** (`linuxdeploy`), both
+   with hicolor icons (16–256px) generated from `icon.png`. Still future: Flatpak,
+   a signed Windows installer (MSI/NSIS), and a signed macOS .app/.dmg bundle. Note
+   the SMB file browser uses `smbclient`, so it's Linux-only until a Windows SMB
+   backend is added.
 
 Each phase ends with something runnable.
 

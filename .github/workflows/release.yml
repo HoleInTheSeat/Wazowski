@@ -63,9 +63,76 @@ jobs:
           name: ${{ env.ASSET }}
           path: dist/${{ env.ASSET }}
 
+  package-linux:
+    name: Package Linux (RPM + AppImage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build + packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
+            imagemagick wget file
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p wazowski-app
+
+      - name: Generate icons from icon.png
+        run: |
+          convert=$(command -v magick || command -v convert)
+          for size in 16 32 48 64 128 256; do
+            dir="packaging/linux/icons/hicolor/${size}x${size}/apps"
+            mkdir -p "$dir"
+            "$convert" icon.png -resize "${size}x${size}" "$dir/wazowski.png"
+          done
+
+      - name: Build RPM
+        run: |
+          cargo install cargo-generate-rpm --locked
+          # Run from the workspace root so the asset source paths resolve;
+          # disable auto-req (host is Ubuntu, target is Fedora — sonames differ).
+          cargo generate-rpm -p crates/wazowski-app --auto-req disabled
+          mkdir -p dist
+          rpm=$(ls target/generate-rpm/*.rpm | head -1)
+          cp "$rpm" "dist/wazowski-${GITHUB_REF_NAME}-linux-x86_64.rpm"
+
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications
+          cp target/release/wazowski AppDir/usr/bin/
+          cp packaging/linux/wazowski.desktop AppDir/usr/share/applications/
+          for size in 16 32 48 64 128 256; do
+            d="AppDir/usr/share/icons/hicolor/${size}x${size}/apps"
+            mkdir -p "$d"
+            cp "packaging/linux/icons/hicolor/${size}x${size}/apps/wazowski.png" "$d/"
+          done
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir \
+            -d packaging/linux/wazowski.desktop \
+            -i packaging/linux/icons/hicolor/256x256/apps/wazowski.png \
+            --output appimage
+          mkdir -p dist
+          img=$(ls ./*.AppImage | grep -iv linuxdeploy | head -1)
+          cp "$img" "dist/wazowski-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: wazowski-linux-packages
+          path: dist/*
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, package-linux]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

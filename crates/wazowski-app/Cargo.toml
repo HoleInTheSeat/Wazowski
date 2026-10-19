@@ -3,10 +3,34 @@ name = "wazowski-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "A MobaXterm-style terminal, SSH/SFTP, RDP/VNC and network toolbox"
 
 [[bin]]
 name = "wazowski"
 path = "src/main.rs"
+
+# RPM packaging (built in CI via `cargo generate-rpm -p crates/wazowski-app`, run
+# from the workspace root so these source paths resolve). Icons are generated from the
+# repo's icon.png into packaging/linux/icons/ during the release workflow.
+[package.metadata.generate-rpm]
+name = "wazowski"
+assets = [
+    { source = "target/release/wazowski", dest = "/usr/bin/wazowski", mode = "0755" },
+    { source = "packaging/linux/wazowski.desktop", dest = "/usr/share/applications/wazowski.desktop", mode = "0644" },
+    { source = "packaging/linux/icons/hicolor/16x16/apps/wazowski.png", dest = "/usr/share/icons/hicolor/16x16/apps/wazowski.png", mode = "0644" },
+    { source = "packaging/linux/icons/hicolor/32x32/apps/wazowski.png", dest = "/usr/share/icons/hicolor/32x32/apps/wazowski.png", mode = "0644" },
+    { source = "packaging/linux/icons/hicolor/48x48/apps/wazowski.png", dest = "/usr/share/icons/hicolor/48x48/apps/wazowski.png", mode = "0644" },
+    { source = "packaging/linux/icons/hicolor/64x64/apps/wazowski.png", dest = "/usr/share/icons/hicolor/64x64/apps/wazowski.png", mode = "0644" },
+    { source = "packaging/linux/icons/hicolor/128x128/apps/wazowski.png", dest = "/usr/share/icons/hicolor/128x128/apps/wazowski.png", mode = "0644" },
+    { source = "packaging/linux/icons/hicolor/256x256/apps/wazowski.png", dest = "/usr/share/icons/hicolor/256x256/apps/wazowski.png", mode = "0644" },
+]
+
+# Optional helper tools Wazowski shells out to (weak deps: not required to install).
+[package.metadata.generate-rpm.recommends]
+samba-client = "*"
+jq = "*"
+iperf3 = "*"
+cups = "*"
 
 [dependencies]
 eframe.workspace = true
