@@ -136,6 +136,11 @@ jobs:
   release:
     name: Publish release
     needs: [build, package-linux]
+    # Publish as long as the Linux packaging succeeded, even if the `build` job
+    # is marked failed because the macOS runner never got allocated (a frequent
+    # capacity issue that otherwise blocks the Linux/Windows artifacts). The
+    # Windows/Linux binaries still publish; macOS is included if it managed to run.
+    if: ${{ !cancelled() && needs.package-linux.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
