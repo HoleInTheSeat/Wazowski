@@ -2357,6 +2357,88 @@ impl App {
 
     /// The custom window title bar (native decorations are off): app-icon menu,
     /// title, theme toggle, and window controls. Dragging it moves the window.
+    /// Draw invisible grab strips along the window border so a borderless
+    /// (undecorated) window can still be resized by dragging its edges/corners.
+    /// Each strip is its own foreground `Area` sitting over the border, showing
+    /// the matching resize cursor and starting a native resize on drag.
+    fn window_resize_handles(ctx: &egui::Context) {
+        use egui::{
+            Area, CursorIcon, Id, Order, Rect, ResizeDirection, Sense, ViewportCommand, pos2,
+        };
+        // No edge resizing while maximized/fullscreen — the OS owns the bounds.
+        let fixed = ctx.input(|i| {
+            i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)
+        });
+        if fixed {
+            return;
+        }
+        let r = ctx.viewport_rect();
+        const B: f32 = 6.0; // border grab thickness (corners are B×B)
+        // (direction, grab rect, cursor). Edges stop short of the corners so the
+        // corner squares win where they overlap.
+        let handles = [
+            (
+                ResizeDirection::NorthWest,
+                Rect::from_min_max(r.left_top(), pos2(r.left() + B, r.top() + B)),
+                CursorIcon::ResizeNorthWest,
+            ),
+            (
+                ResizeDirection::NorthEast,
+                Rect::from_min_max(pos2(r.right() - B, r.top()), pos2(r.right(), r.top() + B)),
+                CursorIcon::ResizeNorthEast,
+            ),
+            (
+                ResizeDirection::SouthWest,
+                Rect::from_min_max(pos2(r.left(), r.bottom() - B), pos2(r.left() + B, r.bottom())),
+                CursorIcon::ResizeSouthWest,
+            ),
+            (
+                ResizeDirection::SouthEast,
+                Rect::from_min_max(pos2(r.right() - B, r.bottom() - B), r.right_bottom()),
+                CursorIcon::ResizeSouthEast,
+            ),
+            (
+                ResizeDirection::North,
+                Rect::from_min_max(pos2(r.left() + B, r.top()), pos2(r.right() - B, r.top() + B)),
+                CursorIcon::ResizeNorth,
+            ),
+            (
+                ResizeDirection::South,
+                Rect::from_min_max(
+                    pos2(r.left() + B, r.bottom() - B),
+                    pos2(r.right() - B, r.bottom()),
+                ),
+                CursorIcon::ResizeSouth,
+            ),
+            (
+                ResizeDirection::West,
+                Rect::from_min_max(pos2(r.left(), r.top() + B), pos2(r.left() + B, r.bottom() - B)),
+                CursorIcon::ResizeWest,
+            ),
+            (
+                ResizeDirection::East,
+                Rect::from_min_max(
+                    pos2(r.right() - B, r.top() + B),
+                    pos2(r.right(), r.bottom() - B),
+                ),
+                CursorIcon::ResizeEast,
+            ),
+        ];
+        for (i, (dir, rect, cursor)) in handles.into_iter().enumerate() {
+            let resp = Area::new(Id::new(("wz-resize", i)))
+                .order(Order::Foreground)
+                .fixed_pos(rect.min)
+                .show(ctx, |ui| ui.allocate_response(rect.size(), Sense::drag()))
+                .inner;
+            if resp.hovered() || resp.dragged() {
+                ctx.set_cursor_icon(cursor);
+            }
+            if resp.drag_started() {
+                ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
+            }
+        }
+    }
+
     fn title_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut about = false;
         let mut quit = false;
@@ -8973,6 +9055,8 @@ impl eframe::App for App {
             }
         }
 
+        // Borderless window: provide our own edge/corner resize grips.
+        Self::window_resize_handles(&ctx);
         egui::Panel::top("titlebar").show(ui, |ui| self.title_bar(ui, &ctx));
         egui::Panel::left("sessions")
             .resizable(true)
