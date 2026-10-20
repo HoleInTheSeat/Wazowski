@@ -14,6 +14,9 @@ jobs:
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
+    # macOS arm64 hosted runners are frequently capacity-constrained; don't let a
+    # missing macOS runner block the Linux/Windows artifacts from publishing.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
