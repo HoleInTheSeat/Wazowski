@@ -7458,14 +7458,32 @@ impl App {
         });
         match act {
             Some(Act::Push) => {
-                // Best effort: a failed push keeps the local commits, which are
-                // offered again next launch, so nothing is lost.
-                for (id, _) in &pending {
-                    if let Some(source) = self.shared.iter_mut().find(|s| s.id() == *id) {
-                        let _ = source.push();
+                // Push each pending source; if any fail, stay open and report it
+                // rather than closing silently. Local commits are kept either way.
+                let mut failed: Vec<String> = Vec::new();
+                for (id, name) in &pending {
+                    if let Some(source) = self.shared.iter_mut().find(|s| s.id() == *id)
+                        && let Err(e) = source.push()
+                    {
+                        failed.push(format!("• {name}: {e:#}"));
                     }
                 }
-                self.finish_quit(ctx);
+                if failed.is_empty() {
+                    self.finish_quit(ctx);
+                } else {
+                    // Abort the quit; the sources keep their local commits.
+                    self.quit_pending.clear();
+                    self.dialog = Dialog::Notice {
+                        title: "Push failed — not quitting".into(),
+                        body: format!(
+                            "Couldn't push {} shared source(s), so Wazowski stayed open. \
+                             Your changes are kept locally — fix the problem and try Sync now, \
+                             or quit again and choose Discard.\n\n{}",
+                            failed.len(),
+                            failed.join("\n"),
+                        ),
+                    };
+                }
             }
             Some(Act::Discard) => {
                 for (id, _) in &pending {

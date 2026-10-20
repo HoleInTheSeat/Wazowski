@@ -684,4 +684,52 @@ mod tests {
         assert!(b.available(), "second clone should be online: {:?}", b.status());
         assert_eq!(b.store().all().len(), 1, "pushed session should sync via git");
     }
+
+    // Two sources sharing one repo (different files) must both be able to push:
+    // the second push integrates the first (rebase) instead of being rejected as
+    // non-fast-forward. Regression test for the "second source fails to push
+    // until relaunch" bug.
+    #[test]
+    #[ignore = "requires the git binary"]
+    fn two_sources_same_repo_can_both_push() {
+        use std::process::Command;
+        let dir = tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "-b", "main"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let url = remote.to_string_lossy().into_owned();
+        let def_file = |id: &str, file: &str| {
+            let mut d = git_def(id, &url);
+            d.file = file.into();
+            d
+        };
+
+        // Source A seeds a.toml; source B seeds b.toml in the same repo.
+        let mut a = SharedSource::open(def_file("a", "a.toml"), &dir.path().join("a"), None);
+        a.create().unwrap();
+        let mut b = SharedSource::open(def_file("b", "b.toml"), &dir.path().join("b"), None);
+        b.create().unwrap();
+
+        // A pushes a change; now B's clone is behind the shared branch.
+        a.upsert(Session::new("hostA", "a.example.com", "root")).unwrap();
+        a.push().unwrap();
+
+        // B edits its own file and pushes — must succeed by integrating A's commit,
+        // not fail as non-fast-forward.
+        b.upsert(Session::new("hostB", "b.example.com", "root")).unwrap();
+        b.push().unwrap();
+        assert!(!b.has_pending(), "B's push should clear its pending state");
+
+        // A fresh clone of each file sees the expected sessions.
+        let ca = SharedSource::open(def_file("ca", "a.toml"), &dir.path().join("ca"), None);
+        let cb = SharedSource::open(def_file("cb", "b.toml"), &dir.path().join("cb"), None);
+        assert_eq!(ca.store().all().len(), 1, "A's session survived B's push");
+        assert_eq!(cb.store().all().len(), 1, "B's session was pushed");
+    }
 }

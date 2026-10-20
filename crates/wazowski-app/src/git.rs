@@ -106,9 +106,29 @@ impl GitRepo {
     }
 
     /// Pushes committed changes to the remote (setting upstream on first push).
+    ///
+    /// First fetches and rebases local commits onto the updated upstream, so a
+    /// sibling source that shares the same repo (a different file in it) doesn't
+    /// get rejected as non-fast-forward after the other one pushes. A real
+    /// conflict (the same file changed on both sides) aborts the rebase and lets
+    /// the push surface the rejection.
     pub fn push(&self) -> Result<()> {
         self.ensure_clone()?;
+        // Bring in anything pushed to the same branch since our last fetch.
+        let _ = self.git(&["fetch", "--prune"]);
+        if self.has_upstream() && self.git(&["rebase", "@{u}"]).is_err() {
+            let _ = self.git(&["rebase", "--abort"]);
+        }
         self.git(&["push", "--set-upstream", "origin", "HEAD"]).context("git push failed")
+    }
+
+    /// Whether HEAD has a tracked upstream branch (i.e. it has been pushed).
+    fn has_upstream(&self) -> bool {
+        self.command(Some(&self.work_dir))
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     /// Writes the sessions file, commits, and pushes in one step.
