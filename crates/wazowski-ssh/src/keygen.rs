@@ -77,6 +77,24 @@ pub fn generate_ed25519(comment: &str) -> Result<GeneratedKey> {
     generate(KeyAlgo::Ed25519, comment, None)
 }
 
+/// Returns an OpenSSH private key that `ssh -i` can use without prompting: if the
+/// input is an encrypted OpenSSH key it is decrypted with `passphrase`; an
+/// already-unencrypted key is re-encoded as-is. Keys that aren't OpenSSH-format
+/// (e.g. a classic `-----BEGIN RSA PRIVATE KEY-----` PEM) are returned unchanged
+/// for `ssh` to handle directly.
+pub fn to_unencrypted_openssh(pem: &str, passphrase: Option<&str>) -> Result<String> {
+    let Ok(key) = PrivateKey::from_openssh(pem) else {
+        // Not an OpenSSH key; hand it to ssh untouched.
+        return Ok(pem.to_owned());
+    };
+    let key = if key.is_encrypted() {
+        key.decrypt(passphrase.unwrap_or("")).context("could not decrypt the SSH key")?
+    } else {
+        key
+    };
+    Ok(key.to_openssh(LineEnding::LF).context("could not encode the SSH key")?.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +134,23 @@ mod tests {
         assert!(parsed.decrypt("hunter2").is_ok());
         // The public key is still readable without the passphrase.
         assert!(key.public_openssh.starts_with("ssh-ed25519 "));
+    }
+
+    #[test]
+    fn to_unencrypted_decrypts_and_passes_through() {
+        // An encrypted key is decrypted to an unencrypted OpenSSH key.
+        let enc = generate(KeyAlgo::Ed25519, "", Some("pw")).unwrap();
+        let out = to_unencrypted_openssh(&enc.private_pem, Some("pw")).unwrap();
+        let parsed = PrivateKey::from_openssh(&out).unwrap();
+        assert!(!parsed.is_encrypted(), "output must be usable by ssh -i without a prompt");
+
+        // An already-unencrypted key round-trips unchanged in meaning.
+        let plain = generate(KeyAlgo::Ed25519, "", None).unwrap();
+        let out = to_unencrypted_openssh(&plain.private_pem, None).unwrap();
+        assert!(PrivateKey::from_openssh(&out).is_ok());
+
+        // Non-OpenSSH text is passed through untouched for ssh to handle.
+        assert_eq!(to_unencrypted_openssh("not a key", None).unwrap(), "not a key");
     }
 
     #[test]

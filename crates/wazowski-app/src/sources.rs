@@ -32,6 +32,9 @@ pub enum GitAuthKind {
     None,
     Https,
     Ssh,
+    /// Authenticate from a named vault entry: a password entry is used as the
+    /// HTTPS token (+username), an SSH keypair entry as the SSH key.
+    Vault,
 }
 
 fn default_file() -> String {
@@ -65,6 +68,9 @@ pub struct SourceDef {
     /// Git SSH private key path (empty = agent/default key).
     #[serde(default)]
     pub key_path: String,
+    /// Name of the vault entry to authenticate with (for `GitAuthKind::Vault`).
+    #[serde(default)]
+    pub vault_entry: String,
     /// Optional custom icon (an emoji); empty uses the default.
     #[serde(default)]
     pub icon: String,
@@ -165,8 +171,10 @@ impl Backend {
     }
 }
 
-/// Builds the backend for a source definition.
-fn backend_for(def: &SourceDef, cache_dir: &Path) -> Backend {
+/// Builds the backend for a source definition. `vault_auth` is the auth resolved
+/// from the vault by the caller (only used when the source's auth is
+/// `GitAuthKind::Vault`); it's `None` when the vault is locked or unavailable.
+fn backend_for(def: &SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -> Backend {
     match def.kind {
         SourceKind::Folder => Backend::Folder(def.path.clone()),
         SourceKind::Git => {
@@ -178,7 +186,12 @@ fn backend_for(def: &SourceDef, cache_dir: &Path) -> Backend {
                 },
                 GitAuthKind::Ssh => GitAuth::Ssh {
                     key_path: (!def.key_path.is_empty()).then(|| PathBuf::from(&def.key_path)),
+                    inline_key: None,
                 },
+                // The caller resolves the vault entry (it has the unlocked vault);
+                // a locked vault yields `None`, so the source stays offline until
+                // it's unlocked and the source re-opened.
+                GitAuthKind::Vault => vault_auth.unwrap_or(GitAuth::None),
             };
             let work_dir = cache_dir.join("git").join(&def.id);
             Backend::Git(GitRepo::new(
@@ -271,9 +284,9 @@ pub struct SharedSource {
 impl SharedSource {
     /// Opens a source: refresh the cache from the share if reachable, then load
     /// the store from the cache (so it works offline).
-    pub fn open(def: SourceDef, cache_dir: &Path) -> Self {
+    pub fn open(def: SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -> Self {
         let cache_path = cache_dir.join(format!("{}.toml", def.id));
-        let backend = backend_for(&def, cache_dir);
+        let backend = backend_for(&def, cache_dir, vault_auth);
         let mut source = Self {
             def,
             cache_path,
@@ -546,12 +559,13 @@ mod tests {
             auth: GitAuthKind::None,
             username: String::new(),
             key_path: String::new(),
+            vault_entry: String::new(),
             icon: String::new(),
             color: None,
         };
 
         // A brand-new source has no file yet; create() writes an empty one.
-        let mut source = SharedSource::open(def.clone(), &cache);
+        let mut source = SharedSource::open(def.clone(), &cache, None);
         assert!(!source.available());
         source.create().unwrap();
         assert!(source.available());
@@ -562,13 +576,13 @@ mod tests {
 
         // Reopen from the share: the description is stored in the file, so it and
         // the session both come back.
-        let reopened = SharedSource::open(def.clone(), &cache);
+        let reopened = SharedSource::open(def.clone(), &cache, None);
         assert_eq!(reopened.description(), "Team servers", "description persists in the file");
         assert_eq!(reopened.store().all().len(), 1);
 
         // Reopen from cache with the share removed: session still present, offline.
         fs::remove_dir_all(dir.path().join("share")).unwrap();
-        let offline = SharedSource::open(def, &cache);
+        let offline = SharedSource::open(def, &cache, None);
         assert!(!offline.available());
         assert_eq!(offline.store().all().len(), 1, "cache keeps sessions when offline");
         assert_eq!(offline.description(), "Team servers", "description available offline too");
@@ -590,6 +604,7 @@ mod tests {
             auth: GitAuthKind::None,
             username: String::new(),
             key_path: String::new(),
+            vault_entry: String::new(),
             icon: String::new(),
             color: None,
         })
@@ -611,6 +626,7 @@ mod tests {
             auth: GitAuthKind::None,
             username: String::new(),
             key_path: String::new(),
+            vault_entry: String::new(),
             icon: String::new(),
             color: None,
         }
@@ -651,7 +667,7 @@ mod tests {
 
         // First clone: empty repo, so the file is missing until we create it.
         let cache_a = dir.path().join("cache-a");
-        let mut a = SharedSource::open(git_def("g1", &url), &cache_a);
+        let mut a = SharedSource::open(git_def("g1", &url), &cache_a, None);
         assert!(!a.available() && a.missing());
         a.create().unwrap();
         a.upsert(Session::new("web", "example.com", "root")).unwrap();
@@ -664,7 +680,7 @@ mod tests {
 
         // A second clone of the same remote sees the pushed session.
         let cache_b = dir.path().join("cache-b");
-        let b = SharedSource::open(git_def("g2", &url), &cache_b);
+        let b = SharedSource::open(git_def("g2", &url), &cache_b, None);
         assert!(b.available(), "second clone should be online: {:?}", b.status());
         assert_eq!(b.store().all().len(), 1, "pushed session should sync via git");
     }

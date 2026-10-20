@@ -13,9 +13,15 @@ each user creates those credentials locally on first use.
   mount, NAS, Dropbox/Nextcloud folder, …).
 - **Git repo** — a repository on GitHub, GitLab, Forgejo, etc. Auth can be:
   - **None / ambient** (public repo or your existing git credentials),
-  - **HTTPS token** (stored in your OS keyring, sent as a header — never written
-    to the repo config), or
-  - **SSH key** (a specific key, or your agent/default key).
+  - **HTTPS token (keyring)** (stored in your OS keyring, sent as a header —
+    never written to the repo config),
+  - **SSH key file** (a specific key file, or your agent/default key), or
+  - **Vault entry** — authenticate from a [vault](vault.md) credential: a
+    **password** entry is used as the HTTPS username + token, and an **SSH
+    keypair** entry as the SSH key. The vault must be unlocked for the source to
+    sync; while it's locked the source stays on its offline cache and re-syncs
+    once you unlock. (A passphrase-protected keypair is decrypted in memory for
+    git; the key is written only to a private temporary file for the SSH call.)
 
 Either way, the source is **cached locally**, so the sessions stay available even
 when the share or remote is offline (read-only until it's reachable again).

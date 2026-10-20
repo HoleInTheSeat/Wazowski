@@ -22,6 +22,7 @@ use wazowski_term::{
 };
 
 use crate::connect::{Connected, PendingConnect, Progress};
+use crate::git::GitAuth;
 use crate::highlights::{HighlightStore, HighlightRule};
 use crate::keybinds::{Action, Keymap};
 use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
@@ -620,6 +621,8 @@ struct AddSourceForm {
     username: String,
     token: String,
     key_path: String,
+    /// Name of the vault entry to authenticate with (for `GitAuthKind::Vault`).
+    vault_entry: String,
     icon: String,
     color: Option<[u8; 3]>,
 }
@@ -639,6 +642,7 @@ impl Default for AddSourceForm {
             username: String::new(),
             token: String::new(),
             key_path: String::new(),
+            vault_entry: String::new(),
             icon: String::new(),
             color: None,
         }
@@ -662,6 +666,7 @@ impl AddSourceForm {
             username: def.username.clone(),
             token: token.unwrap_or_default(),
             key_path: def.key_path.clone(),
+            vault_entry: def.vault_entry.clone(),
             icon: def.icon.clone(),
             color: def.color,
         }
@@ -1275,7 +1280,10 @@ impl App {
         let shared = sources_config
             .defs
             .iter()
-            .map(|def| SharedSource::open(def.clone(), &cache))
+            .map(|def| {
+                let auth = vault_git_auth(def, vault.unlocked());
+                SharedSource::open(def.clone(), &cache, auth)
+            })
             .collect();
 
         let servers_store = ServersStore::default_path()
@@ -3137,8 +3145,13 @@ impl App {
             .or_else(|_| SourcesConfig::load("sources.toml".into()))
             .expect("loading a missing sources file yields an empty config");
         let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
-        self.shared =
-            self.sources_config.defs.iter().map(|def| SharedSource::open(def.clone(), &cache)).collect();
+        let vault = self.vault.unlocked();
+        self.shared = self
+            .sources_config
+            .defs
+            .iter()
+            .map(|def| SharedSource::open(def.clone(), &cache, vault_git_auth(def, vault)))
+            .collect();
 
         // Quick servers: reload configs, but carry over any still-running server's
         // handle so importing settings doesn't orphan a running server.
@@ -7102,6 +7115,10 @@ impl App {
         let mut cancel = false;
         let mut browse_folder = false;
         let mut browse_key = false;
+        // Snapshot the vault entry names for the "Vault entry" auth picker (the
+        // dialog closure borrows self.dialog, so it can't also read self.vault).
+        let vault_names: Vec<String> = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
+        let vault_unlocked = self.vault.unlocked().is_some();
         if let Dialog::AddSource(f) = &mut self.dialog {
             let editing = f.edit_id.is_some();
             egui::Modal::new(egui::Id::new("add-source")).show(ctx, |ui| {
@@ -7164,13 +7181,15 @@ impl App {
                             egui::ComboBox::from_id_salt("git-auth")
                                 .selected_text(match f.auth {
                                     GitAuthKind::None => "None / ambient",
-                                    GitAuthKind::Https => "HTTPS token",
-                                    GitAuthKind::Ssh => "SSH key",
+                                    GitAuthKind::Https => "HTTPS token (keyring)",
+                                    GitAuthKind::Ssh => "SSH key file",
+                                    GitAuthKind::Vault => "Vault entry",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut f.auth, GitAuthKind::None, "None / ambient");
-                                    ui.selectable_value(&mut f.auth, GitAuthKind::Https, "HTTPS token");
-                                    ui.selectable_value(&mut f.auth, GitAuthKind::Ssh, "SSH key");
+                                    ui.selectable_value(&mut f.auth, GitAuthKind::Https, "HTTPS token (keyring)");
+                                    ui.selectable_value(&mut f.auth, GitAuthKind::Ssh, "SSH key file");
+                                    ui.selectable_value(&mut f.auth, GitAuthKind::Vault, "Vault entry");
                                 });
                             ui.end_row();
                             match f.auth {
@@ -7199,6 +7218,42 @@ impl App {
                                         );
                                         browse_key |= ui.button("Browse…").clicked();
                                     });
+                                    ui.end_row();
+                                }
+                                GitAuthKind::Vault => {
+                                    ui.label("Vault entry");
+                                    if !vault_unlocked {
+                                        ui.label(
+                                            RichText::new("unlock the vault to choose an entry")
+                                                .weak(),
+                                        );
+                                    } else {
+                                        let current = if f.vault_entry.is_empty() {
+                                            "(choose…)".to_owned()
+                                        } else {
+                                            f.vault_entry.clone()
+                                        };
+                                        egui::ComboBox::from_id_salt("git-vault-entry")
+                                            .selected_text(current)
+                                            .show_ui(ui, |ui| {
+                                                for name in &vault_names {
+                                                    ui.selectable_value(
+                                                        &mut f.vault_entry,
+                                                        name.clone(),
+                                                        name,
+                                                    );
+                                                }
+                                            });
+                                    }
+                                    ui.end_row();
+                                    ui.label("");
+                                    ui.label(
+                                        RichText::new(
+                                            "A password entry is used as the HTTPS token; an \
+                                             SSH keypair entry as the SSH key.",
+                                        )
+                                        .weak(),
+                                    );
                                     ui.end_row();
                                 }
                                 GitAuthKind::None => {}
@@ -7273,6 +7328,7 @@ impl App {
             auth: f.auth,
             username: f.username.trim().to_owned(),
             key_path: f.key_path.trim().to_owned(),
+            vault_entry: f.vault_entry.trim().to_owned(),
             icon: f.icon.clone(),
             color: f.color,
         };
@@ -7289,11 +7345,20 @@ impl App {
                     return Err("Enter the repository URL.".into());
                 }
                 def.url = f.url.trim().to_owned();
-                if f.auth == GitAuthKind::Https {
-                    if f.token.is_empty() {
-                        return Err("Enter the HTTPS token (or choose a different auth).".into());
+                match f.auth {
+                    GitAuthKind::Https => {
+                        if f.token.is_empty() {
+                            return Err("Enter the HTTPS token (or choose a different auth)."
+                                .into());
+                        }
+                        token = Some(f.token.clone());
                     }
-                    token = Some(f.token.clone());
+                    GitAuthKind::Vault => {
+                        if f.vault_entry.trim().is_empty() {
+                            return Err("Choose a vault entry (or a different auth).".into());
+                        }
+                    }
+                    GitAuthKind::Ssh | GitAuthKind::None => {}
                 }
             }
         }
@@ -7312,7 +7377,8 @@ impl App {
             return;
         }
         let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
-        let mut source = SharedSource::open(def, &cache);
+        let auth = vault_git_auth(&def, self.vault.unlocked());
+        let mut source = SharedSource::open(def, &cache, auth);
         // A new source's file usually doesn't exist yet; create it (with the
         // description baked in) so the share is immediately usable.
         if !source.available() && source.missing() {
@@ -7348,7 +7414,8 @@ impl App {
             return;
         }
         let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
-        let mut source = SharedSource::open(def.clone(), &cache);
+        let auth = vault_git_auth(&def, self.vault.unlocked());
+        let mut source = SharedSource::open(def.clone(), &cache, auth);
         if source.available()
             && source.description() != description
             && let Err(e) = source.set_description(description)
@@ -7954,11 +8021,31 @@ impl App {
                 self.vault = VaultState::Unlocked(Box::new(vault));
                 self.dialog = Dialog::None;
                 self.apply_remember(remember);
+                // Vault-backed git sources could not authenticate while locked;
+                // re-open them now so they sync with the resolved credential.
+                self.reopen_vault_sources();
             }
             Err(VaultError::BadPassword) => {
                 *error = Some("Incorrect master password.".into());
             }
             Err(e) => *error = Some(format!("{e}")),
+        }
+    }
+
+    /// Re-opens shared sources that authenticate from the vault, so they pick up
+    /// their credential once the vault is unlocked (they stay on the offline
+    /// cache while it is locked). Only touches `GitAuthKind::Vault` sources.
+    fn reopen_vault_sources(&mut self) {
+        if self.vault.unlocked().is_none() {
+            return;
+        }
+        let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
+        for i in 0..self.shared.len() {
+            let def = self.shared[i].def().clone();
+            if def.auth == GitAuthKind::Vault {
+                let auth = vault_git_auth(&def, self.vault.unlocked());
+                self.shared[i] = SharedSource::open(def, &cache, auth);
+            }
         }
     }
 
@@ -9976,6 +10063,38 @@ fn material_from(secret: &Secret) -> AuthMaterial {
         Secret::Password { password, .. } => AuthMaterial::Password(password.clone()),
         Secret::PrivateKey { pem, passphrase, .. } => {
             AuthMaterial::Key { pem: pem.clone(), passphrase: passphrase.clone() }
+        }
+    }
+}
+
+/// The git auth for a `GitAuthKind::Vault` source, resolved from its named vault
+/// entry. Returns `None` for non-vault sources, or when the vault is locked or
+/// the entry is missing (the source then stays on its offline cache until the
+/// vault is unlocked and the source re-opened).
+fn vault_git_auth(def: &SourceDef, vault: Option<&Vault>) -> Option<GitAuth> {
+    if def.auth != GitAuthKind::Vault {
+        return None;
+    }
+    let secret = vault?.get(&def.vault_entry)?;
+    Some(git_auth_from_secret(secret, &def.username))
+}
+
+/// Converts a vault secret into git auth: a password entry becomes an HTTPS
+/// token (its username falls back to the source's), a keypair entry becomes an
+/// inline SSH key (decrypted for `ssh -i` if it has a passphrase).
+fn git_auth_from_secret(secret: &Secret, fallback_user: &str) -> GitAuth {
+    match secret {
+        Secret::Password { username, password } => GitAuth::Https {
+            username: username
+                .clone()
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| fallback_user.to_owned()),
+            token: password.clone(),
+        },
+        Secret::PrivateKey { pem, passphrase, .. } => {
+            let key = wazowski_ssh::to_unencrypted_openssh(pem, passphrase.as_deref())
+                .unwrap_or_else(|_| pem.clone());
+            GitAuth::Ssh { key_path: None, inline_key: Some(key) }
         }
     }
 }

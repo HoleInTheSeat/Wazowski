@@ -16,6 +16,6 @@ mod keygen;
 mod sftp;
 
 pub use connection::{AuthMaterial, ConnectError, ConnectParams, SshBackend, connect};
-pub use keygen::{GeneratedKey, KeyAlgo, generate, generate_ed25519};
+pub use keygen::{GeneratedKey, KeyAlgo, generate, generate_ed25519, to_unencrypted_openssh};
 pub use sftp::{FileEntry, Sftp};
 pub use host_key::{HostKeyPolicy, UnknownHostKey, trust_host};
