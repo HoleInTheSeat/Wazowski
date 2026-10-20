@@ -96,12 +96,6 @@ pub struct Settings {
     /// Scheme used by the session "Open web GUI" action.
     #[serde(default)]
     pub web_scheme: WebScheme,
-    /// Preferred RDP client binary; `None` auto-detects.
-    #[serde(default)]
-    pub rdp_client: Option<String>,
-    /// Preferred VNC viewer binary; `None` auto-detects.
-    #[serde(default)]
-    pub vnc_client: Option<String>,
     /// Saved URLs for the JSON/jq puller (most-recent first).
     #[serde(default)]
     pub json_urls: Vec<String>,
@@ -129,8 +123,6 @@ impl Default for Settings {
             recent: Vec::new(),
             terminal_font_size: default_font_size(),
             web_scheme: WebScheme::default(),
-            rdp_client: None,
-            vnc_client: None,
             json_urls: Vec::new(),
             jq_filters: Vec::new(),
             api_urls: Vec::new(),

@@ -171,7 +171,18 @@ impl GitRepo {
     }
 
     fn git_in(&self, cwd: Option<&std::path::Path>, args: &[&str]) -> Result<()> {
-        let out = self.command(cwd).args(args).output().context("could not run git")?;
+        let out = match self.command(cwd).args(args).output() {
+            Ok(out) => out,
+            // The git binary isn't on PATH. This is the common Windows case
+            // (Git for Windows isn't installed by default), so say so plainly.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!(
+                    "git is not installed or not on PATH — install Git \
+                     (https://git-scm.com/downloads) and restart Wazowski"
+                );
+            }
+            Err(e) => return Err(e).context("could not run git"),
+        };
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             bail!("{}", stderr.trim().lines().last().unwrap_or("git error"));

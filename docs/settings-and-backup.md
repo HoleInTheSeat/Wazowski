@@ -31,11 +31,12 @@ plain TOML files in your config dir (`~/.config/wazowski/` on Linux).
 
 ### Extras
 - **Environment checks** for optional tools/permissions: low-port permission
-  (with a one-click `setcap` grant on Linux), `iperf3` (with install), printing
-  (CUPS), `jq`, `smbclient`, an RDP client, a VNC viewer, and your default
-  browser — each with status and, where possible, a fix button.
-- **Preferred RDP client** and **Preferred VNC viewer** (for the external-launch
-  fallbacks).
+  (with a one-click `setcap` grant on Linux), `iperf3`, `jq`, `git`, `smbclient`
+  (each with a one-click **Install** where a package manager is available),
+  printing (CUPS), and your default browser — each with status and, where
+  possible, a fix button. (RDP and VNC are built in and need no external client.)
+- **Diagnostics** — open the rolling log file or its folder (see
+  [Troubleshooting](troubleshooting.md)).
 
 ### Backup
 - Export/import your whole configuration — below.

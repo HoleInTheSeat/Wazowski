@@ -15,6 +15,9 @@ tokio.workspace = true
 dirs.workspace = true
 rand.workspace = true
 thiserror.workspace = true
+# Pinned to the exact version russh re-exports so the crate unifies; we add the
+# `rsa` feature (russh doesn't enable it) so key generation can produce RSA keys.
+ssh-key = { version = "=0.7.0-rc.11", features = ["ed25519", "rsa", "ecdsa", "p256", "encryption"] }
 
 [dev-dependencies]
 egui.workspace = true

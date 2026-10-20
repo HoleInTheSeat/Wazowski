@@ -8,7 +8,7 @@ quick picker.
 
 An SSH session opens as a terminal tab.
 
-- **Auth**: SSH agent, a vault **password**, or a vault **private key**. A session
+- **Auth**: SSH agent, a vault **password**, or a vault **SSH keypair**. A session
   with a blank password prompts you at connect time (MobaXterm-style).
 - **Host-key verification** against `~/.ssh/known_hosts`: unknown or changed keys
   raise a prompt showing the fingerprint before you trust them.

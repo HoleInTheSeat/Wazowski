@@ -26,6 +26,32 @@ on "loading". Install from the terminal instead:
 sudo dnf install ./wazowski-*-linux-x86_64.rpm
 ```
 
+## Windows: git shared sources never pull / stay "(offline)"
+
+Git-backed shared sources shell out to the **`git`** binary, which **isn't
+installed by default on Windows**. If git is missing, the source can't clone or
+fetch and falls back to its (possibly empty) local cache.
+
+- Check **Settings → Extras → Environment**: the **git (shared-session sync)**
+  row shows ✘ when git can't be found.
+- Install **[Git for Windows](https://git-scm.com/downloads)** (its installer adds
+  `git` to PATH), then restart Wazowski and **Sync now** on the source.
+- The exact failure is recorded in the log file (see below) — a missing binary
+  reads as *"git is not installed or not on PATH"*.
+
+## Where is the log file?
+
+Wazowski writes a rolling log (connections, SSH handshakes, and shared-source
+syncs) you can check when something fails. Open it from **Settings → Extras →
+Diagnostics → Open log file**, or find it at:
+
+- **Linux**: `~/.local/share/wazowski/wazowski.log`
+- **Windows**: `%LOCALAPPDATA%\wazowski\wazowski\data\wazowski.log`
+- **macOS**: `~/Library/Application Support/org.wazowski.wazowski/wazowski.log`
+
+It rolls over once it passes ~2 MB. For more verbose stderr output, launch from a
+terminal with `RUST_LOG=debug`.
+
 ## A shared source shows "(offline)"
 
 The share or git remote wasn't reachable at the last sync. Wazowski keeps using

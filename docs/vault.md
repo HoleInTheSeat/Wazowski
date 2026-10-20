@@ -1,6 +1,6 @@
 # Vault (credentials)
 
-The vault is Wazowski's encrypted store for secrets — passwords and private keys.
+The vault is Wazowski's encrypted store for secrets — passwords and SSH keypairs.
 Sessions never contain secrets; they reference a **named** vault entry, so one
 credential can be shared by many sessions.
 
@@ -29,11 +29,15 @@ that need a secret will say so.
 
 In the vault view you can:
 
-- **Add** a credential (`➕`): a named password or a private key (PEM), optionally
-  with a username stored alongside it.
+- **Add** a credential (`➕`): a named **password** or an **SSH keypair**,
+  optionally with a username stored alongside it. A keypair holds a private key
+  (PEM) and, optionally, its public key — paste just the private key, or both.
 - **Edit / delete** entries.
 - **Reveal** a secret's value — this re-asks for the master password first.
-- **Generate** an **Ed25519** key pair to use for SSH auth.
+- **Generate an SSH keypair** to use for SSH auth. Choose the algorithm
+  (**Ed25519**, **RSA 4096**, or **ECDSA P-256**) and optionally set a passphrase
+  to encrypt the private key. Both keys are stored, and the public key is shown so
+  you can copy it to a server's `authorized_keys`.
 
 ## How sessions use the vault
 

@@ -310,6 +310,14 @@ impl SharedSource {
             Err(e) => {
                 self.available = false;
                 self.missing = false;
+                log::warn!(
+                    "shared source \"{}\" ({}) could not sync: {e:#}",
+                    self.def.name,
+                    match self.def.kind {
+                        SourceKind::Folder => "folder",
+                        SourceKind::Git => "git",
+                    }
+                );
                 self.status = Some(format!("share offline ({e}) — using local cache (read-only)"));
             }
         }

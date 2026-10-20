@@ -60,9 +60,14 @@ pub enum Secret {
         username: Option<String>,
         password: String,
     },
-    /// A private key in PEM/OpenSSH form, with an optional passphrase and username.
+    /// An SSH keypair: a private key in PEM/OpenSSH form, an optional public key
+    /// (OpenSSH single-line form), an optional passphrase for the private key,
+    /// and an optional username override.
     PrivateKey {
         pem: String,
+        /// The matching public key, if saved alongside the private one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         passphrase: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -77,6 +82,14 @@ impl Secret {
             Secret::Password { username, .. } | Secret::PrivateKey { username, .. } => {
                 username.as_deref()
             }
+        }
+    }
+
+    /// The saved public key, for a keypair that has one.
+    pub fn public_key(&self) -> Option<&str> {
+        match self {
+            Secret::PrivateKey { public, .. } => public.as_deref(),
+            Secret::Password { .. } => None,
         }
     }
 }
@@ -402,6 +415,7 @@ mod tests {
                 "deploy-key",
                 Secret::PrivateKey {
                     pem: "-----BEGIN-----\nx\n".into(),
+                    public: Some("ssh-ed25519 AAAA deploy".into()),
                     passphrase: Some("pw".into()),
                     username: Some("deploy".into()),
                 },
@@ -412,6 +426,8 @@ mod tests {
         let reopened = Vault::open(path, "correct horse").unwrap();
         assert_eq!(reopened.names(), vec!["deploy-key", "prod-root"]);
         assert_eq!(reopened.get("prod-root"), Some(&Secret::Password { username: None, password: "hunter2".into() }));
+        // The keypair's public key survives the round-trip.
+        assert_eq!(reopened.get("deploy-key").and_then(Secret::public_key), Some("ssh-ed25519 AAAA deploy"));
     }
 
     #[test]

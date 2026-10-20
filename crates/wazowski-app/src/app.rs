@@ -223,6 +223,9 @@ enum TabAct {
 enum ExtrasAction {
     GrantLowPort,
     InstallIperf,
+    InstallJq,
+    InstallSmbclient,
+    InstallGit,
     Recheck,
 }
 
@@ -461,20 +464,6 @@ fn low_port_granted() -> Option<bool> {
     None
 }
 
-/// The common RDP clients Wazowski can launch, most-preferred first.
-const RDP_CLIENTS: &[&str] = if cfg!(windows) {
-    &["mstsc", "xfreerdp", "remmina"]
-} else if cfg!(target_os = "macos") {
-    &["xfreerdp", "remmina"]
-} else {
-    &["xfreerdp3", "xfreerdp", "wlfreerdp", "remmina"]
-};
-
-/// The first installed RDP client on the PATH, if any.
-fn detect_rdp_client() -> Option<String> {
-    RDP_CLIENTS.iter().find(|name| has_bin(name)).map(|name| (*name).to_owned())
-}
-
 /// Best-effort name of the user's default web browser. `None` where it can't
 /// be determined (currently anything but Linux, or a missing `xdg-settings`).
 fn detect_default_browser() -> Option<String> {
@@ -502,10 +491,9 @@ fn compute_env_checks() -> EnvChecks {
         iperf3: has_bin("iperf3"),
         printing: has_bin("lp") || has_bin("lpr"),
         jq: has_bin("jq"),
+        git: has_bin("git"),
         smbclient: has_bin("smbclient"),
         low_port: low_port_granted(),
-        rdp_client: detect_rdp_client(),
-        vnc_client: detect_vnc_client(),
         default_browser: detect_default_browser(),
     }
 }
@@ -771,6 +759,8 @@ struct VaultManagerState {
 struct GenForm {
     name: String,
     comment: String,
+    algo: wazowski_ssh::KeyAlgo,
+    passphrase: String,
 }
 
 /// Fields for adding or editing one vault entry.
@@ -782,6 +772,8 @@ struct SecretForm {
     /// Optional username stored with the credential (overrides the session's).
     username: String,
     value: String,
+    /// For a keypair: the optional public key (OpenSSH single-line form).
+    public: String,
     passphrase: String,
     /// For an existing private key: whether it has a passphrase (so the field
     /// can hint one is set before the value is revealed). Not used when saving.
@@ -802,9 +794,15 @@ impl SecretForm {
             kind: SecretKind::Password,
             username: String::new(),
             value: String::new(),
+            public: String::new(),
             passphrase: String::new(),
             has_passphrase: false,
         }
+    }
+
+    /// The optional public key as an `Option`, trimmed and empty-filtered.
+    fn public_opt(&self) -> Option<String> {
+        (!self.public.trim().is_empty()).then(|| self.public.trim().to_owned())
     }
 
     /// Builds the vault secret this form describes (value assumed non-empty).
@@ -814,9 +812,23 @@ impl SecretForm {
             SecretKind::Password => Secret::Password { username, password: self.value.clone() },
             SecretKind::Key => Secret::PrivateKey {
                 pem: self.value.clone(),
+                public: self.public_opt(),
                 passphrase: (!self.passphrase.is_empty()).then(|| self.passphrase.clone()),
                 username,
             },
+        }
+    }
+
+    /// Like [`to_secret`](Self::to_secret) but keeps a given private key (used
+    /// when editing a keypair's public key/passphrase without re-entering the
+    /// private key).
+    fn to_secret_with_pem(&self, pem: String) -> Secret {
+        let username = (!self.username.trim().is_empty()).then(|| self.username.trim().to_owned());
+        Secret::PrivateKey {
+            pem,
+            public: self.public_opt(),
+            passphrase: (!self.passphrase.is_empty()).then(|| self.passphrase.clone()),
+            username,
         }
     }
 }
@@ -948,6 +960,9 @@ pub struct App {
     /// The active-tab index seen last frame, to notice tab switches (which turn
     /// broadcast off so it can't fire into a tab the user just moved away from).
     last_active: usize,
+    /// The title-bar panel rect from the last frame, used to overlay a window
+    /// drag strip above modals so the window can still be moved with a box open.
+    titlebar_rect: egui::Rect,
     /// Frames remaining to wait for a requested clipboard paste (for the remote
     /// "Paste text" op). `0` means no paste is pending. We use the windowing
     /// system's clipboard (via `RequestPaste`) rather than a separate crate so it
@@ -1096,14 +1111,12 @@ struct EnvChecks {
     printing: bool,
     /// `jq` for the JSON/jq puller's filter box.
     jq: bool,
+    /// `git` for git-backed shared sources (not installed by default on Windows).
+    git: bool,
     /// `smbclient` for browsing an RDP host's files over SMB.
     smbclient: bool,
     /// `Some(granted)` on Linux; `None` where not applicable.
     low_port: Option<bool>,
-    /// Name of the first detected RDP client, if any (for launching saved RDP sessions).
-    rdp_client: Option<String>,
-    /// Name of the first detected VNC viewer, if any.
-    vnc_client: Option<String>,
     /// Best-effort default web browser name; `None` if it couldn't be determined.
     default_browser: Option<String>,
 }
@@ -1297,6 +1310,7 @@ impl App {
             admin_task: None,
             broadcast: false,
             last_active: 0,
+            titlebar_rect: egui::Rect::NOTHING,
             pending_remote_paste: 0,
             keymap,
             macros,
@@ -1692,7 +1706,7 @@ impl App {
     /// Starts connecting to `session`, resolving its credentials from the vault.
     /// A missing named credential opens a prompt to create it, then continues.
     /// Connects a saved session according to its protocol: SSH opens a terminal
-    /// tab, RDP/VNC launch the configured external client.
+    /// tab, RDP/VNC open a native in-window session tab.
     fn connect_session(&mut self, session: &Session, ctx: &egui::Context) {
         match session.protocol {
             Protocol::Ssh => self.start_connect(session, ctx),
@@ -2439,6 +2453,32 @@ impl App {
         }
     }
 
+    /// A transparent drag strip over the title bar, drawn above modals so the
+    /// window can still be moved (and double-clicked to maximize) while a dialog
+    /// box is open — the title bar's own buttons are inert behind the modal then.
+    fn titlebar_drag_overlay(&self, ctx: &egui::Context) {
+        use egui::{Area, Id, Order, Rect, Sense, ViewportCommand, pos2};
+        let bar = self.titlebar_rect;
+        if !bar.is_finite() || bar.width() <= 0.0 {
+            return;
+        }
+        // Leave the top few pixels to the north resize grip.
+        let strip = Rect::from_min_max(pos2(bar.left(), bar.top() + 6.0), bar.right_bottom());
+        let resp = Area::new(Id::new("wz-titlebar-drag"))
+            .order(Order::Foreground)
+            .fixed_pos(strip.min)
+            .show(ctx, |ui| {
+                ui.allocate_response(strip.size(), Sense::click_and_drag())
+            })
+            .inner;
+        if resp.double_clicked() {
+            let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(!max));
+        } else if resp.drag_started() {
+            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+        }
+    }
+
     fn title_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut about = false;
         let mut quit = false;
@@ -2611,6 +2651,24 @@ impl App {
             Some(ExtrasAction::InstallIperf) => {
                 if let Some(cmd) = wazowski_servers::iperf_install_command() {
                     self.run_admin("Install iperf3".into(), cmd, None, false);
+                }
+                self.env_checks = None;
+            }
+            Some(ExtrasAction::InstallJq) => {
+                if let Some(cmd) = wazowski_servers::jq_install_command() {
+                    self.run_admin("Install jq".into(), cmd, None, false);
+                }
+                self.env_checks = None;
+            }
+            Some(ExtrasAction::InstallSmbclient) => {
+                if let Some(cmd) = wazowski_servers::smbclient_install_command() {
+                    self.run_admin("Install smbclient".into(), cmd, None, false);
+                }
+                self.env_checks = None;
+            }
+            Some(ExtrasAction::InstallGit) => {
+                if let Some(cmd) = wazowski_servers::git_install_command() {
+                    self.run_admin("Install git".into(), cmd, None, false);
                 }
                 self.env_checks = None;
             }
@@ -2866,35 +2924,39 @@ impl App {
             status(ui, "jq (JSON filtering)", checks.jq);
             if checks.jq {
                 ui.label("");
+            } else if wazowski_servers::jq_install_command().is_some() {
+                if ui.button("Install").clicked() {
+                    *action = Some(ExtrasAction::InstallJq);
+                }
             } else {
                 ui.label(RichText::new("install jq to filter in the JSON puller").weak());
+            }
+            ui.end_row();
+            // git (for git-backed shared sources).
+            status(ui, "git (shared-session sync)", checks.git);
+            if checks.git {
+                ui.label("");
+            } else if wazowski_servers::git_install_command().is_some() {
+                if ui.button("Install").clicked() {
+                    *action = Some(ExtrasAction::InstallGit);
+                }
+            } else {
+                ui.label(
+                    RichText::new("install Git for Windows to use git-backed shared sources").weak(),
+                );
             }
             ui.end_row();
             // smbclient (for browsing an RDP host's files over SMB).
             status(ui, "smbclient (SMB file browser)", checks.smbclient);
             if checks.smbclient {
                 ui.label("");
+            } else if wazowski_servers::smbclient_install_command().is_some() {
+                if ui.button("Install").clicked() {
+                    *action = Some(ExtrasAction::InstallSmbclient);
+                }
             } else {
                 ui.label(RichText::new("install Samba's client for RDP file browsing").weak());
             }
-            ui.end_row();
-            // RDP client (for launching saved RDP sessions).
-            status(ui, "RDP client", checks.rdp_client.is_some());
-            match &checks.rdp_client {
-                Some(name) => ui.label(RichText::new(format!("found: {name}")).weak()),
-                None => ui.label(
-                    RichText::new(format!("install one of: {}", RDP_CLIENTS.join(", "))).weak(),
-                ),
-            };
-            ui.end_row();
-            // VNC viewer (for launching saved VNC sessions).
-            status(ui, "VNC viewer", checks.vnc_client.is_some());
-            match &checks.vnc_client {
-                Some(name) => ui.label(RichText::new(format!("found: {name}")).weak()),
-                None => ui.label(
-                    RichText::new(format!("install one of: {}", VNC_CLIENTS.join(", "))).weak(),
-                ),
-            };
             ui.end_row();
             // Default web browser (used by "Open web GUI").
             status(ui, "Default web browser", checks.default_browser.is_some());
@@ -2905,64 +2967,44 @@ impl App {
             ui.end_row();
         });
 
-        // Preferred RDP client for the session "Open RDP" action.
-        let installed: Vec<&'static str> =
-            RDP_CLIENTS.iter().copied().filter(|c| has_bin(c)).collect();
-        if !installed.is_empty() {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("Preferred RDP client:");
-                let current = self.settings.rdp_client.clone().unwrap_or_else(|| "Auto".into());
-                let mut changed = false;
-                egui::ComboBox::from_id_salt("rdp-client").selected_text(current).show_ui(ui, |ui| {
-                    if ui.selectable_label(self.settings.rdp_client.is_none(), "Auto").clicked() {
-                        self.settings.rdp_client = None;
-                        changed = true;
-                    }
-                    for c in &installed {
-                        let sel = self.settings.rdp_client.as_deref() == Some(*c);
-                        if ui.selectable_label(sel, *c).clicked() {
-                            self.settings.rdp_client = Some((*c).to_owned());
-                            changed = true;
-                        }
-                    }
-                });
-                if changed && let Err(e) = self.settings.save() {
-                    self.error = Some(format!("Could not save settings: {e:#}"));
-                }
-            });
-        }
-
-        // Preferred VNC viewer for a VNC session's Connect action.
-        let vnc_installed: Vec<&'static str> =
-            VNC_CLIENTS.iter().copied().filter(|c| has_bin(c)).collect();
-        if !vnc_installed.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label("Preferred VNC viewer:");
-                let current = self.settings.vnc_client.clone().unwrap_or_else(|| "Auto".into());
-                let mut changed = false;
-                egui::ComboBox::from_id_salt("vnc-client").selected_text(current).show_ui(ui, |ui| {
-                    if ui.selectable_label(self.settings.vnc_client.is_none(), "Auto").clicked() {
-                        self.settings.vnc_client = None;
-                        changed = true;
-                    }
-                    for c in &vnc_installed {
-                        let sel = self.settings.vnc_client.as_deref() == Some(*c);
-                        if ui.selectable_label(sel, *c).clicked() {
-                            self.settings.vnc_client = Some((*c).to_owned());
-                            changed = true;
-                        }
-                    }
-                });
-                if changed && let Err(e) = self.settings.save() {
-                    self.error = Some(format!("Could not save settings: {e:#}"));
-                }
-            });
-        }
-
         ui.add_space(6.0);
         if ui.button("Re-check").clicked() {
             *action = Some(ExtrasAction::Recheck);
+        }
+
+        // Diagnostics: a persistent log file for troubleshooting (handy on
+        // Windows, where the app has no visible console for stderr output).
+        ui.add_space(14.0);
+        ui.separator();
+        ui.label(RichText::new("Diagnostics").strong());
+        ui.label(
+            RichText::new(
+                "Wazowski writes a rolling log of connections and shared-source syncs. \
+                 Check it to see why something failed (e.g. a git sync).",
+            )
+            .weak(),
+        );
+        ui.add_space(6.0);
+        match crate::conn_log::log_path() {
+            Some(path) => {
+                ui.horizontal(|ui| {
+                    if ui.button("📄  Open log file").clicked()
+                        && let Err(e) = open::that_detached(path)
+                    {
+                        self.error = Some(format!("Could not open the log: {e:#}"));
+                    }
+                    if ui.button("📂  Open log folder").clicked()
+                        && let Some(dir) = path.parent()
+                        && let Err(e) = open::that_detached(dir)
+                    {
+                        self.error = Some(format!("Could not open the log folder: {e:#}"));
+                    }
+                });
+                ui.label(RichText::new(path.display().to_string()).weak().monospace());
+            }
+            None => {
+                ui.label(RichText::new("No log file this session.").weak());
+            }
         }
     }
 
@@ -3433,7 +3475,7 @@ impl App {
             }
             if !keys.is_empty() {
                 ui.add_space(6.0);
-                ui.label(RichText::new("Private keys").strong());
+                ui.label(RichText::new("SSH keypairs").strong());
                 for name in &keys {
                     row(ui, format!("🗝 {name}"), name);
                 }
@@ -3486,11 +3528,16 @@ impl App {
         self.vault_show_passphrase = false;
         let Some(vault) = self.vault.unlocked() else { return };
         let Some(secret) = vault.get(name) else { return };
-        let (kind, username, has_passphrase) = match secret {
-            Secret::Password { username, .. } => (SecretKind::Password, username.clone(), false),
-            Secret::PrivateKey { username, passphrase, .. } => {
-                (SecretKind::Key, username.clone(), passphrase.is_some())
+        let (kind, username, public, has_passphrase) = match secret {
+            Secret::Password { username, .. } => {
+                (SecretKind::Password, username.clone(), String::new(), false)
             }
+            Secret::PrivateKey { username, public, passphrase, .. } => (
+                SecretKind::Key,
+                username.clone(),
+                public.clone().unwrap_or_default(),
+                passphrase.is_some(),
+            ),
         };
         self.vault_selected = Some(name.to_owned());
         self.vault_form = Some(SecretForm {
@@ -3499,6 +3546,7 @@ impl App {
             kind,
             username: username.unwrap_or_default(),
             value: String::new(),
+            public,
             passphrase: String::new(),
             has_passphrase,
         });
@@ -3555,6 +3603,13 @@ impl App {
             ui.heading("Sessions");
             if ui.small_button("+").on_hover_text("New session").clicked() {
                 self.dialog = Dialog::EditSession(SessionForm::new());
+            }
+            if ui
+                .small_button("🔗")
+                .on_hover_text("Add shared source")
+                .clicked()
+            {
+                self.dialog = Dialog::AddSource(AddSourceForm::default());
             }
         });
         filter_box(ui, &mut self.filter_sessions);
@@ -4292,6 +4347,12 @@ impl App {
         let mut remote_op: Option<RemoteOp> = None;
         let mut clicked_tab = None;
         let mut new_shell = false;
+        // The new-shell "+" only makes sense where the tab area is showing; in the
+        // full-area rail views (Settings / Tools / Vault) the tabs are hidden.
+        let show_new_shell = !matches!(
+            self.sidebar_view,
+            SidebarView::Settings | SidebarView::Tools | SidebarView::Vault
+        );
 
         egui::containers::Sides::new().shrink_left().spacing(6.0).show(
             ui,
@@ -4340,11 +4401,13 @@ impl App {
                                 }
                                 ui.separator();
                             }
-                            // New-tab button at the end of the tab list.
-                            if ui
-                                .button("+")
-                                .on_hover_text("New local shell (Ctrl+Shift+T)")
-                                .clicked()
+                            // New-tab button at the end of the tab list (only where
+                            // the tab area is visible, not in Settings/Tools/Vault).
+                            if show_new_shell
+                                && ui
+                                    .button("+")
+                                    .on_hover_text("New local shell (Ctrl+Shift+T)")
+                                    .clicked()
                             {
                                 new_shell = true;
                             }
@@ -5829,6 +5892,7 @@ impl App {
         let (mut save, mut delete, mut reveal, mut cancel) = (false, false, false, false);
         let mut eye_clicked = false;
         let mut eye_clicked_pass = false;
+        let mut gen_request: Option<wazowski_ssh::KeyAlgo> = None;
 
         ui.heading(if editing { "Edit credential" } else { "New credential" });
         ui.separator();
@@ -5844,11 +5908,11 @@ impl App {
                 egui::ComboBox::from_id_salt("vault-type")
                     .selected_text(match form.kind {
                         SecretKind::Password => "Password",
-                        SecretKind::Key => "Private key",
+                        SecretKind::Key => "SSH keypair",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut form.kind, SecretKind::Password, "Password");
-                        ui.selectable_value(&mut form.kind, SecretKind::Key, "Private key");
+                        ui.selectable_value(&mut form.kind, SecretKind::Key, "SSH keypair");
                     });
                 ui.end_row();
                 ui.label("Username:");
@@ -5874,6 +5938,24 @@ impl App {
                     });
                 }
                 SecretKind::Key => {
+                    // Offer to generate a fresh keypair when creating a new entry.
+                    if !editing {
+                        ui.horizontal(|ui| {
+                            ui.menu_button("🔑 Generate keypair…", |ui| {
+                                for algo in wazowski_ssh::KeyAlgo::ALL {
+                                    if ui.button(algo.label()).clicked() {
+                                        gen_request = Some(algo);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            ui.label(
+                                RichText::new("fills the keys below (set a passphrase first to encrypt)")
+                                    .weak(),
+                            );
+                        });
+                        ui.add_space(6.0);
+                    }
                     ui.label("Private key:");
                     ui.horizontal(|ui| {
                         if show {
@@ -5897,6 +5979,15 @@ impl App {
                         }
                         eye_clicked |= eye_button(ui, show);
                     });
+                    ui.add_space(6.0);
+                    ui.label("Public key:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut form.public)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("(optional) ssh-ed25519 AAAA… user@host")
+                            .desired_width(360.0)
+                            .desired_rows(2),
+                    );
                     ui.add_space(6.0);
                     ui.label("Passphrase:");
                     // Before reveal we can't show the value, but we know whether
@@ -5991,6 +6082,18 @@ impl App {
             }
             return;
         }
+        if let Some(algo) = gen_request {
+            let passphrase = (!form.passphrase.is_empty()).then(|| form.passphrase.clone());
+            match wazowski_ssh::generate(algo, form.username.trim(), passphrase.as_deref()) {
+                Ok(k) => {
+                    form.value = k.private_pem;
+                    form.public = k.public_openssh;
+                    // Reveal the generated private key so the user can see it.
+                    self.vault_show_value = true;
+                }
+                Err(e) => self.error = Some(format!("Key generation failed: {e:#}")),
+            }
+        }
         self.vault_form = Some(form);
     }
 
@@ -6011,9 +6114,10 @@ impl App {
                 (SecretKind::Password, Some(Secret::Password { password, .. })) => {
                     Secret::Password { username, password: password.clone() }
                 }
-                (SecretKind::Key, Some(Secret::PrivateKey { pem, passphrase, .. })) => {
+                (SecretKind::Key, Some(Secret::PrivateKey { pem, public, passphrase, .. })) => {
                     Secret::PrivateKey {
                         pem: pem.clone(),
+                        public: form.public_opt().or_else(|| public.clone()),
                         passphrase: passphrase.clone(),
                         username,
                     }
@@ -7662,11 +7766,11 @@ impl App {
                     egui::ComboBox::from_id_salt("cred-kind")
                         .selected_text(match form.kind {
                             SecretKind::Password => "Password",
-                            SecretKind::Key => "Private key",
+                            SecretKind::Key => "SSH keypair",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut form.kind, SecretKind::Password, "Password");
-                            ui.selectable_value(&mut form.kind, SecretKind::Key, "Private key");
+                            ui.selectable_value(&mut form.kind, SecretKind::Key, "SSH keypair");
                         });
                     ui.end_row();
                     ui.label("Username");
@@ -7690,6 +7794,14 @@ impl App {
                                 egui::TextEdit::multiline(&mut form.value)
                                     .hint_text("Paste the PEM private key")
                                     .desired_rows(3),
+                            );
+                            ui.end_row();
+                            ui.label("Public key");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut form.public)
+                                    .desired_rows(2)
+                                    .font(egui::TextStyle::Monospace)
+                                    .hint_text("(optional) ssh-ed25519 AAAA… user@host"),
                             );
                             ui.end_row();
                             ui.label("Passphrase");
@@ -7947,7 +8059,7 @@ impl App {
                 ui.horizontal(|ui| {
                     for (proto, icon, tip) in [
                         (Protocol::Ssh, "🖥", "SSH terminal"),
-                        (Protocol::Rdp, "🖵", "Remote Desktop (external client)"),
+                        (Protocol::Rdp, "🖵", "Remote Desktop (in-window)"),
                         (Protocol::Vnc, "👁", "VNC (in-window)"),
                     ] {
                         let selected = form.protocol == proto;
@@ -8325,6 +8437,7 @@ impl App {
                             }
                             AuthMethod::Key => Secret::PrivateKey {
                                 pem: secret_input,
+                                public: None,
                                 passphrase: (!key_passphrase.is_empty()).then_some(key_passphrase),
                                 username: cred_user,
                             },
@@ -8593,20 +8706,36 @@ impl App {
                 ui.set_width(440.0);
                 ui.heading("Vault secrets");
                 ui.label(
-                    RichText::new("Named passwords and private keys, shareable across sessions.")
+                    RichText::new("Named passwords and SSH keypairs, shareable across sessions.")
                         .weak(),
                 );
                 ui.add_space(6.0);
 
                 if let Some(gf) = &mut state.gen_form {
-                    ui.heading("Generate key pair");
-                    ui.label(RichText::new("Creates an Ed25519 key and stores the private key here.").weak());
+                    ui.heading("Generate SSH keypair");
+                    ui.label(RichText::new("Creates a keypair and stores the private and public keys here.").weak());
                     egui::Grid::new("gen-fields").num_columns(2).show(ui, |ui| {
                         ui.label("Name");
                         ui.text_edit_singleline(&mut gf.name);
                         ui.end_row();
+                        ui.label("Algorithm");
+                        egui::ComboBox::from_id_salt("gen-algo")
+                            .selected_text(gf.algo.label())
+                            .show_ui(ui, |ui| {
+                                for algo in wazowski_ssh::KeyAlgo::ALL {
+                                    ui.selectable_value(&mut gf.algo, algo, algo.label());
+                                }
+                            });
+                        ui.end_row();
                         ui.label("Comment");
                         ui.add(egui::TextEdit::singleline(&mut gf.comment).hint_text("user@host (optional)"));
+                        ui.end_row();
+                        ui.label("Passphrase");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut gf.passphrase)
+                                .password(true)
+                                .hint_text("(optional, encrypts the key)"),
+                        );
                         ui.end_row();
                     });
                     ui.add_space(6.0);
@@ -8620,7 +8749,7 @@ impl App {
                     });
                 } else if let Some((name, public)) = state.last_public.clone() {
                     ui.heading("Key pair created");
-                    ui.label(format!("Stored private key as '{name}'. Public key:"));
+                    ui.label(format!("Stored keypair as '{name}'. Public key:"));
                     ui.add_space(4.0);
                     let mut public_text = public.clone();
                     ui.add(egui::TextEdit::multiline(&mut public_text).desired_rows(3).font(egui::TextStyle::Monospace));
@@ -8684,7 +8813,7 @@ impl App {
                             egui::ComboBox::from_id_salt("secret-kind")
                                 .selected_text(match form.kind {
                                     SecretKind::Password => "Password",
-                                    SecretKind::Key => "Private key",
+                                    SecretKind::Key => "SSH keypair",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
@@ -8695,7 +8824,7 @@ impl App {
                                     ui.selectable_value(
                                         &mut form.kind,
                                         SecretKind::Key,
-                                        "Private key",
+                                        "SSH keypair",
                                     );
                                 });
                             ui.end_row();
@@ -8727,10 +8856,23 @@ impl App {
                                             }),
                                     );
                                     ui.end_row();
+                                    ui.label("Public key");
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut form.public)
+                                            .desired_rows(2)
+                                            .font(egui::TextStyle::Monospace)
+                                            .hint_text("(optional) ssh-ed25519 AAAA… user@host"),
+                                    );
+                                    ui.end_row();
                                     ui.label("Passphrase");
                                     ui.add(
                                         egui::TextEdit::singleline(&mut form.passphrase)
-                                            .password(true),
+                                            .password(true)
+                                            .hint_text(if form.has_passphrase {
+                                                "(set; leave blank to keep)"
+                                            } else {
+                                                ""
+                                            }),
                                     );
                                     ui.end_row();
                                 }
@@ -8794,24 +8936,32 @@ impl App {
         }
     }
 
-    /// Generates an Ed25519 key pair, stores the private key, and shows the public key.
+    /// Generates an SSH keypair of the chosen algorithm, stores the private and
+    /// public keys, and shows the public key for copying.
     fn generate_keypair(&mut self) {
         let Dialog::VaultManager(state) = &self.dialog else { return };
         let Some(gf) = &state.gen_form else { return };
         let name = gf.name.trim().to_owned();
         let comment = gf.comment.trim().to_owned();
+        let algo = gf.algo;
+        let passphrase = gf.passphrase.clone();
         if name.is_empty() {
             return self.set_vault_error("Name is required.");
         }
         if self.vault.unlocked().and_then(|v| v.get(&name)).is_some() {
             return self.set_vault_error("A secret with that name already exists.");
         }
-        let generated = match wazowski_ssh::generate_ed25519(&comment) {
+        let passphrase = (!passphrase.is_empty()).then_some(passphrase);
+        let generated = match wazowski_ssh::generate(algo, &comment, passphrase.as_deref()) {
             Ok(k) => k,
             Err(e) => return self.set_vault_error(&format!("{e:#}")),
         };
-        let secret =
-            Secret::PrivateKey { pem: generated.private_pem, passphrase: None, username: None };
+        let secret = Secret::PrivateKey {
+            pem: generated.private_pem,
+            public: Some(generated.public_openssh.clone()),
+            passphrase,
+            username: None,
+        };
         if let Err(e) = self.store_secret(&name, secret) {
             return self.set_vault_error(&e);
         }
@@ -8825,15 +8975,19 @@ impl App {
     /// Loads an existing secret into the manager's edit form (values left blank
     /// so they are only overwritten when the user types a new value).
     fn begin_edit_secret(&mut self, name: &str) {
-        let (kind, username) = match self.vault.unlocked().and_then(|v| v.get(name)) {
-            Some(secret @ Secret::Password { .. }) => {
-                (SecretKind::Password, secret.username().unwrap_or_default().to_owned())
-            }
-            Some(secret @ Secret::PrivateKey { .. }) => {
-                (SecretKind::Key, secret.username().unwrap_or_default().to_owned())
-            }
-            None => return,
-        };
+        let (kind, username, public, has_passphrase) =
+            match self.vault.unlocked().and_then(|v| v.get(name)) {
+                Some(secret @ Secret::Password { .. }) => {
+                    (SecretKind::Password, secret.username().unwrap_or_default().to_owned(), String::new(), false)
+                }
+                Some(Secret::PrivateKey { username, public, passphrase, .. }) => (
+                    SecretKind::Key,
+                    username.clone().unwrap_or_default(),
+                    public.clone().unwrap_or_default(),
+                    passphrase.is_some(),
+                ),
+                None => return,
+            };
         if let Dialog::VaultManager(state) = &mut self.dialog {
             state.form = Some(SecretForm {
                 original: Some(name.to_owned()),
@@ -8841,8 +8995,9 @@ impl App {
                 kind,
                 username,
                 value: String::new(),
+                public,
                 passphrase: String::new(),
-                has_passphrase: false,
+                has_passphrase,
             });
             state.error = None;
         }
@@ -8868,8 +9023,35 @@ impl App {
         if name.is_empty() {
             return self.set_vault_error("Name is required.");
         }
-        // When editing with a blank value, keep the existing secret unchanged.
+        // When editing with the value (private key / password) left blank, keep
+        // the existing private key but still apply edits to a keypair's public
+        // key / passphrase / username. For a password, nothing to edit → close.
         if editing && form.value.is_empty() {
+            let existing_pem = self.vault.unlocked().and_then(|v| v.get(&name)).and_then(|s| {
+                match s {
+                    Secret::PrivateKey { pem, .. } => Some(pem.clone()),
+                    Secret::Password { .. } => None,
+                }
+            });
+            if form.kind == SecretKind::Key
+                && let Some(pem) = existing_pem
+            {
+                let secret = form.to_secret_with_pem(pem);
+                let result = match self.vault.unlocked_mut() {
+                    Some(vault) => vault.put(&name, secret).map_err(|e| format!("{e:#}")),
+                    None => Err("The vault is locked.".into()),
+                };
+                match result {
+                    Ok(()) => {
+                        if let Dialog::VaultManager(state) = &mut self.dialog {
+                            state.form = None;
+                            state.error = None;
+                        }
+                    }
+                    Err(e) => self.set_vault_error(&e),
+                }
+                return;
+            }
             if let Dialog::VaultManager(state) = &mut self.dialog {
                 state.form = None;
             }
@@ -9055,9 +9237,10 @@ impl eframe::App for App {
             }
         }
 
-        // Borderless window: provide our own edge/corner resize grips.
-        Self::window_resize_handles(&ctx);
-        egui::Panel::top("titlebar").show(ui, |ui| self.title_bar(ui, &ctx));
+        self.titlebar_rect = egui::Panel::top("titlebar")
+            .show(ui, |ui| self.title_bar(ui, &ctx))
+            .response
+            .rect;
         egui::Panel::left("sessions")
             .resizable(true)
             .default_size(240.0)
@@ -9111,6 +9294,14 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.central(ui));
 
         self.show_dialog(&ctx);
+
+        // Window chrome overlays are drawn last so they sit above any open modal:
+        // the border resize grips stay usable with a dialog up, and a drag strip
+        // over the title bar lets the window still be moved while a box is open.
+        Self::window_resize_handles(&ctx);
+        if !matches!(self.dialog, Dialog::None) {
+            self.titlebar_drag_overlay(&ctx);
+        }
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {}
@@ -9525,7 +9716,7 @@ fn session_hint(s: &Session) -> String {
             if !s.domain.is_empty() {
                 hint.push_str(&format!("\ndomain: {}", s.domain));
             }
-            hint.push_str("\nopens in external client");
+            hint.push_str("\nopens in a tab");
             hint
         }
         Protocol::Vnc => {
@@ -9735,21 +9926,6 @@ fn web_gui_url(host: &str, scheme: WebScheme) -> String {
     } else {
         format!("{}{host}", scheme.prefix())
     }
-}
-
-
-/// The common VNC viewers Wazowski can launch, most-preferred first.
-const VNC_CLIENTS: &[&str] = if cfg!(windows) {
-    &["vncviewer"]
-} else if cfg!(target_os = "macos") {
-    &["vncviewer", "open"]
-} else {
-    &["vncviewer", "xtigervncviewer", "remmina"]
-};
-
-/// The first installed VNC viewer on the PATH, if any.
-fn detect_vnc_client() -> Option<String> {
-    VNC_CLIENTS.iter().find(|name| has_bin(name)).map(|name| (*name).to_owned())
 }
 
 

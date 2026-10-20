@@ -191,24 +191,78 @@ pub fn start(
     }
 }
 
+/// Builds an install command for the first detected package manager, given the
+/// package name to use for each. A `None` for a manager skips it (no package).
+/// Returns `None` when no known package manager is on PATH (e.g. on Windows).
+fn install_command(packages: &[(&str, Option<&str>)]) -> Option<Vec<String>> {
+    // (manager binary, install args sans package) in preference order.
+    let managers: &[(&str, &[&str])] = &[
+        ("dnf", &["install", "-y"]),
+        ("apt-get", &["install", "-y"]),
+        ("pacman", &["-S", "--noconfirm"]),
+        ("zypper", &["install", "-y"]),
+        ("brew", &["install"]),
+    ];
+    for (bin, args) in managers {
+        if !on_path(bin) {
+            continue;
+        }
+        let Some((_, Some(pkg))) = packages.iter().find(|(m, _)| m == bin) else {
+            continue; // this manager has no package mapping; try the next
+        };
+        let mut cmd = vec![(*bin).to_string()];
+        cmd.extend(args.iter().map(|s| (*s).to_string()));
+        cmd.push((*pkg).to_string());
+        return Some(cmd);
+    }
+    None
+}
+
 /// The command to install iperf3 using a detected package manager, if any.
 /// (The caller runs it with elevation where needed.)
 pub fn iperf_install_command() -> Option<Vec<String>> {
-    let candidates: &[(&str, &[&str])] = &[
-        ("dnf", &["install", "-y", "iperf3"]),
-        ("apt-get", &["install", "-y", "iperf3"]),
-        ("pacman", &["-S", "--noconfirm", "iperf3"]),
-        ("zypper", &["install", "-y", "iperf"]),
-        ("brew", &["install", "iperf3"]),
-    ];
-    for (bin, args) in candidates {
-        if on_path(bin) {
-            let mut cmd = vec![(*bin).to_string()];
-            cmd.extend(args.iter().map(|s| (*s).to_string()));
-            return Some(cmd);
-        }
-    }
-    None
+    install_command(&[
+        ("dnf", Some("iperf3")),
+        ("apt-get", Some("iperf3")),
+        ("pacman", Some("iperf3")),
+        ("zypper", Some("iperf")),
+        ("brew", Some("iperf3")),
+    ])
+}
+
+/// The command to install `jq` (for the JSON/jq puller) via a package manager.
+pub fn jq_install_command() -> Option<Vec<String>> {
+    install_command(&[
+        ("dnf", Some("jq")),
+        ("apt-get", Some("jq")),
+        ("pacman", Some("jq")),
+        ("zypper", Some("jq")),
+        ("brew", Some("jq")),
+    ])
+}
+
+/// The command to install `smbclient` (Samba client) via a package manager.
+pub fn smbclient_install_command() -> Option<Vec<String>> {
+    install_command(&[
+        ("dnf", Some("samba-client")),
+        ("apt-get", Some("smbclient")),
+        ("pacman", Some("smbclient")),
+        ("zypper", Some("samba-client")),
+        ("brew", Some("samba")),
+    ])
+}
+
+/// The command to install `git` via a package manager (used for git-backed
+/// shared sources). On Windows there's no package manager here, so this returns
+/// `None` and the UI points at the Git for Windows download instead.
+pub fn git_install_command() -> Option<Vec<String>> {
+    install_command(&[
+        ("dnf", Some("git")),
+        ("apt-get", Some("git")),
+        ("pacman", Some("git")),
+        ("zypper", Some("git")),
+        ("brew", Some("git")),
+    ])
 }
 
 /// The command to let this binary bind privileged ports without root (Linux).
