@@ -23,6 +23,12 @@ pub(crate) async fn serve(
         command.arg("-B").arg(cfg.bind.to_string());
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // On Windows, don't flash a console window for the iperf3 server process.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
 
     let mut child = match command.spawn() {
         Ok(c) => c,

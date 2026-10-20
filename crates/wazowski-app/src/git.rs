@@ -220,6 +220,13 @@ impl GitRepo {
         if let Some(dir) = cwd {
             cmd.arg("-C").arg(dir);
         }
+        // On Windows, run git (and the ssh/credential helpers it spawns) without
+        // flashing a console window. CREATE_NO_WINDOW = 0x08000000.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
         // Never block on an interactive credential/host prompt.
         cmd.env("GIT_TERMINAL_PROMPT", "0");
         match &self.auth {
