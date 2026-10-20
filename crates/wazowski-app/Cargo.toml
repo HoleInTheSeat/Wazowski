@@ -52,6 +52,7 @@ open = "5"
 fs2 = "0.4"
 png = "0.17"
 ureq = "2"
+self-replace.workspace = true
 if-addrs.workspace = true
 regex.workspace = true
 log.workspace = true

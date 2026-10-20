@@ -540,6 +540,16 @@ impl VaultState {
 }
 
 /// A modal dialog, at most one at a time.
+/// The stage of the software-update dialog.
+enum UpdatePhase {
+    Checking,
+    UpToDate,
+    Available(crate::update::Release),
+    Downloading,
+    Installed,
+    Error(String),
+}
+
 enum Dialog {
     None,
     UnlockVault { password: String, remember: bool, error: Option<String> },
@@ -581,6 +591,8 @@ enum Dialog {
     ImportSettings { path: PathBuf },
     /// A plain informational modal (title + body) with an OK button.
     Notice { title: String, body: String },
+    /// The software-update dialog.
+    Update(UpdatePhase),
     DropMenu { payload: DragPayload, to: StoreId, folder: String },
     /// The macro editor (new or existing).
     MacroEdit(MacroForm),
@@ -942,6 +954,14 @@ pub struct App {
     vault: VaultState,
     vault_path: PathBuf,
     dialog: Dialog,
+    /// How this build was installed (fixed at startup; drives the updater).
+    install_kind: crate::update::InstallKind,
+    /// An in-flight "check for updates" worker, if any.
+    update_check: Option<crate::update::CheckHandle>,
+    /// An in-flight download+install worker, if any.
+    update_apply: Option<crate::update::ApplyHandle>,
+    /// A newer release found by a check (for the menu's "update available" hint).
+    update_available: Option<crate::update::Release>,
     quick_connect: String,
     next_tab_id: u64,
     /// Set once the user has confirmed quitting, so the window is allowed to close.
@@ -1304,6 +1324,13 @@ impl App {
             vault,
             vault_path,
             dialog: Dialog::None,
+            install_kind: crate::update::install_kind(),
+            // A quiet check on startup surfaces a menu hint if an update is out.
+            update_check: Some(crate::update::CheckHandle::spawn(
+                crate::update::current_version().to_owned(),
+            )),
+            update_apply: None,
+            update_available: None,
             quick_connect: String::new(),
             next_tab_id: 1,
             quitting: false,
@@ -2458,6 +2485,60 @@ impl App {
         }
     }
 
+    /// Starts a "check for updates" worker and opens the update dialog.
+    fn start_update_check(&mut self) {
+        self.update_check =
+            Some(crate::update::CheckHandle::spawn(crate::update::current_version().to_owned()));
+        self.dialog = Dialog::Update(UpdatePhase::Checking);
+    }
+
+    /// Polls the background update check / download workers and advances the UI.
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        if let Some(check) = &self.update_check {
+            if let Some(outcome) = check.take() {
+                self.update_check = None;
+                let user_initiated = matches!(self.dialog, Dialog::Update(UpdatePhase::Checking));
+                match outcome {
+                    crate::update::CheckOutcome::Available(rel) => {
+                        self.update_available = Some(rel.clone());
+                        if user_initiated {
+                            self.dialog = Dialog::Update(UpdatePhase::Available(rel));
+                        }
+                    }
+                    crate::update::CheckOutcome::UpToDate => {
+                        if user_initiated {
+                            self.dialog = Dialog::Update(UpdatePhase::UpToDate);
+                        }
+                    }
+                    // A silent startup check that errors is ignored; a user-started
+                    // one shows the error.
+                    crate::update::CheckOutcome::Error(e) => {
+                        if user_initiated {
+                            self.dialog = Dialog::Update(UpdatePhase::Error(e));
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(400));
+            }
+        }
+        if let Some(apply) = &self.update_apply {
+            if let Some(outcome) = apply.take() {
+                self.update_apply = None;
+                self.dialog = match outcome {
+                    crate::update::ApplyOutcome::Done => Dialog::Update(UpdatePhase::Installed),
+                    crate::update::ApplyOutcome::Error(e) => {
+                        Dialog::Update(UpdatePhase::Error(e))
+                    }
+                };
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(400));
+            }
+        }
+    }
+
     /// A transparent drag strip over the title bar, drawn above modals so the
     /// window can still be moved (and double-clicked to maximize) while a dialog
     /// box is open — the title bar's own buttons are inert behind the modal then.
@@ -2490,15 +2571,42 @@ impl App {
         let mut toggle_max = false;
         let mut minimize = false;
         let mut toggle_theme = false;
+        let mut check_update = false;
+        let update_label = self
+            .update_available
+            .as_ref()
+            .map(|r| format!("⬆ Update to v{}…", r.version));
 
         let bar = ui.horizontal(|ui| {
             ui.set_height(28.0);
             ui.add_space(6.0);
-            let app_menu = |ui: &mut egui::Ui, about: &mut bool, quit: &mut bool| {
+            let app_menu = |ui: &mut egui::Ui,
+                            about: &mut bool,
+                            quit: &mut bool,
+                            check_update: &mut bool,
+                            update_label: &Option<String>| {
                 ui.set_min_width(150.0);
                 if ui.button("About Wazowski").clicked() {
                     *about = true;
                     ui.close();
+                }
+                ui.separator();
+                match update_label {
+                    Some(label) => {
+                        if ui
+                            .button(RichText::new(label).color(Color32::from_rgb(120, 200, 120)))
+                            .clicked()
+                        {
+                            *check_update = true;
+                            ui.close();
+                        }
+                    }
+                    None => {
+                        if ui.button("Check for updates…").clicked() {
+                            *check_update = true;
+                            ui.close();
+                        }
+                    }
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
@@ -2511,11 +2619,15 @@ impl App {
                     tex.id(),
                     egui::vec2(18.0, 18.0),
                 ));
-                ui.menu_image_button(img, |ui| app_menu(ui, &mut about, &mut quit))
-                    .response
-                    .on_hover_text("Menu");
+                ui.menu_image_button(img, |ui| {
+                    app_menu(ui, &mut about, &mut quit, &mut check_update, &update_label)
+                })
+                .response
+                .on_hover_text("Menu");
             } else {
-                ui.menu_button("⬢", |ui| app_menu(ui, &mut about, &mut quit));
+                ui.menu_button("⬢", |ui| {
+                    app_menu(ui, &mut about, &mut quit, &mut check_update, &update_label)
+                });
             }
             ui.label(RichText::new("Wazowski").strong());
 
@@ -2551,6 +2663,9 @@ impl App {
 
         if about {
             self.dialog = Dialog::About;
+        }
+        if check_update {
+            self.start_update_check();
         }
         if quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3121,6 +3236,125 @@ impl App {
         });
         if close {
             self.dialog = Dialog::None;
+        }
+    }
+
+    /// The software-update dialog: check result, release notes, download/install,
+    /// and restart.
+    fn show_update(&mut self, ctx: &egui::Context) {
+        enum Act {
+            Close,
+            Download,
+            Restart,
+            OpenUrl(String),
+            Recheck,
+        }
+        let mut act: Option<Act> = None;
+        let can_update = self.install_kind.can_self_update();
+        let current = crate::update::current_version();
+        if let Dialog::Update(phase) = &self.dialog {
+            egui::Modal::new(egui::Id::new("update")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading("Software update");
+                ui.add_space(4.0);
+                match phase {
+                    UpdatePhase::Checking => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Checking for updates…");
+                        });
+                    }
+                    UpdatePhase::UpToDate => {
+                        ui.label(format!("You're on the latest version (v{current})."));
+                        ui.add_space(8.0);
+                        act = ui.button("OK").clicked().then_some(Act::Close);
+                    }
+                    UpdatePhase::Available(rel) => {
+                        ui.label(format!(
+                            "Version {} is available — you have {current}.",
+                            rel.version
+                        ));
+                        if !rel.notes.trim().is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("Release notes").strong());
+                            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                                ui.label(RichText::new(rel.notes.as_str()).weak());
+                            });
+                        }
+                        if !can_update {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(
+                                    "This copy is managed by your package manager — update it \
+                                     there (e.g. dnf upgrade).",
+                                )
+                                .weak(),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if can_update && ui.button("⬇ Download & install").clicked() {
+                                act = Some(Act::Download);
+                            }
+                            if ui.button("View release").clicked() {
+                                act = Some(Act::OpenUrl(rel.url.clone()));
+                            }
+                            if ui.button("Later").clicked() {
+                                act = Some(Act::Close);
+                            }
+                        });
+                    }
+                    UpdatePhase::Downloading => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Downloading and installing…");
+                        });
+                    }
+                    UpdatePhase::Installed => {
+                        ui.label("Update installed. Restart Wazowski to use the new version.");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Restart now").clicked() {
+                                act = Some(Act::Restart);
+                            }
+                            if ui.button("Later").clicked() {
+                                act = Some(Act::Close);
+                            }
+                        });
+                    }
+                    UpdatePhase::Error(e) => {
+                        ui.colored_label(Color32::LIGHT_RED, e);
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Retry").clicked() {
+                                act = Some(Act::Recheck);
+                            }
+                            if ui.button("Close").clicked() {
+                                act = Some(Act::Close);
+                            }
+                        });
+                    }
+                }
+            });
+        }
+        match act {
+            Some(Act::Close) => self.dialog = Dialog::None,
+            Some(Act::Download) => {
+                if let Dialog::Update(UpdatePhase::Available(rel)) = &self.dialog {
+                    let rel = rel.clone();
+                    self.update_apply = Some(crate::update::ApplyHandle::spawn(
+                        rel,
+                        self.install_kind.clone(),
+                    ));
+                    self.dialog = Dialog::Update(UpdatePhase::Downloading);
+                }
+            }
+            Some(Act::Restart) => crate::update::relaunch(&self.install_kind),
+            Some(Act::OpenUrl(url)) => {
+                let _ = open::that_detached(url);
+            }
+            Some(Act::Recheck) => self.start_update_check(),
+            None => {}
         }
     }
 
@@ -6169,6 +6403,7 @@ impl App {
             Dialog::ConfirmSyncPush { .. } => self.show_confirm_sync_push(ctx),
             Dialog::ImportSettings { .. } => self.show_import_settings(ctx),
             Dialog::Notice { .. } => self.show_notice(ctx),
+            Dialog::Update(_) => self.show_update(ctx),
             Dialog::DropMenu { .. } => self.show_drop_menu(ctx),
             Dialog::MacroEdit(_) => self.show_macro_edit(ctx),
             Dialog::ConfirmMacro { .. } => self.show_confirm_macro(ctx),
@@ -9362,6 +9597,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.central(ui));
 
+        self.poll_updates(&ctx);
         self.show_dialog(&ctx);
 
         // Window chrome overlays are drawn last so they sit above any open modal:

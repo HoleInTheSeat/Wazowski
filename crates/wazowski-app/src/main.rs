@@ -16,6 +16,7 @@ mod sftp_ui;
 mod smb_ui;
 mod sources;
 mod servers_ui;
+mod update;
 
 use std::fs::{File, OpenOptions};
 

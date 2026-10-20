@@ -27,7 +27,8 @@ consoles, saved sessions, credentials, macros, quick servers, and network tools.
 11. [Keyboard shortcuts](keybindings.md) — the default keymap and how to rebind.
 12. [Importing from MobaXterm](importing-from-mobaxterm.md) — converting
     `.mxtsessions` files.
-13. [Troubleshooting](troubleshooting.md) — common issues and fixes.
+13. [Updating](updating.md) — in-app updates and the Windows installer.
+14. [Troubleshooting](troubleshooting.md) — common issues and fixes.
 
 ## Core concepts
 

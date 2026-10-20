@@ -133,9 +133,39 @@ jobs:
           name: wazowski-linux-packages
           path: dist/*
 
+  package-windows:
+    name: Package Windows (installer)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p wazowski-app
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          # Stage the payload next to the .iss (it references wazowski.exe / icon.ico).
+          Copy-Item target/release/wazowski.exe packaging/windows/wazowski.exe
+          $version = "${{ github.ref_name }}" -replace '^v',''
+          # Inno Setup ships on the hosted Windows runners.
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DMyAppVersion=$version" packaging/windows/wazowski.iss
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item packaging/windows/Output/Wazowski-Setup.exe "dist/wazowski-${{ github.ref_name }}-windows-x86_64-setup.exe"
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: wazowski-windows-installer
+          path: dist/*
+
   release:
     name: Publish release
-    needs: [build, package-linux]
+    needs: [build, package-linux, package-windows]
     # Publish as long as the Linux packaging succeeded, even if the `build` job
     # is marked failed because the macOS runner never got allocated (a frequent
     # capacity issue that otherwise blocks the Linux/Windows artifacts). The
