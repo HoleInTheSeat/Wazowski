@@ -11,17 +11,20 @@ each user creates those credentials locally on first use.
 
 - **Folder / file** — a sessions file on a shared or synced location (network
   mount, NAS, Dropbox/Nextcloud folder, …).
-- **Git repo** — a repository on GitHub, GitLab, Forgejo, etc. Auth can be:
-  - **None / ambient** (public repo or your existing git credentials),
-  - **HTTPS token (keyring)** (stored in your OS keyring, sent as a header —
-    never written to the repo config),
-  - **SSH key file** (a specific key file, or your agent/default key), or
-  - **Vault entry** — authenticate from a [vault](vault.md) credential: a
-    **password** entry is used as the HTTPS username + token, and an **SSH
-    keypair** entry as the SSH key. The vault must be unlocked for the source to
+- **Git repo** — a repository on GitHub, GitLab, Forgejo, etc. Auth is either:
+  - **None / ambient** (public repo or your existing git credentials), or
+  - **Vault entry** — authenticate from a [vault](vault.md) credential. Add a
+    **password** entry (its password is the HTTPS token; set the username for
+    GitLab/Forgejo — GitHub PATs don't need one) or an **SSH keypair** entry,
+    then pick it. Credentials live only in the encrypted vault — never in a
+    config file or the OS keyring. The vault must be unlocked for the source to
     sync; while it's locked the source stays on its offline cache and re-syncs
     once you unlock. (A passphrase-protected keypair is decrypted in memory for
-    git; the key is written only to a private temporary file for the SSH call.)
+    git; the key is written only to a private, 0600 temporary file for the SSH
+    call and deleted afterward.)
+
+  Sources created in older versions with a keyring token or key-file still sync;
+  switch them to a vault entry to change their credentials.
 
 Either way, the source is **cached locally**, so the sessions stay available even
 when the share or remote is offline (read-only until it's reachable again).

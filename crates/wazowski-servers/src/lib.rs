@@ -71,8 +71,10 @@ pub struct ServerConfig {
     /// SFTP username (empty = anonymous, any username accepted).
     #[serde(default)]
     pub username: String,
-    /// SFTP password (empty = accept any).
-    #[serde(default)]
+    /// SFTP password (empty = accept any). Kept out of `servers.toml` — it's
+    /// stored in the OS keyring instead (see `servers_ui`). Still deserialized so
+    /// an older plaintext config can be migrated into the keyring on load.
+    #[serde(default, skip_serializing)]
     pub password: String,
 }
 

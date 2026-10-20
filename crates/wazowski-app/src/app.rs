@@ -619,7 +619,6 @@ struct AddSourceForm {
     file: String,
     auth: GitAuthKind,
     username: String,
-    token: String,
     key_path: String,
     /// Name of the vault entry to authenticate with (for `GitAuthKind::Vault`).
     vault_entry: String,
@@ -640,7 +639,6 @@ impl Default for AddSourceForm {
             file: "wazowski-sessions.toml".into(),
             auth: GitAuthKind::None,
             username: String::new(),
-            token: String::new(),
             key_path: String::new(),
             vault_entry: String::new(),
             icon: String::new(),
@@ -650,9 +648,9 @@ impl Default for AddSourceForm {
 }
 
 impl AddSourceForm {
-    /// Prefills the form from an existing source (and its stored HTTPS token). The
-    /// description lives in the shared file, so it's passed in from the live store.
-    fn from_def(def: &SourceDef, token: Option<String>, description: &str) -> Self {
+    /// Prefills the form from an existing source. The description lives in the
+    /// shared file, so it's passed in from the live store.
+    fn from_def(def: &SourceDef, description: &str) -> Self {
         Self {
             edit_id: Some(def.id.clone()),
             name: def.name.clone(),
@@ -664,7 +662,6 @@ impl AddSourceForm {
             file: def.file.clone(),
             auth: def.auth,
             username: def.username.clone(),
-            token: token.unwrap_or_default(),
             key_path: def.key_path.clone(),
             vault_entry: def.vault_entry.clone(),
             icon: def.icon.clone(),
@@ -4087,13 +4084,8 @@ impl App {
                 if let Some(source) = self.shared.iter().find(|s| s.id() == id) {
                     let def = source.def().clone();
                     let description = source.description().to_owned();
-                    let token = if def.auth == GitAuthKind::Https {
-                        sources::load_git_token(&def.id)
-                    } else {
-                        None
-                    };
                     self.dialog =
-                        Dialog::AddSource(AddSourceForm::from_def(&def, token, &description));
+                        Dialog::AddSource(AddSourceForm::from_def(&def, &description));
                 }
                 Ok(())
             }
@@ -7114,7 +7106,6 @@ impl App {
         let mut add = false;
         let mut cancel = false;
         let mut browse_folder = false;
-        let mut browse_key = false;
         // Snapshot the vault entry names for the "Vault entry" auth picker (the
         // dialog closure borrows self.dialog, so it can't also read self.vault).
         let vault_names: Vec<String> = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
@@ -7178,48 +7169,22 @@ impl App {
                             ui.text_edit_singleline(&mut f.file);
                             ui.end_row();
                             ui.label("Auth");
+                            // Git sources authenticate either anonymously or from a
+                            // vault entry — credentials live only in the encrypted
+                            // vault, never in a config file or the keyring.
                             egui::ComboBox::from_id_salt("git-auth")
                                 .selected_text(match f.auth {
                                     GitAuthKind::None => "None / ambient",
-                                    GitAuthKind::Https => "HTTPS token (keyring)",
-                                    GitAuthKind::Ssh => "SSH key file",
                                     GitAuthKind::Vault => "Vault entry",
+                                    GitAuthKind::Https => "HTTPS token (legacy keyring)",
+                                    GitAuthKind::Ssh => "SSH key file (legacy)",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut f.auth, GitAuthKind::None, "None / ambient");
-                                    ui.selectable_value(&mut f.auth, GitAuthKind::Https, "HTTPS token (keyring)");
-                                    ui.selectable_value(&mut f.auth, GitAuthKind::Ssh, "SSH key file");
                                     ui.selectable_value(&mut f.auth, GitAuthKind::Vault, "Vault entry");
                                 });
                             ui.end_row();
                             match f.auth {
-                                GitAuthKind::Https => {
-                                    ui.label("Username");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut f.username)
-                                            .hint_text("(optional for GitHub PATs)"),
-                                    );
-                                    ui.end_row();
-                                    ui.label("Token");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut f.token)
-                                            .password(true)
-                                            .hint_text("stored in your OS keyring"),
-                                    );
-                                    ui.end_row();
-                                }
-                                GitAuthKind::Ssh => {
-                                    ui.label("Private key");
-                                    ui.horizontal(|ui| {
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut f.key_path)
-                                                .hint_text("(optional; uses agent if blank)")
-                                                .desired_width(240.0),
-                                        );
-                                        browse_key |= ui.button("Browse…").clicked();
-                                    });
-                                    ui.end_row();
-                                }
                                 GitAuthKind::Vault => {
                                     ui.label("Vault entry");
                                     if !vault_unlocked {
@@ -7249,8 +7214,22 @@ impl App {
                                     ui.label("");
                                     ui.label(
                                         RichText::new(
-                                            "A password entry is used as the HTTPS token; an \
-                                             SSH keypair entry as the SSH key.",
+                                            "Add a Password vault entry for an HTTPS token (its \
+                                             password is the token), or an SSH keypair entry for \
+                                             an SSH key, then pick it here.",
+                                        )
+                                        .weak(),
+                                    );
+                                    ui.end_row();
+                                }
+                                // Legacy keyring/key-file sources still sync, but new
+                                // credentials can only be set via a vault entry.
+                                GitAuthKind::Https | GitAuthKind::Ssh => {
+                                    ui.label("");
+                                    ui.label(
+                                        RichText::new(
+                                            "Legacy auth — switch to \"Vault entry\" to manage \
+                                             this source's credentials.",
                                         )
                                         .weak(),
                                     );
@@ -7277,12 +7256,6 @@ impl App {
             && let Dialog::AddSource(f) = &mut self.dialog
         {
             f.path = picked.to_string_lossy().into_owned();
-        }
-        if browse_key
-            && let Some(picked) = rfd::FileDialog::new().pick_file()
-            && let Dialog::AddSource(f) = &mut self.dialog
-        {
-            f.key_path = picked.to_string_lossy().into_owned();
         }
         if add
             && let Dialog::AddSource(f) = &self.dialog
@@ -7332,7 +7305,10 @@ impl App {
             icon: f.icon.clone(),
             color: f.color,
         };
-        let mut token = None;
+        // New git sources authenticate via a vault entry (or anonymously), so no
+        // token is ever captured for the keyring here; legacy keyring sources keep
+        // whatever token they already have.
+        let token: Option<String> = None;
         match f.kind {
             SourceKind::Folder => {
                 if f.path.trim().is_empty() {
@@ -7345,20 +7321,8 @@ impl App {
                     return Err("Enter the repository URL.".into());
                 }
                 def.url = f.url.trim().to_owned();
-                match f.auth {
-                    GitAuthKind::Https => {
-                        if f.token.is_empty() {
-                            return Err("Enter the HTTPS token (or choose a different auth)."
-                                .into());
-                        }
-                        token = Some(f.token.clone());
-                    }
-                    GitAuthKind::Vault => {
-                        if f.vault_entry.trim().is_empty() {
-                            return Err("Choose a vault entry (or a different auth).".into());
-                        }
-                    }
-                    GitAuthKind::Ssh | GitAuthKind::None => {}
+                if f.auth == GitAuthKind::Vault && f.vault_entry.trim().is_empty() {
+                    return Err("Choose a vault entry (or None / ambient).".into());
                 }
             }
         }
