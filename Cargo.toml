@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -50,7 +50,8 @@ wazowski-remote = { path = "crates/wazowski-remote" }
 
 [profile.release]
 strip = true
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 
 # Vendored vnc-rs with VncClient::new / AuthHelper exposed, so wazowski-remote can
 # run the RFB handshake itself (needed for VeNCrypt + TLS, which upstream lacks).

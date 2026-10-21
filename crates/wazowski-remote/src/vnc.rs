@@ -92,9 +92,12 @@ pub(crate) async fn run(
     ev_tx: std::sync::mpsc::Sender<RemoteEvent>,
     mut in_rx: UnboundedReceiver<RemoteInput>,
     shutdown: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
 ) {
-    if let Err(e) =
-        run_inner(&host, port, password, &options, &frame, &ev_tx, &mut in_rx, &shutdown).await
+    if let Err(e) = run_inner(
+        &host, port, password, &options, &frame, &ev_tx, &mut in_rx, &shutdown, &active,
+    )
+    .await
     {
         let _ = ev_tx.send(RemoteEvent::Error(friendly_error(&e.to_string())));
     }
@@ -116,17 +119,29 @@ async fn run_inner(
     ev_tx: &std::sync::mpsc::Sender<RemoteEvent>,
     in_rx: &mut UnboundedReceiver<RemoteInput>,
     shutdown: &Arc<AtomicBool>,
+    active: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let client = connect(host, port, password.unwrap_or_default(), options).await?;
 
     let mut local = Local::default();
     let mut refresh = Instant::now();
+    let mut was_active = true;
     let _ = client.input(X11Event::Refresh).await;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        // While the tab is hidden the backend idles: we keep draining the socket
+        // (so it stays healthy) but stop *requesting* framebuffer updates — RFB is
+        // demand-driven, so a well-behaved server then sends nothing — and we don't
+        // publish frames nobody is watching. Becoming visible asks for a full update.
+        let is_active = active.load(Ordering::Relaxed);
+        if is_active && !was_active {
+            let _ = client.input(X11Event::Refresh).await;
+            refresh = Instant::now();
+        }
+        was_active = is_active;
 
         // Forward all queued input (dropped when observing only).
         while let Ok(input) = in_rx.try_recv() {
@@ -152,8 +167,10 @@ async fn run_inner(
             }
         }
 
-        // Publish a fresh frame to the UI only when something changed.
-        if dirty
+        // Publish a fresh frame only when something changed and the tab is visible
+        // (no point copying frames nobody is looking at).
+        if is_active
+            && dirty
             && local.w > 0
             && let Ok(mut guard) = frame.lock()
         {
@@ -164,11 +181,13 @@ async fn run_inner(
             guard.seq = guard.seq.wrapping_add(1);
         }
 
-        if refresh.elapsed() >= Duration::from_millis(33) {
+        if is_active && refresh.elapsed() >= Duration::from_millis(33) {
             let _ = client.input(X11Event::Refresh).await;
             refresh = Instant::now();
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        // Poll briskly while visible; idle slowly while hidden.
+        let idle = if is_active { 2 } else { 100 };
+        tokio::time::sleep(Duration::from_millis(idle)).await;
     }
 
     let _ = client.close().await;

@@ -1320,7 +1320,9 @@ impl App {
         let vault_path = Vault::default_path().unwrap_or_else(|_| "vault.enc".into());
         let vault = initial_vault_state(&vault_path);
 
-        // Load shared sources and open each (refreshing its cache from the share).
+        // Load shared sources from their local caches immediately, then refresh
+        // each from the share in the background (so startup never blocks on a
+        // network git fetch).
         let sources_config = SourcesConfig::default_path()
             .and_then(SourcesConfig::load)
             .or_else(|_| SourcesConfig::load("sources.toml".into()))
@@ -1331,7 +1333,7 @@ impl App {
             .iter()
             .map(|def| {
                 let auth = vault_git_auth(def, vault.unlocked());
-                SharedSource::open(def.clone(), &cache, auth)
+                SharedSource::open_deferred(def.clone(), &cache, auth)
             })
             .collect();
 
@@ -1679,9 +1681,9 @@ impl App {
     fn tab_hint(&self, tab: &Tab) -> String {
         let mut lines = Vec::new();
         if let Some(sid) = &tab.session_id
-            && let Some((_, session)) = self.find_session_anywhere(sid)
+            && let Some(session) = self.find_session_ref(sid)
         {
-            lines.push(session_hint(&session));
+            lines.push(session_hint(session));
         } else {
             match &tab.restart {
                 Some(RestartKind::Ssh(p)) => {
@@ -1804,7 +1806,10 @@ impl App {
                     to_remote_rdp_quality(session.rdp_quality),
                 );
                 let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
+                // Link the tab to its saved session (if any) so it gets a tooltip.
+                let sid = self.saved_session_id(session);
                 self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
+                self.tabs[self.active].session_id = sid;
                 self.tabs[self.active].smb = Some(smb);
             }
             Protocol::Vnc => {
@@ -1820,7 +1825,9 @@ impl App {
                 };
                 let handle = connect_vnc(&session.host, session.port, password, options);
                 let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc);
+                let sid = self.saved_session_id(session);
                 self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
+                self.tabs[self.active].session_id = sid;
             }
         }
     }
@@ -3432,7 +3439,7 @@ impl App {
             .sources_config
             .defs
             .iter()
-            .map(|def| SharedSource::open(def.clone(), &cache, vault_git_auth(def, vault)))
+            .map(|def| SharedSource::open_deferred(def.clone(), &cache, vault_git_auth(def, vault)))
             .collect();
 
         // Quick servers: reload configs, but carry over any still-running server's
@@ -4509,6 +4516,16 @@ impl App {
         None
     }
 
+    /// Finds a session by id anywhere (local or a shared source) without cloning
+    /// it — for read-only uses like building a tooltip, where the owned `Session`
+    /// and its `StoreId` from [`find_session_anywhere`] aren't needed.
+    fn find_session_ref(&self, id: &str) -> Option<&Session> {
+        if let Some(s) = self.sessions.get(id) {
+            return Some(s);
+        }
+        self.shared.iter().find_map(|source| source.store().get(id))
+    }
+
     /// The recent sessions that still exist, as (store, id, name), newest first.
     fn recent_sessions(&self) -> Vec<(StoreId, String, String)> {
         self.settings
@@ -4621,9 +4638,14 @@ impl App {
         let active = self.active;
         let tab_count = self.tabs.len();
         let hints: Vec<String> = self.tabs.iter().map(|t| self.tab_hint(t)).collect();
-        // Which tabs have terminal output to save/print (not Connecting/Detached).
-        let has_output: Vec<bool> =
-            (0..self.tabs.len()).map(|i| self.tab_output_text(i).is_some()).collect();
+        // Which tabs can save/print output: terminal tabs with a live pane.
+        // Cheap structural check — never materialize the scrollback just to probe
+        // it (that String is rebuilt on demand when the user actually saves/prints).
+        let has_output: Vec<bool> = self
+            .tabs
+            .iter()
+            .map(|t| matches!(&t.content, TabContent::Terminal(p) if p.count() > 0))
+            .collect();
         let labels: Vec<String> = self
             .tabs
             .iter()
@@ -6670,7 +6692,9 @@ impl App {
             };
             let handle = connect_vnc(&session.host, session.port, pw, options);
             let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc);
+            let sid = self.saved_session_id(&session);
             self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
+            self.tabs[self.active].session_id = sid;
             return;
         }
         if session.protocol == Protocol::Rdp {
@@ -6693,7 +6717,9 @@ impl App {
                 to_remote_rdp_quality(session.rdp_quality),
             );
             let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
+            let sid = self.saved_session_id(&session);
             self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
+            self.tabs[self.active].session_id = sid;
             self.tabs[self.active].smb = Some(smb);
             return;
         }
@@ -8433,7 +8459,7 @@ impl App {
             .sources_config
             .defs
             .iter()
-            .map(|def| SharedSource::open(def.clone(), &cache, vault_git_auth(def, vault)))
+            .map(|def| SharedSource::open_deferred(def.clone(), &cache, vault_git_auth(def, vault)))
             .collect();
     }
 
@@ -9707,6 +9733,24 @@ impl eframe::App for App {
 
         self.poll_connections(&ctx);
         self.poll_admin(&ctx);
+        // Apply any finished background shared-source refreshes; keep polling (and
+        // repaint) while any are still in flight so results land promptly.
+        let mut refreshing = false;
+        for source in &mut self.shared {
+            source.poll_reload();
+            refreshing |= source.is_refreshing();
+        }
+        if refreshing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        // Pause the backend of any remote (RDP/VNC) tab that isn't the visible one,
+        // so hidden sessions don't keep decoding/copying/refreshing frames.
+        let active_tab = self.active;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if let TabContent::Remote(r) = &tab.content {
+                r.set_active(i == active_tab);
+            }
+        }
         if self.settings.auto_backup_due() && Vault::exists(&self.vault_path) {
             self.run_vault_backup(false);
         }
@@ -9917,25 +9961,16 @@ enum TreeAction {
 /// interaction. `editable` is false for an offline shared source (view only).
 /// A node in the folder tree built from folder paths and session locations.
 #[derive(Default)]
-struct FolderNode {
-    children: BTreeMap<String, FolderNode>,
-    /// Each session directly in this folder.
-    sessions: Vec<SessionRow>,
+struct FolderNode<'a> {
+    children: BTreeMap<String, FolderNode<'a>>,
+    /// Each session directly in this folder — borrowed from the store, so the
+    /// tree rebuild each frame does no per-session string clones.
+    sessions: Vec<&'a Session>,
 }
 
-/// A session's data needed to render its sidebar row.
-struct SessionRow {
-    id: String,
-    name: String,
-    hint: String,
-    icon: String,
-    color: Option<[u8; 3]>,
-    protocol: Protocol,
-}
-
-impl FolderNode {
+impl<'a> FolderNode<'a> {
     /// Descends to (creating as needed) the node for a `/`-separated path.
-    fn at(&mut self, path: &str) -> &mut FolderNode {
+    fn at(&mut self, path: &str) -> &mut FolderNode<'a> {
         let mut node = self;
         if !path.is_empty() {
             for segment in path.split('/') {
@@ -9980,19 +10015,12 @@ fn render_store(
         if !filter.is_empty() && !session.name.to_lowercase().contains(filter) {
             continue;
         }
-        root.at(&session.folder).sessions.push(SessionRow {
-            id: session.id.clone(),
-            name: session.name.clone(),
-            hint: session_hint(session),
-            icon: session.icon.clone(),
-            color: session.color,
-            protocol: session.protocol,
-        });
+        root.at(&session.folder).sessions.push(session);
     }
 
     // Root-level sessions, then each top-level folder recursively.
-    for row in &root.sessions {
-        session_row(ui, store, row, destinations, editable, action);
+    for &session in &root.sessions {
+        session_row(ui, store, session, destinations, editable, action);
     }
     let children: Vec<_> = root.children.iter().collect();
     for (segment, node) in children {
@@ -10008,13 +10036,13 @@ fn render_store(
 /// Recursively renders one folder node (a collapsible header with its sessions
 /// and subfolders). `full` is the folder's full `/`-separated path.
 #[allow(clippy::too_many_arguments)]
-fn render_folder(
+fn render_folder<'a>(
     ui: &mut egui::Ui,
     store: &StoreId,
     data: &SessionStore,
     segment: &str,
     full: &str,
-    node: &FolderNode,
+    node: &FolderNode<'a>,
     destinations: &[Destination],
     editable: bool,
     action: &mut Option<TreeAction>,
@@ -10068,8 +10096,8 @@ fn render_folder(
                 )
             })
             .body(|ui| {
-                for row in &node.sessions {
-                    session_row(ui, store, row, destinations, editable, action);
+                for &session in &node.sessions {
+                    session_row(ui, store, session, destinations, editable, action);
                 }
                 for (child_segment, child) in &node.children {
                     if !filter.is_empty() && !child.has_sessions() {
@@ -10082,6 +10110,16 @@ fn render_folder(
                     );
                 }
             });
+
+        // Double-clicking the folder name expands/collapses it (not just the
+        // little triangle). Reload the stored state, flip it, and save.
+        if header_inner.inner.double_clicked() {
+            let mut st = CollapsingState::load_with_default_open(ui.ctx(), id, false);
+            let open = st.is_open();
+            st.set_open(!open);
+            st.store(ui.ctx());
+            ui.ctx().request_repaint();
+        }
 
         // The header row is a drop target; the menu goes on the label (the hit
         // widget), not the whole row, so a right-click on the name opens it.
@@ -10207,11 +10245,10 @@ fn session_hint(s: &Session) -> String {
             if !s.domain.is_empty() {
                 hint.push_str(&format!("\ndomain: {}", s.domain));
             }
-            hint.push_str("\nopens in a tab");
             hint
         }
         Protocol::Vnc => {
-            let mut hint = format!("VNC · {where_to}\nopens in a Wazowski tab");
+            let mut hint = format!("VNC · {where_to}");
             if s.vnc_view_only {
                 hint.push_str("\nview only");
             }
@@ -10222,6 +10259,32 @@ fn session_hint(s: &Session) -> String {
 
 /// Shows a tooltip on `response`, but only once the pointer has rested on the
 /// widget for a few seconds, so hovering the left pane isn't noisy.
+/// Like [`delayed_tooltip`], but the text is produced by a closure that runs only
+/// when the tooltip is actually about to render (hovered, past the delay) — so a
+/// list of rows doesn't build a tooltip string for every row every frame.
+fn delayed_tooltip_lazy(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    text: impl FnOnce() -> String,
+) {
+    const DELAY: f64 = 1.5;
+    let id = response.id.with("wz-hover-since");
+    if response.hovered() {
+        let now = ui.input(|i| i.time);
+        let since: f64 = ui.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || now));
+        if now - since >= DELAY {
+            let text = text();
+            if !text.is_empty() {
+                response.clone().on_hover_text(text);
+            }
+        } else {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    } else {
+        ui.data_mut(|d| d.remove::<f64>(id));
+    }
+}
+
 fn delayed_tooltip(ui: &egui::Ui, response: &egui::Response, text: &str) {
     const DELAY: f64 = 1.5;
     if text.is_empty() {
@@ -10276,26 +10339,26 @@ fn store_salt(store: &StoreId) -> String {
 fn session_row(
     ui: &mut egui::Ui,
     store: &StoreId,
-    row: &SessionRow,
+    session: &Session,
     destinations: &[Destination],
     editable: bool,
     action: &mut Option<TreeAction>,
 ) {
-    let (id, name) = (row.id.as_str(), row.name.as_str());
-    let default_icon = match row.protocol {
+    let (id, name) = (session.id.as_str(), session.name.as_str());
+    let default_icon = match session.protocol {
         Protocol::Ssh => "🖥",
         Protocol::Rdp => "🖵",
         Protocol::Vnc => "👁",
     };
-    let icon = if row.icon.is_empty() { default_icon } else { row.icon.as_str() };
+    let icon = if session.icon.is_empty() { default_icon } else { session.icon.as_str() };
     let text = {
         let t = RichText::new(format!("{icon} {name}"));
-        match row.color {
+        match session.color {
             // An explicit per-session color wins.
             Some([r, g, b]) => t.color(Color32::from_rgb(r, g, b)),
             // Otherwise distinguish types by a default color (SSH keeps the
             // theme's default text color, which reads white on the dark theme).
-            None => match row.protocol {
+            None => match session.protocol {
                 Protocol::Ssh => t,
                 Protocol::Rdp => t.color(Color32::from_rgb(90, 170, 255)),
                 Protocol::Vnc => t.color(Color32::from_rgb(240, 160, 60)),
@@ -10313,7 +10376,9 @@ fn session_row(
             drag_label(ui, text, DragPayload::Session { store: store.clone(), id: id.to_owned() })
         })
         .inner;
-    delayed_tooltip(ui, &resp, &row.hint);
+    // Compute the tooltip text only when it's actually about to show (hovered,
+    // past the delay) — not for every row every frame.
+    delayed_tooltip_lazy(ui, &resp, || session_hint(session));
     if resp.double_clicked() {
         *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
     }
@@ -10322,7 +10387,7 @@ fn session_row(
             *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
             ui.close();
         }
-        if row.protocol != Protocol::Vnc && ui.button("Connect as…").clicked() {
+        if session.protocol != Protocol::Vnc && ui.button("Connect as…").clicked() {
             *action = Some(TreeAction::ConnectAs(store.clone(), id.to_owned()));
             ui.close();
         }

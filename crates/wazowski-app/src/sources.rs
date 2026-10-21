@@ -8,6 +8,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -106,8 +108,8 @@ pub fn delete_git_token(id: &str) {
 enum Backend {
     /// A file on a shared/synced path.
     Folder(PathBuf),
-    /// A git working clone.
-    Git(GitRepo),
+    /// A git working clone (boxed: much larger than the folder variant).
+    Git(Box<GitRepo>),
 }
 
 impl Backend {
@@ -194,13 +196,13 @@ fn backend_for(def: &SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -
                 GitAuthKind::Vault => vault_auth.unwrap_or(GitAuth::None),
             };
             let work_dir = cache_dir.join("git").join(&def.id);
-            Backend::Git(GitRepo::new(
+            Backend::Git(Box::new(GitRepo::new(
                 work_dir,
                 def.url.clone(),
                 def.branch.clone(),
                 def.file.clone(),
                 auth,
-            ))
+            )))
         }
     }
 }
@@ -271,7 +273,9 @@ impl SourcesConfig {
 pub struct SharedSource {
     def: SourceDef,
     cache_path: PathBuf,
-    backend: Backend,
+    /// Shared (`Arc`) so a background refresh thread can run `fetch()` without
+    /// blocking the UI, while the main thread keeps using it for commit/push.
+    backend: Arc<Backend>,
     store: SessionStore,
     /// Whether the share was reachable at the last load/sync.
     available: bool,
@@ -279,33 +283,98 @@ pub struct SharedSource {
     missing: bool,
     /// A note about the last sync problem, for display.
     status: Option<String>,
+    /// An in-flight background fetch, if any (its result applied by `poll_reload`).
+    refresh: Option<Receiver<Result<Option<Vec<u8>>, String>>>,
 }
 
 impl SharedSource {
-    /// Opens a source: refresh the cache from the share if reachable, then load
-    /// the store from the cache (so it works offline).
-    pub fn open(def: SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -> Self {
+    /// Builds a source without touching the network/share. Loads the store from
+    /// the local cache so sessions are available immediately (and offline).
+    fn from_cache(def: SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -> Self {
         let cache_path = cache_dir.join(format!("{}.toml", def.id));
-        let backend = backend_for(&def, cache_dir, vault_auth);
-        let mut source = Self {
-            def,
-            cache_path,
-            backend,
-            store: SessionStore::default(),
-            available: false,
-            missing: false,
-            status: None,
-        };
+        let backend = Arc::new(backend_for(&def, cache_dir, vault_auth));
+        let available = cache_path.is_file();
+        let store = SessionStore::load(cache_path.clone()).unwrap_or_default();
+        Self { def, cache_path, backend, store, available, missing: false, status: None, refresh: None }
+    }
+
+    /// Opens a source synchronously: refresh the cache from the share (blocking),
+    /// then load the store. Used by tests and by one-shot operations where a brief
+    /// block is fine (creating/editing a source). The app's startup/sync paths use
+    /// [`open_deferred`](Self::open_deferred) to avoid freezing the UI.
+    pub fn open(def: SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -> Self {
+        let mut source = Self::from_cache(def, cache_dir, vault_auth);
         source.reload();
         source
     }
 
-    /// Re-reads the share (refreshing the cache) and reloads the store.
+    /// Opens a source without blocking: loads the local cache immediately, then
+    /// kicks off a background refresh (see [`poll_reload`](Self::poll_reload)).
+    pub fn open_deferred(def: SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -> Self {
+        let mut source = Self::from_cache(def, cache_dir, vault_auth);
+        source.begin_reload();
+        source
+    }
+
+    /// Re-reads the share (refreshing the cache) and reloads the store. Blocking:
+    /// a git source performs network I/O here. Prefer [`begin_reload`] on the UI.
     pub fn reload(&mut self) {
         if let Some(parent) = self.cache_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        match self.backend.fetch() {
+        let result = self.backend.fetch().map_err(|e| format!("{e:#}"));
+        self.apply_fetch(result);
+    }
+
+    /// Starts a background refresh (no-op if one is already in flight). The fetch
+    /// runs on a worker thread; call [`poll_reload`](Self::poll_reload) each frame
+    /// to apply the result when it arrives.
+    pub fn begin_reload(&mut self) {
+        if self.refresh.is_some() {
+            return;
+        }
+        if let Some(parent) = self.cache_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::channel();
+        // A detached worker: it owns a clone of the Arc'd backend and reports the
+        // fetch result back. If the receiver is gone (source removed), the send
+        // just fails harmlessly.
+        std::thread::spawn(move || {
+            let result = backend.fetch().map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        self.refresh = Some(rx);
+    }
+
+    /// Whether a background refresh is currently in flight.
+    pub fn is_refreshing(&self) -> bool {
+        self.refresh.is_some()
+    }
+
+    /// Applies a finished background refresh if one has landed. Returns `true`
+    /// when state changed (so the caller can repaint). Cheap to call every frame.
+    pub fn poll_reload(&mut self) -> bool {
+        let Some(rx) = &self.refresh else { return false };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.refresh = None;
+                self.apply_fetch(result);
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.refresh = None;
+                true
+            }
+        }
+    }
+
+    /// Applies a fetch result (from a blocking or background fetch): updates the
+    /// cache file + availability state, then reloads the store from the cache.
+    fn apply_fetch(&mut self, result: Result<Option<Vec<u8>>, String>) {
+        match result {
             Ok(Some(bytes)) => {
                 if let Err(e) = fs::write(&self.cache_path, &bytes) {
                     self.status = Some(format!("could not update cache: {e}"));
@@ -324,7 +393,7 @@ impl SharedSource {
                 self.available = false;
                 self.missing = false;
                 log::warn!(
-                    "shared source \"{}\" ({}) could not sync: {e:#}",
+                    "shared source \"{}\" ({}) could not sync: {e}",
                     self.def.name,
                     match self.def.kind {
                         SourceKind::Folder => "folder",
@@ -424,7 +493,7 @@ impl SharedSource {
     /// Whether the missing share can be recreated from the local cache. True only
     /// for a folder source whose file is gone (a deleted git repo can't be remade).
     pub fn can_recreate(&self) -> bool {
-        self.missing && matches!(self.backend, Backend::Folder(_))
+        self.missing && matches!(*self.backend, Backend::Folder(_))
     }
 
     // --- Accessors -------------------------------------------------------

@@ -96,6 +96,11 @@ pub struct RemoteHandle {
     events: std::sync::mpsc::Receiver<RemoteEvent>,
     input_tx: tokio::sync::mpsc::UnboundedSender<RemoteInput>,
     shutdown: Arc<AtomicBool>,
+    /// Whether this session's tab is currently visible. While `false`, the
+    /// backend idles: VNC stops requesting framebuffer updates (so the server
+    /// sends nothing) and RDP skips publishing frames — saving CPU/network/memory
+    /// bandwidth for tabs nobody is looking at.
+    active: Arc<AtomicBool>,
     _join: std::thread::JoinHandle<()>,
 }
 
@@ -103,6 +108,13 @@ impl RemoteHandle {
     /// Queues an input event for the backend (ignored once disconnected).
     pub fn send_input(&self, input: RemoteInput) {
         let _ = self.input_tx.send(input);
+    }
+
+    /// Marks this session visible/hidden. When hidden the backend idles (VNC
+    /// stops requesting frames; RDP stops publishing); becoming visible again
+    /// resumes and repaints the current screen.
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Relaxed);
     }
 
     /// Drains any backend events emitted since the last call.
@@ -144,9 +156,11 @@ pub fn connect_vnc(
     let (ev_tx, ev_rx) = std::sync::mpsc::channel();
     let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    let active = Arc::new(AtomicBool::new(true));
     let host = host.to_owned();
     let frame_bg = Arc::clone(&frame);
     let shutdown_bg = Arc::clone(&shutdown);
+    let active_bg = Arc::clone(&active);
     let join = std::thread::Builder::new()
         .name("wazowski-vnc".into())
         .spawn(move || {
@@ -157,11 +171,13 @@ pub fn connect_vnc(
                     return;
                 }
             };
-            rt.block_on(vnc::run(host, port, password, options, frame_bg, ev_tx, in_rx, shutdown_bg));
+            rt.block_on(vnc::run(
+                host, port, password, options, frame_bg, ev_tx, in_rx, shutdown_bg, active_bg,
+            ));
         })
         .expect("spawn vnc thread");
 
-    RemoteHandle { frame, events: ev_rx, input_tx: in_tx, shutdown, _join: join }
+    RemoteHandle { frame, events: ev_rx, input_tx: in_tx, shutdown, active, _join: join }
 }
 
 /// Connects to an RDP server (native, in-window), returning a session handle.
@@ -193,8 +209,10 @@ pub fn connect_rdp(
         view_only,
         quality,
     };
+    let active = Arc::new(AtomicBool::new(true));
     let frame_bg = Arc::clone(&frame);
     let shutdown_bg = Arc::clone(&shutdown);
+    let active_bg = Arc::clone(&active);
     let join = std::thread::Builder::new()
         .name("wazowski-rdp".into())
         .spawn(move || {
@@ -205,9 +223,9 @@ pub fn connect_rdp(
                     return;
                 }
             };
-            rt.block_on(rdp::run(params, frame_bg, ev_tx, in_rx, shutdown_bg));
+            rt.block_on(rdp::run(params, frame_bg, ev_tx, in_rx, shutdown_bg, active_bg));
         })
         .expect("spawn rdp thread");
 
-    RemoteHandle { frame, events: ev_rx, input_tx: in_tx, shutdown, _join: join }
+    RemoteHandle { frame, events: ev_rx, input_tx: in_tx, shutdown, active, _join: join }
 }

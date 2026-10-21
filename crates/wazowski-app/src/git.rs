@@ -5,9 +5,9 @@
 //! Private repos can authenticate with an HTTPS token (sent as a Basic auth
 //! header, never written to the repo config) or an SSH key.
 
-use std::cell::OnceCell;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -41,7 +41,7 @@ pub struct GitRepo {
     /// The GitHub account behind the HTTPS token, looked up once and cached
     /// (`None` when there's no token, the remote isn't github.com, or the lookup
     /// failed — e.g. offline). This is the preferred commit identity.
-    github_cache: OnceCell<Option<(String, String)>>,
+    github_cache: OnceLock<Option<(String, String)>>,
 }
 
 impl GitRepo {
@@ -73,7 +73,7 @@ impl GitRepo {
             file,
             auth,
             _ssh_key_file: ssh_key_file,
-            github_cache: OnceCell::new(),
+            github_cache: OnceLock::new(),
         }
     }
 

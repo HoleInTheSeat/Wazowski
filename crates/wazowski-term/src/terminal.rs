@@ -196,15 +196,17 @@ impl Terminal {
             let cut = self.osc_buf.len() - MAX;
             self.osc_buf.drain(..cut);
         }
-        let buf = self.osc_buf.clone();
+        // Scan the rolling buffer in place (no clone): the immutable borrows in
+        // the loop end before the `drain` below, and `parse_osc7` returns an owned
+        // path, so nothing borrows `osc_buf` past the loop.
         let mut from = 0;
         let mut found = None;
         let mut consumed = 0;
-        while let Some(rel) = find(&buf[from..], b"\x1b]7;") {
+        while let Some(rel) = find(&self.osc_buf[from..], b"\x1b]7;") {
             let start = from + rel + 4;
-            match osc_terminator(&buf[start..]) {
+            match osc_terminator(&self.osc_buf[start..]) {
                 Some((end, after)) => {
-                    if let Some(path) = parse_osc7(&buf[start..start + end]) {
+                    if let Some(path) = parse_osc7(&self.osc_buf[start..start + end]) {
                         found = Some(path);
                     }
                     consumed = start + after;

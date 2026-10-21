@@ -40,8 +40,9 @@ pub(crate) async fn run(
     ev_tx: std::sync::mpsc::Sender<RemoteEvent>,
     mut in_rx: UnboundedReceiver<RemoteInput>,
     shutdown: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
 ) {
-    if let Err(e) = run_inner(&params, &frame, &ev_tx, &mut in_rx, &shutdown).await {
+    if let Err(e) = run_inner(&params, &frame, &ev_tx, &mut in_rx, &shutdown, &active).await {
         let _ = ev_tx.send(RemoteEvent::Error(e.to_string()));
     }
     let _ = ev_tx.send(RemoteEvent::Disconnected);
@@ -143,6 +144,7 @@ async fn run_inner(
     ev_tx: &std::sync::mpsc::Sender<RemoteEvent>,
     in_rx: &mut UnboundedReceiver<RemoteInput>,
     shutdown: &Arc<AtomicBool>,
+    visible: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     // Install the rustls ring provider once (shared with the VNC backend; the
     // second caller just gets an Err we ignore).
@@ -217,7 +219,10 @@ async fn run_inner(
 
         let outputs = tokio::select! {
             _ = publish_timer.tick() => {
-                if dirty {
+                // Only copy the framebuffer to the UI while the tab is visible —
+                // the server keeps pushing (RDP is server-driven), but there's no
+                // point spending the per-frame copy on a tab nobody is watching.
+                if dirty && visible.load(Ordering::Relaxed) {
                     publish(frame, &image);
                     dirty = false;
                 }

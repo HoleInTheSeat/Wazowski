@@ -36,6 +36,9 @@ pub struct RemoteTab {
     buttons: u8,
     /// Modifier state last frame, to synthesize modifier key up/down.
     mods: Modifiers,
+    /// When a new frame last arrived, to pick the repaint cadence: fast while the
+    /// remote is actively updating, slow when its screen is static.
+    last_frame: std::time::Instant,
 }
 
 impl RemoteTab {
@@ -50,11 +53,18 @@ impl RemoteTab {
             view_only,
             buttons: 0,
             mods: Modifiers::default(),
+            last_frame: std::time::Instant::now(),
         }
     }
 
     pub fn kind(&self) -> RemoteKind {
         self.kind
+    }
+
+    /// Marks whether this tab is the visible one. Hidden tabs let their backend
+    /// idle (VNC stops requesting frames; RDP stops publishing).
+    pub fn set_active(&self, active: bool) {
+        self.handle.set_active(active);
     }
 
     /// Whether the session has stopped (errored or disconnected).
@@ -96,12 +106,11 @@ impl RemoteTab {
         }
     }
 
-    /// Draws the tab and processes input. Schedules the next repaint (~30 fps)
-    /// so frames flow without pegging the render loop; input still triggers
-    /// immediate repaints, so interaction stays snappy.
+    /// Draws the tab and processes input. Schedules the next repaint adaptively:
+    /// at video rate while frames are arriving, but only a slow idle poll when the
+    /// remote screen is static — so staring at an idle remote costs almost nothing.
+    /// Input still triggers immediate repaints, so interaction stays snappy.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
-
         for ev in self.handle.poll_events() {
             match ev {
                 RemoteEvent::Resized(w, h) => {
@@ -117,7 +126,15 @@ impl RemoteTab {
             }
         }
 
-        self.sync_texture(ui);
+        if self.sync_texture(ui) {
+            self.last_frame = std::time::Instant::now();
+        }
+        // Poll briskly for ~0.4s after the last frame (covers continuous video),
+        // then drop to a slow idle poll so a static remote screen isn't repainting
+        // the whole UI 30×/second for nothing.
+        let recent = self.last_frame.elapsed() < std::time::Duration::from_millis(400);
+        let delay = if recent { 16 } else { 150 };
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(delay));
 
         if let Status::Ended(msg) = &self.status {
             let msg = msg.clone();
@@ -165,8 +182,9 @@ impl RemoteTab {
     /// Never blocks the UI thread on the backend's frame lock (uses a try-lock,
     /// skipping this repaint if the backend is mid-write), and builds the image
     /// under the lock but performs the GPU upload *after* releasing it — so a
-    /// large/slow remote update can't freeze the window.
-    fn sync_texture(&mut self, ui: &egui::Ui) {
+    /// large/slow remote update can't freeze the window. Returns whether a new
+    /// frame was uploaded this call (so the caller can pace repaints).
+    fn sync_texture(&mut self, ui: &egui::Ui) -> bool {
         let image = self.handle.try_with_frame(|frame| {
             if frame.width == 0 || frame.seq == self.last_seq {
                 return None;
@@ -190,6 +208,9 @@ impl RemoteTab {
                         Some(ui.ctx().load_texture("remote-fb", image, TextureOptions::default()));
                 }
             }
+            true
+        } else {
+            false
         }
     }
 
