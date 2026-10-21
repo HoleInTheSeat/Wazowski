@@ -96,9 +96,11 @@ impl RemoteTab {
         }
     }
 
-    /// Draws the tab and processes input. Requests a repaint so frames flow.
+    /// Draws the tab and processes input. Schedules the next repaint (~30 fps)
+    /// so frames flow without pegging the render loop; input still triggers
+    /// immediate repaints, so interaction stays snappy.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
 
         for ev in self.handle.poll_events() {
             match ev {
@@ -159,19 +161,28 @@ impl RemoteTab {
     }
 
     /// Uploads the latest framebuffer to the texture when it changed.
+    ///
+    /// Never blocks the UI thread on the backend's frame lock (uses a try-lock,
+    /// skipping this repaint if the backend is mid-write), and builds the image
+    /// under the lock but performs the GPU upload *after* releasing it — so a
+    /// large/slow remote update can't freeze the window.
     fn sync_texture(&mut self, ui: &egui::Ui) {
-        self.handle.with_frame(|frame| {
+        let image = self.handle.try_with_frame(|frame| {
             if frame.width == 0 || frame.seq == self.last_seq {
-                return;
+                return None;
             }
             self.last_seq = frame.seq;
             if self.size == (0, 0) {
                 self.size = (frame.width as u16, frame.height as u16);
             }
-            let image = egui::ColorImage::from_rgba_unmultiplied(
+            Some(egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width, frame.height],
                 &frame.rgba,
-            );
+            ))
+        });
+        // `try_with_frame` is `None` when the lock was busy; the inner `Option`
+        // is `None` when nothing changed. Only upload on a real new frame.
+        if let Some(Some(image)) = image {
             match &mut self.texture {
                 Some(tex) => tex.set(image, TextureOptions::default()),
                 None => {
@@ -179,7 +190,7 @@ impl RemoteTab {
                         Some(ui.ctx().load_texture("remote-fb", image, TextureOptions::default()));
                 }
             }
-        });
+        }
     }
 
     fn handle_pointer(

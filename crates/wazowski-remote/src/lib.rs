@@ -115,6 +115,14 @@ impl RemoteHandle {
         let guard = self.frame.lock().expect("frame mutex poisoned");
         f(&guard)
     }
+
+    /// Like [`with_frame`](Self::with_frame) but never blocks: returns `None` if
+    /// the backend currently holds the frame lock (the UI then keeps its last
+    /// texture for this repaint instead of stalling). This keeps the window
+    /// responsive even while a slow/busy remote is streaming large updates.
+    pub fn try_with_frame<R>(&self, f: impl FnOnce(&FrameBuf) -> R) -> Option<R> {
+        self.frame.try_lock().ok().map(|guard| f(&guard))
+    }
 }
 
 impl Drop for RemoteHandle {

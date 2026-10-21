@@ -5,8 +5,10 @@
 //! Private repos can authenticate with an HTTPS token (sent as a Basic auth
 //! header, never written to the repo config) or an SSH key.
 
+use std::cell::OnceCell;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -36,6 +38,10 @@ pub struct GitRepo {
     /// A temp file holding an inline SSH key (from the vault), written for the
     /// life of this repo so `ssh -i` can read it. Deleted when the repo drops.
     _ssh_key_file: Option<tempfile::TempPath>,
+    /// The GitHub account behind the HTTPS token, looked up once and cached
+    /// (`None` when there's no token, the remote isn't github.com, or the lookup
+    /// failed — e.g. offline). This is the preferred commit identity.
+    github_cache: OnceCell<Option<(String, String)>>,
 }
 
 impl GitRepo {
@@ -60,7 +66,15 @@ impl GitRepo {
             },
             other => (other, None),
         };
-        Self { work_dir, url, branch, file, auth, _ssh_key_file: ssh_key_file }
+        Self {
+            work_dir,
+            url,
+            branch,
+            file,
+            auth,
+            _ssh_key_file: ssh_key_file,
+            github_cache: OnceCell::new(),
+        }
     }
 
     /// Fetches the latest and returns the sessions-file bytes (`None` if absent).
@@ -89,20 +103,70 @@ impl GitRepo {
         }
         std::fs::write(&path, bytes).context("writing the sessions file")?;
         self.git(&["add", "--", &self.file]).context("git add failed")?;
+        // Attribute the commit to the user, not "Wazowski": use their own git
+        // identity when configured, else a derived one (GitHub login / OS user).
+        let mut args: Vec<String> = self.identity_args();
+        args.extend(["commit".into(), "-m".into(), "Update sessions".into()]);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         // Commit; a no-op commit returns non-zero, which is fine.
-        let committed = self.git(&[
-            "-c",
-            "user.name=Wazowski",
-            "-c",
-            "user.email=wazowski@localhost",
-            "commit",
-            "-m",
-            "Update sessions",
-        ]);
+        let committed = self.git(&argv);
         if committed.is_err() && !self.is_clean()? {
             committed.context("git commit failed")?;
         }
         Ok(())
+    }
+
+    /// The `-c user.name=…`/`-c user.email=…` arguments to attribute the commit.
+    /// Preference order: the GitHub account behind the token (primary), then the
+    /// user's own configured git identity (used unchanged → empty args), then the
+    /// OS user running Wazowski.
+    fn identity_args(&self) -> Vec<String> {
+        let identity = self.token_identity().or_else(|| {
+            // No token identity: prefer the user's own git config if they have one.
+            if self.has_git_identity() {
+                return None; // empty args → git uses the configured identity
+            }
+            // Last resort: the OS user running Wazowski.
+            let user = os_username();
+            Some((user.clone(), format!("{user}@localhost")))
+        });
+        match identity {
+            Some((name, email)) => vec![
+                "-c".into(),
+                format!("user.name={name}"),
+                "-c".into(),
+                format!("user.email={email}"),
+            ],
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether git already resolves a committer identity here (global/local
+    /// `user.name` and `user.email`), in which case we don't override it.
+    fn has_git_identity(&self) -> bool {
+        self.config_value("user.name").is_some() && self.config_value("user.email").is_some()
+    }
+
+    /// Reads a non-empty git config value in the work dir (honours global config).
+    fn config_value(&self, key: &str) -> Option<String> {
+        let out = self.command(Some(&self.work_dir)).args(["config", "--get", key]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let val = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (!val.is_empty()).then_some(val)
+    }
+
+    /// The GitHub account behind the HTTPS token (`(name, email)`), looked up
+    /// once and cached. `None` when there's no token, the remote isn't github.com,
+    /// or the lookup failed. This is the preferred commit identity.
+    fn token_identity(&self) -> Option<(String, String)> {
+        self.github_cache
+            .get_or_init(|| match &self.auth {
+                GitAuth::Https { token, .. } if is_github(&self.url) => github_identity(token),
+                _ => None,
+            })
+            .clone()
     }
 
     /// Pushes committed changes to the remote (setting upstream on first push).
@@ -310,6 +374,51 @@ fn summarize_git_error(stderr: &str) -> String {
     let chosen = if !signal.is_empty() { signal } else { lines };
     let msg = chosen.join("; ");
     if msg.is_empty() { "git error".to_owned() } else { msg }
+}
+
+/// Whether a remote URL points at github.com (HTTPS or SSH form).
+fn is_github(url: &str) -> bool {
+    let low = url.to_ascii_lowercase();
+    low.contains("github.com")
+}
+
+/// The OS user running Wazowski (for commit attribution when nothing better is
+/// known). Falls back to "wazowski" if the environment says nothing.
+fn os_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .map(|u| u.trim().to_owned())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "wazowski".to_owned())
+}
+
+/// Looks up the GitHub account behind a personal-access token, returning
+/// `(name, email)` where the email is the account's `noreply` address so the
+/// commit links to that GitHub user. `None` on any network/parse failure.
+fn github_identity(token: &str) -> Option<(String, String)> {
+    let body = ureq::get("https://api.github.com/user")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("User-Agent", "Wazowski")
+        .set("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(5))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let login = json.get("login")?.as_str()?.to_owned();
+    let id = json.get("id")?.as_i64()?;
+    // Prefer the profile name; fall back to the login.
+    let name = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&login)
+        .to_owned();
+    let email = format!("{id}+{login}@users.noreply.github.com");
+    Some((name, email))
 }
 
 /// Writes an inline private key to a private temp file for `ssh -i`, returning a

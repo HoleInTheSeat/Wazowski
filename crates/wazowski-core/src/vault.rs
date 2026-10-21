@@ -73,15 +73,31 @@ pub enum Secret {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
     },
+    /// An access token: a GitHub HTTPS token, API key, or similar bearer secret,
+    /// with an optional username (used as the HTTPS username for git; ignored by
+    /// bearer-style APIs).
+    Token {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+    },
+}
+
+/// The broad kind of a [`Secret`], used to group entries in the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretCategory {
+    Password,
+    Key,
+    Token,
 }
 
 impl Secret {
     /// The username this credential overrides the session's with, if any.
     pub fn username(&self) -> Option<&str> {
         match self {
-            Secret::Password { username, .. } | Secret::PrivateKey { username, .. } => {
-                username.as_deref()
-            }
+            Secret::Password { username, .. }
+            | Secret::PrivateKey { username, .. }
+            | Secret::Token { username, .. } => username.as_deref(),
         }
     }
 
@@ -89,7 +105,24 @@ impl Secret {
     pub fn public_key(&self) -> Option<&str> {
         match self {
             Secret::PrivateKey { public, .. } => public.as_deref(),
-            Secret::Password { .. } => None,
+            Secret::Password { .. } | Secret::Token { .. } => None,
+        }
+    }
+
+    /// The token string, for a token entry.
+    pub fn token(&self) -> Option<&str> {
+        match self {
+            Secret::Token { token, .. } => Some(token),
+            _ => None,
+        }
+    }
+
+    /// This secret's broad category, for grouping.
+    pub fn category(&self) -> SecretCategory {
+        match self {
+            Secret::Password { .. } => SecretCategory::Password,
+            Secret::PrivateKey { .. } => SecretCategory::Key,
+            Secret::Token { .. } => SecretCategory::Token,
         }
     }
 }
@@ -102,11 +135,12 @@ struct Entry {
     secret: Secret,
 }
 
-/// An entry's id and display name, for listing/choosing in the UI.
+/// An entry's id, display name, and category, for listing/choosing in the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryInfo {
     pub id: String,
     pub name: String,
+    pub category: SecretCategory,
 }
 
 /// The decrypted contents of the vault.
@@ -296,7 +330,11 @@ impl Vault {
             .doc
             .entries
             .iter()
-            .map(|(id, e)| EntryInfo { id: id.clone(), name: e.name.clone() })
+            .map(|(id, e)| EntryInfo {
+                id: id.clone(),
+                name: e.name.clone(),
+                category: e.secret.category(),
+            })
             .collect();
         v.sort_by_key(|e| e.name.to_lowercase());
         v
@@ -584,6 +622,28 @@ mod tests {
         assert_eq!(reopened.get("deploy-key").and_then(Secret::public_key), Some("ssh-ed25519 AAAA deploy"));
         // Resolution also works by name (for legacy/shared references).
         assert!(reopened.resolve("prod root").is_some());
+    }
+
+    #[test]
+    fn token_roundtrip_and_category() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let mut vault = Vault::create(path.clone(), "pw").unwrap();
+        let id = vault
+            .add(
+                "GitHub token",
+                Secret::Token { token: "ghp_abc123".into(), username: Some("octocat".into()) },
+            )
+            .unwrap();
+        assert_eq!(id, "github-token");
+        drop(vault);
+
+        let reopened = Vault::open(path, "pw").unwrap();
+        let secret = reopened.get("github-token").unwrap();
+        assert_eq!(secret.token(), Some("ghp_abc123"));
+        assert_eq!(secret.username(), Some("octocat"));
+        assert_eq!(secret.public_key(), None);
+        assert_eq!(secret.category(), SecretCategory::Token);
     }
 
     #[test]

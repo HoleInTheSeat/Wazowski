@@ -14,16 +14,71 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// How a session authenticates to the remote host.
+///
+/// Current variants are `Prompt` and `Vault`. The `Agent`/`Password`/`Key`
+/// variants are legacy: they still deserialize from older session files and are
+/// normalized to the current model on load (see [`Auth::normalize`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Auth {
-    /// Use keys already loaded in the running SSH agent.
+    /// Prompt for the password at connect time; nothing is stored. The session's
+    /// `username` is offered as an editable default in the prompt.
     #[default]
+    Prompt,
+    /// Authenticate from a vault entry, referenced by its stable id. The entry's
+    /// kind (password, SSH key, or token) determines how the connection is made.
+    Vault {
+        #[serde(default)]
+        entry: String,
+    },
+
+    // ---- legacy variants: read on load, normalized away, never written ----
+    /// Old: keys from the running SSH agent. Migrated to `Prompt`.
     Agent,
-    /// A password stored in the vault under this secret name.
-    Password { secret: String },
-    /// A private key stored in the vault under this secret name.
-    Key { secret: String },
+    /// Old: a password vault entry (an empty id meant "prompt at connect").
+    Password {
+        #[serde(default)]
+        secret: String,
+    },
+    /// Old: an SSH key vault entry.
+    Key {
+        #[serde(default)]
+        secret: String,
+    },
+}
+
+impl Auth {
+    /// Rewrites a legacy variant to the current model, returning whether it
+    /// changed. `Agent` and empty-id `Password` become [`Auth::Prompt`]; a
+    /// `Password`/`Key` with an id becomes [`Auth::Vault`].
+    fn normalize(&mut self) -> bool {
+        let replacement = match self {
+            Auth::Agent => Some(Auth::Prompt),
+            Auth::Password { secret } | Auth::Key { secret } => {
+                if secret.trim().is_empty() {
+                    Some(Auth::Prompt)
+                } else {
+                    Some(Auth::Vault { entry: std::mem::take(secret) })
+                }
+            }
+            Auth::Prompt | Auth::Vault { .. } => None,
+        };
+        match replacement {
+            Some(r) => {
+                *self = r;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The vault entry id this auth references, if it is a vault auth.
+    pub fn vault_entry(&self) -> Option<&str> {
+        match self {
+            Auth::Vault { entry } => Some(entry.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// The protocol a saved session connects with.
@@ -232,13 +287,23 @@ impl SessionStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => StoreFile::default(),
             Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
         };
-        Ok(Self {
+        let mut store = Self {
             path,
             sessions: file.sessions,
             folders: file.folders,
             folder_styles: file.folder_styles,
             description: file.description,
-        })
+        };
+        // Migrate any legacy auth (agent / password / key) to the current model,
+        // persisting best-effort so the file is upgraded for next time.
+        let mut migrated = false;
+        for s in &mut store.sessions {
+            migrated |= s.auth.normalize();
+        }
+        if migrated {
+            let _ = store.save();
+        }
+        Ok(store)
     }
 
     /// This collection's free-text description (empty if none).
@@ -435,9 +500,71 @@ mod tests {
     fn new_session_defaults() {
         let s = Session::new("prod", "example.com", "root");
         assert_eq!(s.port, 22);
-        assert_eq!(s.auth, Auth::Agent);
+        assert_eq!(s.auth, Auth::Prompt);
         assert_eq!(s.address(), "root@example.com");
         assert_eq!(s.id.len(), 16);
+    }
+
+    #[test]
+    fn legacy_auth_migrates_on_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.toml");
+        // Hand-write a file using the old auth variants.
+        let toml = r#"
+[[session]]
+id = "aaaaaaaaaaaaaaaa"
+name = "agent one"
+host = "h"
+username = "u"
+[session.auth]
+method = "agent"
+
+[[session]]
+id = "bbbbbbbbbbbbbbbb"
+name = "pw one"
+host = "h"
+username = "u"
+[session.auth]
+method = "password"
+secret = "prod-db"
+
+[[session]]
+id = "cccccccccccccccc"
+name = "pw prompt"
+host = "h"
+username = "u"
+[session.auth]
+method = "password"
+secret = ""
+
+[[session]]
+id = "dddddddddddddddd"
+name = "key one"
+host = "h"
+username = "u"
+[session.auth]
+method = "key"
+secret = "deploy-key"
+"#;
+        fs::write(&path, toml).unwrap();
+        let store = SessionStore::load(path.clone()).unwrap();
+        assert_eq!(store.get("aaaaaaaaaaaaaaaa").unwrap().auth, Auth::Prompt);
+        assert_eq!(
+            store.get("bbbbbbbbbbbbbbbb").unwrap().auth,
+            Auth::Vault { entry: "prod-db".into() }
+        );
+        assert_eq!(store.get("cccccccccccccccc").unwrap().auth, Auth::Prompt);
+        assert_eq!(
+            store.get("dddddddddddddddd").unwrap().auth,
+            Auth::Vault { entry: "deploy-key".into() }
+        );
+
+        // The file was rewritten in the new format and no longer migrates.
+        let reloaded = SessionStore::load(path).unwrap();
+        assert_eq!(
+            reloaded.get("dddddddddddddddd").unwrap().auth,
+            Auth::Vault { entry: "deploy-key".into() }
+        );
     }
 
     #[test]
@@ -455,7 +582,7 @@ mod tests {
         let mut store = SessionStore::load(path.clone()).unwrap();
         let mut s = Session::new("prod", "example.com", "root");
         s.folder = "work".into();
-        s.auth = Auth::Key { secret: "deploy-key".into() };
+        s.auth = Auth::Vault { entry: "deploy-key".into() };
         let id = s.id.clone();
         store.upsert(s).unwrap();
 
@@ -463,7 +590,7 @@ mod tests {
         assert_eq!(reloaded.all().len(), 1);
         let got = reloaded.get(&id).unwrap();
         assert_eq!(got.folder, "work");
-        assert_eq!(got.auth, Auth::Key { secret: "deploy-key".into() });
+        assert_eq!(got.auth, Auth::Vault { entry: "deploy-key".into() });
     }
 
     #[test]

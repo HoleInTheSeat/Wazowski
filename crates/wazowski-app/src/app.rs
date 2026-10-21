@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, RichText};
 use wazowski_core::session::Auth;
 use wazowski_core::{
-    EntryInfo, FolderStyle, Protocol, RdpQuality, Secret, Session, SessionStore, Vault, VaultError,
-    VncQuality,
+    EntryInfo, FolderStyle, Protocol, RdpQuality, Secret, SecretCategory, Session, SessionStore,
+    Vault, VaultError, VncQuality,
 };
 use wazowski_remote::{
     RdpQuality as RemoteRdpQuality, RemoteOptions, VncQuality as RemoteQuality, connect_rdp,
@@ -110,6 +110,9 @@ struct WebToolsState {
     json_raw: String,
     json_output: String,
     json_error: Option<String>,
+    /// Optional vault entry id whose token is sent as `Authorization: Bearer`.
+    json_token: String,
+    json_token_picker: VaultPickerState,
     // API tool.
     api_method: ApiMethod,
     api_url: String,
@@ -118,6 +121,9 @@ struct WebToolsState {
     api_job: Option<network::Job<Result<network::HttpResponse, String>>>,
     api_response: Option<network::HttpResponse>,
     api_error: Option<String>,
+    /// Optional vault entry id whose token is sent as `Authorization: Bearer`.
+    api_token: String,
+    api_token_picker: VaultPickerState,
     // IP address viewer.
     ip_info: Option<network::IpInfo>,
     public_ip: Option<String>,
@@ -635,6 +641,8 @@ struct AddSourceForm {
     key_path: String,
     /// Name of the vault entry to authenticate with (for `GitAuthKind::Vault`).
     vault_entry: String,
+    /// Expand state for the vault picker groups (collapsed each open).
+    picker: VaultPickerState,
     icon: String,
     color: Option<[u8; 3]>,
 }
@@ -654,6 +662,7 @@ impl Default for AddSourceForm {
             username: String::new(),
             key_path: String::new(),
             vault_entry: String::new(),
+            picker: VaultPickerState::default(),
             icon: String::new(),
             color: None,
         }
@@ -677,6 +686,7 @@ impl AddSourceForm {
             username: def.username.clone(),
             key_path: def.key_path.clone(),
             vault_entry: def.vault_entry.clone(),
+            picker: VaultPickerState::default(),
             icon: def.icon.clone(),
             color: def.color,
         }
@@ -730,9 +740,10 @@ struct UsernamePrompt {
 /// How a quick connection should authenticate.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum ConnectAuth {
-    Agent,
+    /// Type a password now (one-off).
     Password,
-    VaultSecret,
+    /// Use a vault entry.
+    Vault,
 }
 
 /// State of the quick-connect auth chooser.
@@ -740,8 +751,10 @@ struct ConnectAuthForm {
     session: Session,
     method: ConnectAuth,
     password: String,
-    /// Selected vault entry name, when using `VaultSecret`.
-    secret_name: Option<String>,
+    /// Selected vault entry id, when using `Vault` (empty = none chosen).
+    entry: String,
+    /// Expand state for the vault picker groups (collapsed each open).
+    picker: VaultPickerState,
     error: Option<String>,
 }
 
@@ -749,9 +762,10 @@ impl ConnectAuthForm {
     fn new(session: Session) -> Self {
         Self {
             session,
-            method: ConnectAuth::Agent,
+            method: ConnectAuth::Vault,
             password: String::new(),
-            secret_name: None,
+            entry: String::new(),
+            picker: VaultPickerState::default(),
             error: None,
         }
     }
@@ -800,6 +814,16 @@ struct SecretForm {
 enum SecretKind {
     Password,
     Key,
+    Token,
+}
+
+/// Expand state for a vault-entry picker's collapsible groups. Defaults to
+/// all-collapsed, so each time a form opens the groups start closed.
+#[derive(Clone, Default)]
+struct VaultPickerState {
+    open_password: bool,
+    open_key: bool,
+    open_token: bool,
 }
 
 impl SecretForm {
@@ -832,6 +856,7 @@ impl SecretForm {
                 passphrase: (!self.passphrase.is_empty()).then(|| self.passphrase.clone()),
                 username,
             },
+            SecretKind::Token => Secret::Token { token: self.value.clone(), username },
         }
     }
 
@@ -850,11 +875,16 @@ struct SessionForm {
     username: String,
     /// Optional Windows domain (RDP only).
     domain: String,
-    method: AuthMethod,
-    /// Whether to reference an existing vault entry or create a new one.
+    /// Auth choice: prompt each connect, or use the vault.
+    auth: AuthChoice,
+    /// In Vault mode: reference an existing entry or create a new one.
     source: SecretSource,
-    /// Selected existing vault entry name (when `source` is `Existing`).
-    existing_name: Option<String>,
+    /// Selected existing vault entry id (when `source` is `Existing`; empty = none).
+    entry: String,
+    /// Expand state for the vault picker groups (collapsed each open).
+    picker: VaultPickerState,
+    /// When creating a new credential, its kind (Password or Key for sessions).
+    new_kind: SecretKind,
     /// Name to store a new credential under (blank → a per-session default).
     new_name: String,
     /// New credential value (password or PEM); blank keeps the existing one when editing.
@@ -878,11 +908,20 @@ struct SessionForm {
     target: StoreId,
 }
 
+/// Session-editor auth choice: prompt each connect, or use a vault entry.
 #[derive(PartialEq, Eq, Clone, Copy)]
-enum AuthMethod {
-    Agent,
-    Password,
-    Key,
+enum AuthChoice {
+    Prompt,
+    Vault,
+}
+
+impl AuthChoice {
+    fn label(self) -> &'static str {
+        match self {
+            AuthChoice::Prompt => "Prompt Everytime",
+            AuthChoice::Vault => "From Vault",
+        }
+    }
 }
 
 /// Where a session's credential comes from.
@@ -905,7 +944,7 @@ struct ResolvedAuth {
 enum AuthProblem {
     /// The referenced vault entry does not exist yet; prompt to create it
     /// (MobaXterm-style placeholder: created on first use).
-    Missing { name: String, kind: AuthMethod },
+    Missing { name: String, kind: SecretKind },
     /// The session has no stored password (blank): prompt for it each connect.
     NeedPassword,
     /// Any other problem, already phrased for display.
@@ -1734,6 +1773,15 @@ impl App {
     /// Connects a saved session according to its protocol: SSH opens a terminal
     /// tab, RDP/VNC open a native in-window session tab.
     fn connect_session(&mut self, session: &Session, ctx: &egui::Context) {
+        // Prompt-everytime (or a vault session with no entry chosen) asks for
+        // credentials before connecting. SSH handles this itself inside
+        // `start_connect`; RDP/VNC need the prompt raised here.
+        let needs_prompt = matches!(&session.auth, Auth::Prompt | Auth::Agent)
+            || matches!(&session.auth, Auth::Vault { entry } if entry.is_empty());
+        if needs_prompt && session.protocol != Protocol::Ssh {
+            self.prompt_connect_creds(session);
+            return;
+        }
         match session.protocol {
             Protocol::Ssh => self.start_connect(session, ctx),
             Protocol::Rdp => {
@@ -1874,29 +1922,31 @@ impl App {
                 let mut form = SecretForm::new();
                 form.name = name;
                 form.username = session.username.clone();
-                form.kind = match kind {
-                    AuthMethod::Key => SecretKind::Key,
-                    _ => SecretKind::Password,
-                };
+                form.kind = kind;
                 self.dialog = Dialog::CreateCredential(CredentialPrompt {
                     form,
                     then_connect: session.clone(),
                 });
             }
-            Err(AuthProblem::NeedPassword) => {
-                self.dialog = Dialog::ConnectCreds(Box::new(ConnectCredsForm {
-                    username: session.username.clone(),
-                    password: String::new(),
-                    save: false,
-                    save_name: self.default_secret_name(&session.name, &session.host),
-                    rebind: true,
-                    error: None,
-                    title: session.name.clone(),
-                    session: session.clone(),
-                }));
-            }
+            Err(AuthProblem::NeedPassword) => self.prompt_connect_creds(session),
             Err(AuthProblem::Message(m)) => self.error = Some(m),
         }
+    }
+
+    /// Opens the connect-time credential prompt for a Prompt-Everytime session,
+    /// prefilling the (editable) username. Nothing is saved unless the user ticks
+    /// "Save to vault", which then rebinds the session to the new entry.
+    fn prompt_connect_creds(&mut self, session: &Session) {
+        self.dialog = Dialog::ConnectCreds(Box::new(ConnectCredsForm {
+            username: session.username.clone(),
+            password: String::new(),
+            save: false,
+            save_name: self.default_secret_name(&session.name, &session.host),
+            rebind: true,
+            error: None,
+            title: session.name.clone(),
+            session: session.clone(),
+        }));
     }
 
     /// Opens the "Connect as…" one-off credential prompt for a session.
@@ -2002,7 +2052,6 @@ impl App {
     /// Resolves a quick-connect auth choice into connect material.
     fn resolve_form_auth(&self, form: &ConnectAuthForm) -> Result<ResolvedAuth, String> {
         match form.method {
-            ConnectAuth::Agent => Ok(ResolvedAuth { material: AuthMaterial::Agent, username: None }),
             ConnectAuth::Password => {
                 if form.password.is_empty() {
                     return Err("Enter a password.".into());
@@ -2012,14 +2061,18 @@ impl App {
                     username: None,
                 })
             }
-            ConnectAuth::VaultSecret => {
-                let name = form
-                    .secret_name
-                    .as_deref()
-                    .ok_or("Choose a vault entry.".to_string())?;
+            ConnectAuth::Vault => {
+                if form.entry.is_empty() {
+                    return Err("Choose a vault entry.".into());
+                }
                 let vault = self.vault.unlocked().ok_or("Unlock the vault first.".to_string())?;
-                let secret = vault.resolve(name).ok_or(format!("No vault entry '{name}'."))?;
-                Ok(ResolvedAuth { material: material_from(secret), username: secret.username().map(str::to_owned) })
+                let secret = vault
+                    .resolve(&form.entry)
+                    .ok_or("That vault entry no longer exists.".to_string())?;
+                Ok(ResolvedAuth {
+                    material: material_from(secret),
+                    username: secret.username().map(str::to_owned),
+                })
             }
         }
     }
@@ -2027,24 +2080,28 @@ impl App {
     /// Turns a session's stored auth choice into connect-ready material, or a
     /// problem the caller can act on (e.g. a missing credential to create).
     fn resolve_auth(&self, auth: &Auth) -> Result<ResolvedAuth, AuthProblem> {
-        let (name, kind) = match auth {
-            Auth::Agent => {
-                return Ok(ResolvedAuth { material: AuthMaterial::Agent, username: None });
+        let entry = match auth {
+            // Prompt-everytime (and any non-vault legacy) asks at connect time.
+            Auth::Prompt | Auth::Agent => return Err(AuthProblem::NeedPassword),
+            Auth::Vault { entry } | Auth::Password { secret: entry } | Auth::Key { secret: entry }
+                if entry.is_empty() =>
+            {
+                return Err(AuthProblem::NeedPassword);
             }
-            Auth::Password { secret } if secret.is_empty() => return Err(AuthProblem::NeedPassword),
-            Auth::Password { secret } => (secret, AuthMethod::Password),
-            Auth::Key { secret } => (secret, AuthMethod::Key),
+            Auth::Vault { entry } | Auth::Password { secret: entry } | Auth::Key { secret: entry } => {
+                entry
+            }
         };
         let vault = self
             .vault
             .unlocked()
             .ok_or(AuthProblem::Message("Unlock the vault to use saved credentials.".into()))?;
-        match vault.resolve(name) {
+        match vault.resolve(entry) {
             Some(secret) => Ok(ResolvedAuth {
                 material: material_from(secret),
                 username: secret.username().map(str::to_owned),
             }),
-            None => Err(AuthProblem::Missing { name: name.clone(), kind }),
+            None => Err(AuthProblem::Missing { name: entry.clone(), kind: SecretKind::Password }),
         }
     }
 
@@ -3649,20 +3706,20 @@ impl App {
 
         // Collect entries (id + name) by type, then render (drops the vault borrow).
         let needle = self.filter_vault.to_lowercase();
-        let (passwords, keys): (Vec<EntryInfo>, Vec<EntryInfo>) = {
+        let (passwords, keys, tokens): (Vec<EntryInfo>, Vec<EntryInfo>, Vec<EntryInfo>) = {
             let vault = self.vault.unlocked().expect("unlocked");
-            let (mut p, mut k) = (Vec::new(), Vec::new());
+            let (mut p, mut k, mut t) = (Vec::new(), Vec::new(), Vec::new());
             for info in vault.entries() {
                 if !needle.is_empty() && !info.name.to_lowercase().contains(&needle) {
                     continue;
                 }
-                match vault.get(&info.id) {
-                    Some(Secret::Password { .. }) => p.push(info),
-                    Some(Secret::PrivateKey { .. }) => k.push(info),
-                    None => {}
+                match info.category {
+                    SecretCategory::Password => p.push(info),
+                    SecretCategory::Key => k.push(info),
+                    SecretCategory::Token => t.push(info),
                 }
             }
-            (p, k)
+            (p, k, t)
         };
 
         // Each action carries the entry's id.
@@ -3674,7 +3731,7 @@ impl App {
         let mut act: Option<RowAct> = None;
         let selected_id = self.vault_selected.clone();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if passwords.is_empty() && keys.is_empty() {
+            if passwords.is_empty() && keys.is_empty() && tokens.is_empty() {
                 let msg = if needle.is_empty() {
                     "No credentials yet. Click ➕ to add one."
                 } else {
@@ -3717,6 +3774,13 @@ impl App {
                 ui.label(RichText::new("SSH keypairs").strong());
                 for e in &keys {
                     row(ui, format!("🗝 {}", e.name), &e.id);
+                }
+            }
+            if !tokens.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Tokens").strong());
+                for e in &tokens {
+                    row(ui, format!("🎫 {}", e.name), &e.id);
                 }
             }
         });
@@ -3781,6 +3845,9 @@ impl App {
                 public.clone().unwrap_or_default(),
                 passphrase.is_some(),
             ),
+            Secret::Token { username, .. } => {
+                (SecretKind::Token, username.clone(), String::new(), false)
+            }
         };
         self.vault_selected = Some(id.to_owned());
         self.vault_form = Some(SecretForm {
@@ -5282,6 +5349,50 @@ impl App {
         }
     }
 
+    /// Resolves a vault entry id to a bearer-token string: a Token entry's token
+    /// or a Password entry's password. `None` when the id is empty, the vault is
+    /// locked, or the entry is missing or not a token/password.
+    fn bearer_from_vault(&self, entry_id: &str) -> Option<String> {
+        if entry_id.is_empty() {
+            return None;
+        }
+        match self.vault.unlocked()?.resolve(entry_id)? {
+            Secret::Token { token, .. } => Some(token.clone()),
+            Secret::Password { password, .. } => Some(password.clone()),
+            Secret::PrivateKey { .. } => None,
+        }
+    }
+
+    /// Renders an optional "Authorization" vault-token picker for the web tools.
+    /// Returns the UI so the caller places it; mutates the selected id in place.
+    fn token_picker_section(
+        ui: &mut egui::Ui,
+        entries: &[EntryInfo],
+        vault_unlocked: bool,
+        selected: &mut String,
+        state: &mut VaultPickerState,
+    ) {
+        egui::CollapsingHeader::new("Authorization (optional)").show(ui, |ui| {
+            if !vault_unlocked {
+                ui.label(RichText::new("Unlock the vault to use a saved token.").weak());
+                return;
+            }
+            ui.label(
+                RichText::new("Pick a token to send as 'Authorization: Bearer <token>'.").weak(),
+            );
+            vault_picker_ui(
+                ui,
+                entries,
+                &[SecretCategory::Token, SecretCategory::Password],
+                selected,
+                state,
+            );
+            if !selected.is_empty() && ui.small_button("Clear token").clicked() {
+                selected.clear();
+            }
+        });
+    }
+
     /// Resolves a session's launch credentials from the vault: the username to
     /// use (the credential's own username overrides the session's when the
     /// session has none) and the password, when the vault is unlocked and the
@@ -5290,14 +5401,14 @@ impl App {
     fn resolve_launch_creds(&self, session: &Session) -> (String, Option<String>) {
         let mut user = session.username.clone();
         let mut password = None;
-        if let Auth::Password { secret } = &session.auth
-            && !secret.is_empty()
+        if let Auth::Vault { entry } = &session.auth
+            && !entry.is_empty()
             && let Some(vault) = self.vault.unlocked()
-            && let Some(Secret::Password { username, password: pw }) = vault.resolve(secret)
+            && let Some(Secret::Password { username, password: pw }) = vault.resolve(entry)
         {
-            if user.is_empty()
-                && let Some(u) = username
-            {
+            // The entry's username overrides the session's (as for SSH), so a
+            // named credential carries its own login everywhere.
+            if let Some(u) = username.as_ref().filter(|u| !u.is_empty()) {
                 user = u.clone();
             }
             password = Some(pw.clone());
@@ -5587,6 +5698,8 @@ impl App {
 
     /// Network Tools ▸ JSON/jq Puller: fetch JSON from a URL and filter with jq.
     fn tools_json_pull(&mut self, ui: &mut egui::Ui) {
+        let vault_entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
+        let vault_unlocked = self.vault.unlocked().is_some();
         let polled = self.webtools.json_job.as_ref().and_then(|j| j.poll());
         if let Some(result) = polled {
             self.webtools.json_job = None;
@@ -5639,6 +5752,13 @@ impl App {
         if let Some((list, value)) = delete_req {
             self.dialog = Dialog::ConfirmDeleteHistory { list, value };
         }
+        Self::token_picker_section(
+            ui,
+            &vault_entries,
+            vault_unlocked,
+            &mut self.webtools.json_token,
+            &mut self.webtools.json_token_picker,
+        );
         ui.horizontal(|ui| {
             let can_fetch = !fetching && !self.webtools.json_url.trim().is_empty();
             if ui.add_enabled(can_fetch, egui::Button::new("Fetch")).clicked() {
@@ -5679,12 +5799,16 @@ impl App {
                 crate::settings::remember_in(&mut self.settings.jq_filters, &filter);
             }
             let _ = self.settings.save();
+            let headers = match self.bearer_from_vault(&self.webtools.json_token) {
+                Some(t) => vec![("Authorization".to_owned(), format!("Bearer {t}"))],
+                None => Vec::new(),
+            };
             self.webtools.json_error = None;
             self.webtools.json_job = Some(network::spawn_job(move || {
                 network::http_fetch(network::HttpRequest {
                     method: "GET".to_owned(),
                     url,
-                    headers: Vec::new(),
+                    headers,
                     body: None,
                 })
                 .map(|r| r.body)
@@ -5696,6 +5820,8 @@ impl App {
 
     /// Network Tools ▸ API Tool: a minimal HTTP client (push/pull).
     fn tools_api(&mut self, ui: &mut egui::Ui) {
+        let vault_entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
+        let vault_unlocked = self.vault.unlocked().is_some();
         let polled = self.webtools.api_job.as_ref().and_then(|j| j.poll());
         if let Some(result) = polled {
             self.webtools.api_job = None;
@@ -5753,6 +5879,13 @@ impl App {
                 .desired_width(f32::INFINITY)
                 .hint_text("Authorization: Bearer …"),
         );
+        Self::token_picker_section(
+            ui,
+            &vault_entries,
+            vault_unlocked,
+            &mut self.webtools.api_token,
+            &mut self.webtools.api_token_picker,
+        );
         if self.webtools.api_method.has_body() {
             ui.add_space(4.0);
             ui.label("Body");
@@ -5807,13 +5940,19 @@ impl App {
         }
 
         if send {
-            let headers = self
+            let mut headers: Vec<(String, String)> = self
                 .webtools
                 .api_headers
                 .lines()
                 .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())))
                 .filter(|(k, _)| !k.is_empty())
                 .collect();
+            // Inject the vault token as a bearer header unless one was typed in.
+            if let Some(token) = self.bearer_from_vault(&self.webtools.api_token)
+                && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            {
+                headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
+            }
             let body = self
                 .webtools
                 .api_method
@@ -6143,13 +6282,11 @@ impl App {
                 ui.end_row();
                 ui.label("Type:");
                 egui::ComboBox::from_id_salt("vault-type")
-                    .selected_text(match form.kind {
-                        SecretKind::Password => "Password",
-                        SecretKind::Key => "SSH keypair",
-                    })
+                    .selected_text(secret_kind_label(form.kind))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut form.kind, SecretKind::Password, "Password");
                         ui.selectable_value(&mut form.kind, SecretKind::Key, "SSH keypair");
+                        ui.selectable_value(&mut form.kind, SecretKind::Token, "Token");
                     });
                 ui.end_row();
                 ui.label("Username:");
@@ -6162,8 +6299,8 @@ impl App {
             ui.add_space(8.0);
             let dots = if editing { "••••••••" } else { "" };
             match form.kind {
-                SecretKind::Password => {
-                    ui.label("Password:");
+                SecretKind::Password | SecretKind::Token => {
+                    ui.label(if form.kind == SecretKind::Token { "Token:" } else { "Password:" });
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut form.value)
@@ -6370,6 +6507,9 @@ impl App {
                             passphrase: passphrase.clone(),
                             username,
                         },
+                        (SecretKind::Token, Some(Secret::Token { token, .. })) => {
+                            Secret::Token { token: token.clone(), username }
+                        }
                         _ => return Err("Enter the new secret value to change its type.".into()),
                     }
                 } else {
@@ -6507,7 +6647,7 @@ impl App {
                 }
             };
             if form.rebind {
-                session.auth = Auth::Password { secret: id };
+                session.auth = Auth::Vault { entry: id };
                 let store = self
                     .find_session_anywhere(&session.id)
                     .map(|(s, _)| s)
@@ -6515,8 +6655,24 @@ impl App {
                 let _ = self.store_upsert(&store, session.clone());
             }
         }
-        // RDP launches the external client with the one-off credentials; SSH
+        // RDP/VNC open an in-window remote tab with the one-off credentials; SSH
         // opens a terminal tab.
+        if session.protocol == Protocol::Vnc {
+            let pw = (!form.password.is_empty()).then(|| form.password.clone());
+            let options = RemoteOptions {
+                view_only: session.vnc_view_only,
+                shared: true,
+                quality: match session.vnc_quality {
+                    VncQuality::Auto => RemoteQuality::Auto,
+                    VncQuality::High => RemoteQuality::High,
+                    VncQuality::Low => RemoteQuality::Low,
+                },
+            };
+            let handle = connect_vnc(&session.host, session.port, pw, options);
+            let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc);
+            self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
+            return;
+        }
         if session.protocol == Protocol::Rdp {
             let pw = (!form.password.is_empty()).then(|| form.password.clone());
             let smb = crate::smb_ui::SmbBrowser::new(
@@ -7430,14 +7586,14 @@ impl App {
                             // vault, never in a config file or the keyring.
                             egui::ComboBox::from_id_salt("git-auth")
                                 .selected_text(match f.auth {
-                                    GitAuthKind::None => "None / ambient",
-                                    GitAuthKind::Vault => "Vault entry",
+                                    GitAuthKind::None => "None",
+                                    GitAuthKind::Vault => "From Vault",
                                     GitAuthKind::Https => "HTTPS token (legacy keyring)",
                                     GitAuthKind::Ssh => "SSH key file (legacy)",
                                 })
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut f.auth, GitAuthKind::None, "None / ambient");
-                                    ui.selectable_value(&mut f.auth, GitAuthKind::Vault, "Vault entry");
+                                    ui.selectable_value(&mut f.auth, GitAuthKind::None, "None");
+                                    ui.selectable_value(&mut f.auth, GitAuthKind::Vault, "From Vault");
                                 });
                             ui.end_row();
                             match f.auth {
@@ -7449,37 +7605,18 @@ impl App {
                                                 .weak(),
                                         );
                                     } else {
-                                        let current = if f.vault_entry.is_empty() {
-                                            "(choose…)".to_owned()
-                                        } else {
-                                            vault_entries
-                                                .iter()
-                                                .find(|e| e.id == f.vault_entry)
-                                                .map(|e| e.name.clone())
-                                                .unwrap_or_else(|| f.vault_entry.clone())
-                                        };
-                                        egui::ComboBox::from_id_salt("git-vault-entry")
-                                            .selected_text(current)
-                                            .show_ui(ui, |ui| {
-                                                for e in &vault_entries {
-                                                    ui.selectable_value(
-                                                        &mut f.vault_entry,
-                                                        e.id.clone(),
-                                                        &e.name,
-                                                    );
-                                                }
-                                            });
+                                        vault_picker_ui(
+                                            ui,
+                                            &vault_entries,
+                                            &[
+                                                SecretCategory::Token,
+                                                SecretCategory::Key,
+                                                SecretCategory::Password,
+                                            ],
+                                            &mut f.vault_entry,
+                                            &mut f.picker,
+                                        );
                                     }
-                                    ui.end_row();
-                                    ui.label("");
-                                    ui.label(
-                                        RichText::new(
-                                            "Add a Password vault entry for an HTTPS token (its \
-                                             password is the token), or an SSH keypair entry for \
-                                             an SSH key, then pick it here.",
-                                        )
-                                        .weak(),
-                                    );
                                     ui.end_row();
                                 }
                                 // Legacy keyring/key-file sources still sync, but new
@@ -7582,7 +7719,7 @@ impl App {
                 }
                 def.url = f.url.trim().to_owned();
                 if f.auth == GitAuthKind::Vault && f.vault_entry.trim().is_empty() {
-                    return Err("Choose a vault entry (or None / ambient).".into());
+                    return Err("Choose a vault entry, or set Auth to None.".into());
                 }
             }
         }
@@ -8073,10 +8210,7 @@ impl App {
                 egui::Grid::new("cred-fields").num_columns(2).show(ui, |ui| {
                     ui.label("Type");
                     egui::ComboBox::from_id_salt("cred-kind")
-                        .selected_text(match form.kind {
-                            SecretKind::Password => "Password",
-                            SecretKind::Key => "SSH keypair",
-                        })
+                        .selected_text(secret_kind_label(form.kind))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut form.kind, SecretKind::Password, "Password");
                             ui.selectable_value(&mut form.kind, SecretKind::Key, "SSH keypair");
@@ -8089,7 +8223,7 @@ impl App {
                     );
                     ui.end_row();
                     match form.kind {
-                        SecretKind::Password => {
+                        SecretKind::Password | SecretKind::Token => {
                             ui.label("Password");
                             let resp = ui.add(egui::TextEdit::singleline(&mut form.value).password(true));
                             if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
@@ -8152,11 +8286,7 @@ impl App {
             Err(e) => return self.set_credential_error(&e),
         };
         // Bind the session to the new entry's id so it stays linked if renamed.
-        session.auth = match &session.auth {
-            Auth::Password { .. } => Auth::Password { secret: id },
-            Auth::Key { .. } => Auth::Key { secret: id },
-            Auth::Agent => Auth::Agent,
-        };
+        session.auth = Auth::Vault { entry: id };
         if let Some((store, _)) = self.find_session_anywhere(&session.id) {
             let _ = self.store_upsert(&store, session.clone());
         }
@@ -8254,6 +8384,7 @@ impl App {
                             form.value = pem.clone();
                             form.passphrase = passphrase.clone().unwrap_or_default();
                         }
+                        Secret::Token { token, .. } => form.value = token.clone(),
                     }
                     self.vault_show_value = true;
                     self.vault_show_passphrase = true;
@@ -8337,11 +8468,8 @@ impl App {
             .iter()
             .filter_map(|s| {
                 let auth = match &s.auth {
-                    Auth::Password { secret } => {
-                        Auth::Password { secret: remap(secret)? }
-                    }
-                    Auth::Key { secret } => Auth::Key { secret: remap(secret)? },
-                    Auth::Agent => return None,
+                    Auth::Vault { entry } => Auth::Vault { entry: remap(entry)? },
+                    _ => return None,
                 };
                 let mut s2 = s.clone();
                 s2.auth = auth;
@@ -8453,13 +8581,21 @@ impl App {
         let mut open_in_vault: Option<String> = None;
         // Entries for the "from vault" picker: show the name, store the id.
         let secret_entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
-        let entry_name = |id: &str| {
-            secret_entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.name.clone())
-                .unwrap_or_else(|| id.to_owned())
-        };
+        // Map of entry id -> its stored username (if any), to show which username
+        // an existing-entry selection will send.
+        let entry_users: std::collections::HashMap<String, Option<String>> = self
+            .vault
+            .unlocked()
+            .map(|v| {
+                v.entries()
+                    .into_iter()
+                    .map(|e| {
+                        let user = v.get(&e.id).and_then(|s| s.username()).map(str::to_owned);
+                        (e.id, user)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let vault_unlocked = self.vault.unlocked().is_some();
         if let Dialog::EditSession(form) = &mut self.dialog {
             let title = if form.id.is_some() { "Edit session" } else { "New session" };
@@ -8513,11 +8649,6 @@ impl App {
                     ui.label("Port");
                     line(ui, &mut form.port, false);
                     ui.end_row();
-                    if form.protocol != Protocol::Vnc {
-                        ui.label("Username");
-                        line(ui, &mut form.username, false);
-                        ui.end_row();
-                    }
                     if form.protocol == Protocol::Rdp {
                         ui.label("Domain");
                         line(ui, &mut form.domain, false);
@@ -8576,139 +8707,134 @@ impl App {
                             });
                         ui.end_row();
                     }
-                    // SSH-only authentication (RDP/VNC use the external client's
-                    // own credential handling).
-                    if form.protocol == Protocol::Ssh {
+                    // Authentication (all protocols): prompt every time, or use
+                    // a vault entry. The username lives in this section too.
                     ui.label("Auth");
-                    egui::ComboBox::from_id_salt("auth-method")
-                        .selected_text(form.method.label())
+                    egui::ComboBox::from_id_salt("auth-choice")
+                        .selected_text(form.auth.label())
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.method, AuthMethod::Agent, "SSH agent");
-                            ui.selectable_value(&mut form.method, AuthMethod::Password, "Password");
-                            ui.selectable_value(&mut form.method, AuthMethod::Key, "Private key");
+                            ui.selectable_value(
+                                &mut form.auth,
+                                AuthChoice::Prompt,
+                                AuthChoice::Prompt.label(),
+                            );
+                            ui.selectable_value(
+                                &mut form.auth,
+                                AuthChoice::Vault,
+                                AuthChoice::Vault.label(),
+                            );
                         });
                     ui.end_row();
 
-                    if form.method != AuthMethod::Agent {
-                        ui.label("Credential");
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut form.source, SecretSource::Existing, "From vault");
-                            ui.selectable_value(&mut form.source, SecretSource::New, "New");
-                        });
-                        ui.end_row();
+                    match form.auth {
+                        AuthChoice::Prompt => {
+                            // Prompt mode shows only an optional username; the
+                            // password is asked for at connect time.
+                            ui.label("Username");
+                            line(ui, &mut form.username, false);
+                            ui.end_row();
+                        }
+                        AuthChoice::Vault => {
+                            ui.label("Credential");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut form.source,
+                                    SecretSource::Existing,
+                                    "From vault",
+                                );
+                                ui.selectable_value(&mut form.source, SecretSource::New, "New");
+                            });
+                            ui.end_row();
 
-                        match form.source {
-                            SecretSource::Existing => {
-                                ui.label("Vault entry");
-                                ui.horizontal(|ui| {
-                                    let selected = form
-                                        .existing_name
-                                        .as_deref()
-                                        .map(entry_name)
-                                        .unwrap_or_else(|| "Choose…".into());
-                                    egui::ComboBox::from_id_salt("session-secret")
-                                        .selected_text(selected)
-                                        .show_ui(ui, |ui| {
-                                            for e in &secret_entries {
-                                                ui.selectable_value(
-                                                    &mut form.existing_name,
-                                                    Some(e.id.clone()),
-                                                    &e.name,
-                                                );
-                                            }
-                                        });
-                                    if let Some(id) = form.existing_name.clone()
-                                        && ui
-                                            .button("↪ Vault")
-                                            .on_hover_text("Open this credential in the Vault")
-                                            .clicked()
-                                    {
-                                        open_in_vault = Some(id);
-                                    }
-                                });
-                                ui.end_row();
-                            }
-                            SecretSource::New => {
-                                ui.label("Save as");
-                                line(ui, &mut form.new_name, false);
-                                ui.end_row();
-                                match form.method {
-                                    AuthMethod::Password => {
-                                        ui.label("Password");
-                                        line(ui, &mut form.secret_input, true);
-                                        ui.end_row();
-                                    }
-                                    AuthMethod::Key => {
-                                        ui.label("Private key");
-                                        ui.add(
-                                            egui::TextEdit::multiline(&mut form.secret_input)
-                                                .hint_text("Paste the PEM private key")
-                                                .desired_rows(3),
+                            // SSH can use a password or an SSH key; RDP/VNC a password.
+                            let allowed: &[SecretCategory] = if form.protocol == Protocol::Ssh {
+                                &[SecretCategory::Password, SecretCategory::Key]
+                            } else {
+                                &[SecretCategory::Password]
+                            };
+                            match form.source {
+                                SecretSource::Existing => {
+                                    ui.label("Vault entry");
+                                    ui.vertical(|ui| {
+                                        vault_picker_ui(
+                                            ui,
+                                            &secret_entries,
+                                            allowed,
+                                            &mut form.entry,
+                                            &mut form.picker,
                                         );
-                                        ui.end_row();
-                                        ui.label("Key passphrase");
-                                        line(ui, &mut form.key_passphrase, true);
+                                        if !form.entry.is_empty()
+                                            && ui.button("↪ Open in Vault").clicked()
+                                        {
+                                            open_in_vault = Some(form.entry.clone());
+                                        }
+                                    });
+                                    ui.end_row();
+                                    // The username comes from the chosen entry; show
+                                    // which one will be sent (so it's clear when an
+                                    // entry carries none). VNC doesn't use a username.
+                                    if !form.entry.is_empty() && form.protocol != Protocol::Vnc {
+                                        ui.label("");
+                                        let msg = match entry_users.get(&form.entry) {
+                                            Some(Some(u)) => format!("Sends username: {u}"),
+                                            _ => "This entry has no username — connecting will \
+                                                  prompt for one (or set one on the entry)."
+                                                .to_owned(),
+                                        };
+                                        ui.label(RichText::new(msg).weak());
                                         ui.end_row();
                                     }
-                                    AuthMethod::Agent => {}
+                                }
+                                SecretSource::New => {
+                                    ui.label("Save as");
+                                    line(ui, &mut form.new_name, false);
+                                    ui.end_row();
+                                    // Username is stored with the new credential and
+                                    // used to connect.
+                                    ui.label("Username");
+                                    line(ui, &mut form.username, false);
+                                    ui.end_row();
+                                    if form.protocol == Protocol::Ssh {
+                                        ui.label("Type");
+                                        ui.horizontal(|ui| {
+                                            ui.selectable_value(
+                                                &mut form.new_kind,
+                                                SecretKind::Password,
+                                                "Password",
+                                            );
+                                            ui.selectable_value(
+                                                &mut form.new_kind,
+                                                SecretKind::Key,
+                                                "SSH key",
+                                            );
+                                        });
+                                        ui.end_row();
+                                    } else {
+                                        form.new_kind = SecretKind::Password;
+                                    }
+                                    match form.new_kind {
+                                        SecretKind::Key => {
+                                            ui.label("Private key");
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut form.secret_input)
+                                                    .hint_text("Paste the PEM private key")
+                                                    .desired_rows(3),
+                                            );
+                                            ui.end_row();
+                                            ui.label("Key passphrase");
+                                            line(ui, &mut form.key_passphrase, true);
+                                            ui.end_row();
+                                        }
+                                        SecretKind::Password | SecretKind::Token => {
+                                            ui.label("Password");
+                                            line(ui, &mut form.secret_input, true);
+                                            ui.end_row();
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    } else {
-                        // RDP/VNC: an optional vault Password credential. Leaving
-                        // it blank lets the external client prompt instead.
-                        ui.label("Credential");
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(
-                                &mut form.source,
-                                SecretSource::Existing,
-                                "From vault",
-                            );
-                            ui.selectable_value(&mut form.source, SecretSource::New, "New");
-                        });
-                        ui.end_row();
-                        match form.source {
-                            SecretSource::Existing => {
-                                ui.label("Vault entry");
-                                ui.horizontal(|ui| {
-                                    let selected = form
-                                        .existing_name
-                                        .as_deref()
-                                        .map(entry_name)
-                                        .unwrap_or_else(|| "Choose…".into());
-                                    egui::ComboBox::from_id_salt("session-secret-rv")
-                                        .selected_text(selected)
-                                        .show_ui(ui, |ui| {
-                                            for e in &secret_entries {
-                                                ui.selectable_value(
-                                                    &mut form.existing_name,
-                                                    Some(e.id.clone()),
-                                                    &e.name,
-                                                );
-                                            }
-                                        });
-                                    if let Some(id) = form.existing_name.clone()
-                                        && ui
-                                            .button("↪ Vault")
-                                            .on_hover_text("Open this credential in the Vault")
-                                            .clicked()
-                                    {
-                                        open_in_vault = Some(id);
-                                    }
-                                });
-                                ui.end_row();
-                            }
-                            SecretSource::New => {
-                                ui.label("Save as");
-                                line(ui, &mut form.new_name, false);
-                                ui.end_row();
-                                ui.label("Password");
-                                line(ui, &mut form.secret_input, true);
-                                ui.end_row();
-                            }
-                        }
-                    } // end credential section
                 });
                 if form.protocol == Protocol::Ssh {
                     ui.add_space(4.0);
@@ -8728,10 +8854,7 @@ impl App {
                     Protocol::Vnc => "👁",
                 };
                 appearance_picker(ui, "session-appearance", &mut form.icon, &mut form.color, default_icon);
-                let uses_vault = match form.protocol {
-                    Protocol::Ssh => form.method != AuthMethod::Agent,
-                    Protocol::Rdp | Protocol::Vnc => true,
-                };
+                let uses_vault = form.auth == AuthChoice::Vault;
                 if uses_vault && !vault_unlocked {
                     ui.colored_label(
                         Color32::LIGHT_YELLOW,
@@ -8769,14 +8892,14 @@ impl App {
         // Copy the fields out first so the `self.dialog` borrow ends before we
         // touch the vault and session store.
         let Dialog::EditSession(form) = &self.dialog else { return };
-        let (id, name, folder, host, port_str, username, method, legacy) = (
+        let (id, name, folder, host, port_str, username, auth_choice, legacy) = (
             form.id.clone(),
             form.name.trim().to_owned(),
             form.folder.trim().to_owned(),
             form.host.trim().to_owned(),
             form.port.trim().to_owned(),
             form.username.trim().to_owned(),
-            form.method,
+            form.auth,
             form.legacy,
         );
         let (protocol, domain) = (form.protocol, form.domain.trim().to_owned());
@@ -8786,9 +8909,10 @@ impl App {
         let rdp_width = form.rdp_width.trim().parse().unwrap_or(0);
         let rdp_height = form.rdp_height.trim().parse().unwrap_or(0);
         let rdp_quality = form.rdp_quality;
-        let (source, existing_name, new_name, secret_input, key_passphrase) = (
+        let (source, entry, new_kind, new_name, secret_input, key_passphrase) = (
             form.source,
-            form.existing_name.clone(),
+            form.entry.clone(),
+            form.new_kind,
             form.new_name.trim().to_owned(),
             form.secret_input.clone(),
             form.key_passphrase.clone(),
@@ -8821,70 +8945,57 @@ impl App {
         session.rdp_height = rdp_height;
         session.rdp_quality = rdp_quality;
 
-        // SSH supports agent/password/key; RDP/VNC only an optional vault
-        // Password (the external client handles the rest). A blank credential
-        // means "prompt at connect time".
-        let effective_method =
-            if protocol == Protocol::Ssh { method } else { AuthMethod::Password };
-        session.auth = if protocol == Protocol::Ssh && method == AuthMethod::Agent {
-            Auth::Agent
-        } else {
-            // Resolve the vault entry name this session should reference. An empty
-            // name (blank password, no existing entry) means "prompt every time".
-            // A session references a vault entry by its stable id (so the entry
-            // can be renamed later without breaking the link).
-            let secret_ref = match source {
-                SecretSource::Existing => match existing_name {
-                    Some(id) => id, // the picker stores the entry's id
-                    None => return self.set_form_error("Choose a vault entry, or switch to New."),
-                },
-                SecretSource::New => {
-                    let entry_name = if new_name.is_empty() {
-                        self.default_secret_name(&name, &host)
-                    } else {
-                        new_name
-                    };
-                    if !secret_input.is_empty() {
+        // Prompt-everytime stores nothing; Vault references an entry by its
+        // stable id (so the entry can be renamed later without breaking the link).
+        session.auth = match auth_choice {
+            AuthChoice::Prompt => Auth::Prompt,
+            AuthChoice::Vault => {
+                let entry_id = match source {
+                    SecretSource::Existing => {
+                        // Bug fix: require an actual selection — don't save a
+                        // vault session that points at nothing.
+                        if entry.trim().is_empty() {
+                            return self.set_form_error(
+                                "Choose a vault entry, or switch to New to create one.",
+                            );
+                        }
+                        entry
+                    }
+                    SecretSource::New => {
+                        // Bug fix: both a name and a value are required when
+                        // creating a credential inline.
+                        if new_name.is_empty() {
+                            return self
+                                .set_form_error("Enter a name to save the new credential under.");
+                        }
+                        if secret_input.trim().is_empty() {
+                            let what = match new_kind {
+                                SecretKind::Key => "Enter the private key, or pick an existing entry.",
+                                _ => "Enter the password, or pick an existing entry.",
+                            };
+                            return self.set_form_error(what);
+                        }
                         // Store the session's username with the credential.
                         let cred_user = (!username.is_empty()).then(|| username.clone());
-                        let secret = match effective_method {
-                            AuthMethod::Password => {
-                                Secret::Password { username: cred_user, password: secret_input }
-                            }
-                            AuthMethod::Key => Secret::PrivateKey {
+                        let secret = match new_kind {
+                            SecretKind::Key => Secret::PrivateKey {
                                 pem: secret_input,
                                 public: None,
                                 passphrase: (!key_passphrase.is_empty()).then_some(key_passphrase),
                                 username: cred_user,
                             },
-                            AuthMethod::Agent => unreachable!("agent handled above"),
+                            // RDP/VNC and SSH-password both store a Password here.
+                            SecretKind::Password | SecretKind::Token => {
+                                Secret::Password { username: cred_user, password: secret_input }
+                            }
                         };
-                        match self.store_secret(&entry_name, secret) {
+                        match self.store_secret(&new_name, secret) {
                             Ok(id) => id,
                             Err(e) => return self.set_form_error(&e),
                         }
-                    } else if let Some(id) = self
-                        .vault
-                        .unlocked()
-                        .and_then(|v| v.id_for_name(&entry_name))
-                        .map(str::to_owned)
-                    {
-                        // Keep referencing the existing entry (by its id).
-                        id
-                    } else if effective_method == AuthMethod::Password {
-                        // Blank password with no entry: prompt at connect time.
-                        String::new()
-                    } else {
-                        return self.set_form_error(
-                            "Enter the private key, or choose an existing vault entry.",
-                        );
                     }
-                }
-            };
-            match effective_method {
-                AuthMethod::Password => Auth::Password { secret: secret_ref },
-                AuthMethod::Key => Auth::Key { secret: secret_ref },
-                AuthMethod::Agent => unreachable!("agent handled above"),
+                };
+                Auth::Vault { entry: entry_id }
             }
         };
 
@@ -9026,22 +9137,19 @@ impl App {
                     ui.label("Auth");
                     egui::ComboBox::from_id_salt("quick-auth")
                         .selected_text(match form.method {
-                            ConnectAuth::Agent => "SSH agent",
-                            ConnectAuth::Password => "Password",
-                            ConnectAuth::VaultSecret => "Vault entry",
+                            ConnectAuth::Password => "Prompt (password)",
+                            ConnectAuth::Vault => "From Vault",
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.method, ConnectAuth::Agent, "SSH agent");
-                            ui.selectable_value(&mut form.method, ConnectAuth::Password, "Password");
                             ui.selectable_value(
                                 &mut form.method,
-                                ConnectAuth::VaultSecret,
-                                "Vault entry",
+                                ConnectAuth::Password,
+                                "Prompt (password)",
                             );
+                            ui.selectable_value(&mut form.method, ConnectAuth::Vault, "From Vault");
                         });
                 });
                 match form.method {
-                    ConnectAuth::Agent => {}
                     ConnectAuth::Password => {
                         let field = ui.add(
                             egui::TextEdit::singleline(&mut form.password)
@@ -9051,29 +9159,17 @@ impl App {
                         autofocus(ui, &field);
                         connect |= entered(ui, &field);
                     }
-                    ConnectAuth::VaultSecret => {
+                    ConnectAuth::Vault => {
                         if !vault_unlocked {
                             ui.colored_label(Color32::LIGHT_YELLOW, "Unlock the vault first.");
-                        } else if secret_entries.is_empty() {
-                            ui.colored_label(Color32::LIGHT_YELLOW, "The vault has no entries yet.");
                         } else {
-                            let selected = form
-                                .secret_name
-                                .as_deref()
-                                .and_then(|id| secret_entries.iter().find(|e| e.id == id))
-                                .map(|e| e.name.clone())
-                                .unwrap_or_else(|| "Choose…".into());
-                            egui::ComboBox::from_id_salt("quick-secret")
-                                .selected_text(selected)
-                                .show_ui(ui, |ui| {
-                                    for e in &secret_entries {
-                                        ui.selectable_value(
-                                            &mut form.secret_name,
-                                            Some(e.id.clone()),
-                                            &e.name,
-                                        );
-                                    }
-                                });
+                            vault_picker_ui(
+                                ui,
+                                &secret_entries,
+                                &[SecretCategory::Password, SecretCategory::Key],
+                                &mut form.entry,
+                                &mut form.picker,
+                            );
                         }
                     }
                 }
@@ -9240,10 +9336,7 @@ impl App {
                             ui.end_row();
                             ui.label("Type");
                             egui::ComboBox::from_id_salt("secret-kind")
-                                .selected_text(match form.kind {
-                                    SecretKind::Password => "Password",
-                                    SecretKind::Key => "SSH keypair",
-                                })
+                                .selected_text(secret_kind_label(form.kind))
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut form.kind,
@@ -9255,6 +9348,7 @@ impl App {
                                         SecretKind::Key,
                                         "SSH keypair",
                                     );
+                                    ui.selectable_value(&mut form.kind, SecretKind::Token, "Token");
                                 });
                             ui.end_row();
                             ui.label("Username");
@@ -9264,8 +9358,12 @@ impl App {
                             );
                             ui.end_row();
                             match form.kind {
-                                SecretKind::Password => {
-                                    ui.label("Password");
+                                SecretKind::Password | SecretKind::Token => {
+                                    ui.label(if form.kind == SecretKind::Token {
+                                        "Token"
+                                    } else {
+                                        "Password"
+                                    });
                                     ui.add(
                                         egui::TextEdit::singleline(&mut form.value)
                                             .password(true)
@@ -9416,6 +9514,9 @@ impl App {
                 public.clone().unwrap_or_default(),
                 passphrase.is_some(),
             ),
+            Some(secret @ Secret::Token { .. }) => {
+                (SecretKind::Token, secret.username().unwrap_or_default().to_owned(), String::new(), false)
+            }
             None => return,
         };
         if let Dialog::VaultManager(state) = &mut self.dialog {
@@ -9703,16 +9804,6 @@ impl eframe::App for App {
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {}
 }
 
-impl AuthMethod {
-    fn label(self) -> &'static str {
-        match self {
-            AuthMethod::Agent => "SSH agent",
-            AuthMethod::Password => "Password",
-            AuthMethod::Key => "Private key",
-        }
-    }
-}
-
 impl SessionForm {
     fn new() -> Self {
         Self {
@@ -9724,9 +9815,11 @@ impl SessionForm {
             port: "22".into(),
             username: String::new(),
             domain: String::new(),
-            method: AuthMethod::Password,
-            source: SecretSource::New,
-            existing_name: None,
+            auth: AuthChoice::Vault,
+            source: SecretSource::Existing,
+            entry: String::new(),
+            picker: VaultPickerState::default(),
+            new_kind: SecretKind::Password,
             new_name: String::new(),
             secret_input: String::new(),
             key_passphrase: String::new(),
@@ -9746,10 +9839,11 @@ impl SessionForm {
     fn from_session(session: &Session) -> Self {
         // An existing session already references a named vault entry, so default
         // to reusing it (and preselect the name).
-        let (method, existing_name) = match &session.auth {
-            Auth::Agent => (AuthMethod::Agent, None),
-            Auth::Password { secret } => (AuthMethod::Password, Some(secret.clone())),
-            Auth::Key { secret } => (AuthMethod::Key, Some(secret.clone())),
+        // Post-migration, a saved session either references a vault entry or
+        // prompts at connect time.
+        let (auth, entry) = match &session.auth {
+            Auth::Vault { entry } => (AuthChoice::Vault, entry.clone()),
+            _ => (AuthChoice::Prompt, String::new()),
         };
         Self {
             id: Some(session.id.clone()),
@@ -9760,9 +9854,11 @@ impl SessionForm {
             port: session.port.to_string(),
             username: session.username.clone(),
             domain: session.domain.clone(),
-            method,
-            source: if existing_name.is_some() { SecretSource::Existing } else { SecretSource::New },
-            existing_name,
+            auth,
+            source: SecretSource::Existing,
+            entry,
+            picker: VaultPickerState::default(),
+            new_kind: SecretKind::Password,
             new_name: String::new(),
             secret_input: String::new(),
             key_passphrase: String::new(),
@@ -10094,9 +10190,8 @@ fn session_hint(s: &Session) -> String {
     match s.protocol {
         Protocol::Ssh => {
             let auth = match &s.auth {
-                Auth::Agent => "SSH agent",
-                Auth::Password { .. } => "password",
-                Auth::Key { .. } => "key",
+                Auth::Prompt | Auth::Agent => "prompt",
+                Auth::Vault { .. } | Auth::Password { .. } | Auth::Key { .. } => "vault",
             };
             let mut hint = format!("SSH · {}\nauth: {auth}", s.address());
             if s.legacy {
@@ -10373,7 +10468,88 @@ fn material_from(secret: &Secret) -> AuthMaterial {
         Secret::PrivateKey { pem, passphrase, .. } => {
             AuthMaterial::Key { pem: pem.clone(), passphrase: passphrase.clone() }
         }
+        // Tokens aren't SSH credentials, but fall back to using the token as a
+        // password so a misconfigured session fails clearly rather than panics.
+        Secret::Token { token, .. } => AuthMaterial::Password(token.clone()),
     }
+}
+
+/// The display label for a credential kind.
+fn secret_kind_label(kind: SecretKind) -> &'static str {
+    match kind {
+        SecretKind::Password => "Password",
+        SecretKind::Key => "SSH keypair",
+        SecretKind::Token => "Token",
+    }
+}
+
+/// Renders the shared "From Vault" credential picker: a bordered pane with the
+/// entries grouped by category into collapsible sections (collapsed by default,
+/// so they reset each time a form opens), alphabetical within each. `allowed`
+/// limits which categories are shown; `selected` holds the chosen entry id
+/// (empty = none).
+fn vault_picker_ui(
+    ui: &mut egui::Ui,
+    entries: &[EntryInfo],
+    allowed: &[SecretCategory],
+    selected: &mut String,
+    state: &mut VaultPickerState,
+) {
+    // Force a vertical layout: the caller may place this inside a Grid cell or
+    // other horizontal layout, and the group headers must stack — plus the
+    // per-group `ui.indent` below panics outside a vertical layout.
+    ui.vertical(|ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(240.0);
+            let groups: [(SecretCategory, &str, &mut bool); 3] = [
+                (SecretCategory::Password, "🔑 Passwords", &mut state.open_password),
+                (SecretCategory::Key, "🗝 SSH Keypairs", &mut state.open_key),
+                (SecretCategory::Token, "🎫 Tokens", &mut state.open_token),
+            ];
+            // Show the current pick even while every group is collapsed.
+            if !selected.is_empty() {
+                let name = entries
+                    .iter()
+                    .find(|e| &e.id == selected)
+                    .map(|e| e.name.as_str())
+                    .unwrap_or(selected.as_str());
+                ui.label(RichText::new(format!("✔ {name}")).strong());
+            }
+            let mut any_shown = false;
+            for (cat, title, open) in groups {
+                if !allowed.contains(&cat) {
+                    continue;
+                }
+                let items: Vec<&EntryInfo> =
+                    entries.iter().filter(|e| e.category == cat).collect();
+                any_shown |= !items.is_empty();
+                let arrow = if *open { "▾" } else { "▸" };
+                if ui
+                    .selectable_label(false, format!("{arrow} {title} ({})", items.len()))
+                    .clicked()
+                {
+                    *open = !*open;
+                }
+                if *open {
+                    ui.indent(title, |ui| {
+                        if items.is_empty() {
+                            ui.label(RichText::new("none").weak());
+                        }
+                        for e in items {
+                            if ui.selectable_label(*selected == e.id, &e.name).clicked() {
+                                *selected = e.id.clone();
+                            }
+                        }
+                    });
+                }
+            }
+            if !any_shown {
+                ui.label(
+                    RichText::new("No matching vault entries — add one in the Vault.").weak(),
+                );
+            }
+        });
+    });
 }
 
 /// The git auth for a `GitAuthKind::Vault` source, resolved from its named vault
@@ -10405,6 +10581,17 @@ fn git_auth_from_secret(secret: &Secret, fallback_user: &str) -> GitAuth {
                 .unwrap_or_else(|_| pem.clone());
             GitAuth::Ssh { key_path: None, inline_key: Some(key) }
         }
+        // A token authenticates git over HTTPS (GitHub ignores the username for
+        // a PAT, so any non-empty value works; fall back to the source's).
+        Secret::Token { token, username } => GitAuth::Https {
+            username: username
+                .clone()
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| {
+                    if fallback_user.is_empty() { "token".to_owned() } else { fallback_user.to_owned() }
+                }),
+            token: token.clone(),
+        },
     }
 }
 
@@ -10717,6 +10904,41 @@ fn step_editor(ui: &mut egui::Ui, step: &mut Step) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vault_picker_in_horizontal_layout_does_not_panic() {
+        // The picker is used inside Grid cells (a horizontal layout). Expanding a
+        // group uses `ui.indent`, which panics outside a vertical layout — the
+        // picker must force its own vertical layout. This reproduces the crash
+        // from the shared-source editor (all groups expanded, horizontal parent).
+        let ctx = egui::Context::default();
+        let entries = vec![
+            EntryInfo { id: "a".into(), name: "A".into(), category: SecretCategory::Password },
+            EntryInfo { id: "t".into(), name: "tok".into(), category: SecretCategory::Token },
+        ];
+        let mut selected = String::new();
+        let mut state =
+            VaultPickerState { open_password: true, open_key: true, open_token: true };
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.horizontal(|ui| {
+                vault_picker_ui(
+                    ui,
+                    &entries,
+                    &[SecretCategory::Password, SecretCategory::Key, SecretCategory::Token],
+                    &mut selected,
+                    &mut state,
+                );
+            });
+            egui::Grid::new("t").show(ui, |ui| {
+                ui.label("Vault entry");
+                vault_picker_ui(ui, &entries, &[SecretCategory::Token], &mut selected, &mut state);
+                ui.end_row();
+            });
+        });
+        // The test harness isn't a real painter, so drop the texture deltas
+        // explicitly (epaint asserts they were handled otherwise).
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn web_gui_url_prepends_configured_scheme() {

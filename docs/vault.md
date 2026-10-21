@@ -1,8 +1,8 @@
 # Vault (credentials)
 
-The vault is Wazowski's encrypted store for secrets — passwords and SSH keypairs.
-Sessions never contain secrets; they reference a **named** vault entry, so one
-credential can be shared by many sessions.
+The vault is Wazowski's encrypted store for secrets — passwords, SSH keypairs,
+and tokens. Sessions never contain secrets; they reference a vault entry by its
+stable **id**, so one credential can be shared by many sessions.
 
 ![Vault](images/vault.png)
 
@@ -29,9 +29,11 @@ that need a secret will say so.
 
 In the vault view you can:
 
-- **Add** a credential (`➕`): a named **password** or an **SSH keypair**,
-  optionally with a username stored alongside it. A keypair holds a private key
-  (PEM) and, optionally, its public key — paste just the private key, or both.
+- **Add** a credential (`➕`): a named **password**, **SSH keypair**, or
+  **token**, optionally with a username stored alongside it. A keypair holds a
+  private key (PEM) and, optionally, its public key — paste just the private key,
+  or both. A **token** holds a single secret string (a GitHub HTTPS token, an API
+  key, etc.). Entries are grouped by kind (Passwords / SSH Keypairs / Tokens).
 - **Edit / rename / delete** entries. Each entry has a stable internal **id**
   (derived from its first name, e.g. "VNC password" → `vnc-password`), and
   sessions reference that id — so you can **rename an entry freely** and every
@@ -46,9 +48,25 @@ In the vault view you can:
 
 ## How sessions use the vault
 
-When you set a session's auth to **Password** or **Key**, you either pick an
-existing entry or create a new one. A session with a blank password and no entry
-simply prompts you at connect time (and can offer to save what you enter).
+Every session (and shared source) chooses between two auth modes:
+
+- **Prompt Everytime** — nothing is stored; you're asked for the password each
+  time you connect. The session's username is offered as an editable default.
+- **From Vault** — the session references a vault entry. The "From Vault" picker
+  shows the entries grouped by kind (collapsed by default); expand a group and
+  pick one. You can also create a new entry inline (a name and value are
+  required). Shared sources offer **None** instead of Prompt (public repos need
+  no auth); a private repo uses a **Token** or **SSH keypair** entry.
+
+Because sessions reference entries by **id**, you can rename an entry freely and
+every session stays linked.
+
+## Tokens in the API tools
+
+The **API Tool** and **JSON / jq Puller** can authenticate from a vault token.
+Expand **Authorization (optional)** and pick a **Token** (or Password) entry; it
+is sent as `Authorization: Bearer <token>` (an `Authorization` header you type in
+by hand takes precedence).
 
 ## Backups
 
