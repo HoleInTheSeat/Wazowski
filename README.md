@@ -114,4 +114,7 @@ tools/
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Free and open source — use it for anything.
+
+Vendored dependencies under `vendor/` keep their own MIT/Apache-2.0 licenses; see
+[vendor/README.md](vendor/README.md).

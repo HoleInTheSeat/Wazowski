@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "2.2.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [workspace.dependencies]
 eframe = "0.36"

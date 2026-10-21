@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Rust dependencies (workspace Cargo.lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # Vendored crates under vendor/ are intentionally pinned/patched; don't touch.
+    ignore:
+      - dependency-name: "picky"
+      - dependency-name: "sspi"
+      - dependency-name: "vnc-rs"
+
+  # GitHub Actions used by the release/CI workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
