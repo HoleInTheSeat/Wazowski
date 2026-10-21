@@ -8,6 +8,12 @@ Wazowski puts your terminals, SSH/SFTP, **in-window RDP and VNC**, serial
 consoles, saved sessions, credentials, macros, quick file/transfer servers, and
 a set of network tools into one tabbed window.
 
+> 🤖 **Built with Claude Code.** Wazowski was developed with heavy assistance from
+> [Claude Code](https://claude.com/claude-code), Anthropic's agentic coding tool,
+> which pair-programmed much of the implementation, tests, and docs across the
+> codebase. A human drove the goals, review, and decisions. See
+> [Acknowledgments](#acknowledgments).
+
 ![Wazowski main window](docs/images/main-window.png)
 
 ## Highlights
@@ -111,6 +117,15 @@ crates/
 tools/
   mxt2wazowski.py    MobaXterm .mxtsessions → Wazowski converter
 ```
+
+## Acknowledgments
+
+Wazowski was built with **heavy assistance from
+[Claude Code](https://claude.com/claude-code)**, Anthropic's agentic coding tool.
+Claude pair-programmed large parts of the project — architecture, implementation,
+tests, and documentation — with a human directing the goals, reviewing the work,
+and making the decisions. The collaboration is recorded throughout the git
+history via `Co-Authored-By: Claude` commit trailers.
 
 ## License
 
