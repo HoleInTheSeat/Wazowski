@@ -32,7 +32,12 @@ In the vault view you can:
 - **Add** a credential (`➕`): a named **password** or an **SSH keypair**,
   optionally with a username stored alongside it. A keypair holds a private key
   (PEM) and, optionally, its public key — paste just the private key, or both.
-- **Edit / delete** entries.
+- **Edit / rename / delete** entries. Each entry has a stable internal **id**
+  (derived from its first name, e.g. "VNC password" → `vnc-password`), and
+  sessions reference that id — so you can **rename an entry freely** and every
+  session that uses it stays linked. Because the id is derived from the name,
+  teammates who name an entry the same way get the same id, so **shared sessions
+  resolve for everyone**.
 - **Reveal** a secret's value — this re-asks for the master password first.
 - **Generate an SSH keypair** to use for SSH auth. Choose the algorithm
   (**Ed25519**, **RSA 4096**, or **ECDSA P-256**) and optionally set a passphrase

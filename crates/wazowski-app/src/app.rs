@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, RichText};
 use wazowski_core::session::Auth;
 use wazowski_core::{
-    FolderStyle, Protocol, RdpQuality, Secret, Session, SessionStore, Vault, VaultError, VncQuality,
+    EntryInfo, FolderStyle, Protocol, RdpQuality, Secret, Session, SessionStore, Vault, VaultError,
+    VncQuality,
 };
 use wazowski_remote::{
     RdpQuality as RemoteRdpQuality, RemoteOptions, VncQuality as RemoteQuality, connect_rdp,
@@ -778,8 +779,9 @@ struct GenForm {
 }
 
 /// Fields for adding or editing one vault entry.
+#[derive(Clone)]
 struct SecretForm {
-    /// Name of the entry being edited, or `None` when adding.
+    /// Id of the entry being edited, or `None` when adding a new one.
     original: Option<String>,
     name: String,
     kind: SecretKind,
@@ -833,18 +835,6 @@ impl SecretForm {
         }
     }
 
-    /// Like [`to_secret`](Self::to_secret) but keeps a given private key (used
-    /// when editing a keypair's public key/passphrase without re-entering the
-    /// private key).
-    fn to_secret_with_pem(&self, pem: String) -> Secret {
-        let username = (!self.username.trim().is_empty()).then(|| self.username.trim().to_owned());
-        Secret::PrivateKey {
-            pem,
-            public: self.public_opt(),
-            passphrase: (!self.passphrase.is_empty()).then(|| self.passphrase.clone()),
-            username,
-        }
-    }
 }
 
 /// Editable fields for the new/edit-session dialog.
@@ -954,6 +944,9 @@ pub struct App {
     vault: VaultState,
     vault_path: PathBuf,
     dialog: Dialog,
+    /// Whether legacy vault-entry references have been migrated to ids this
+    /// session (runs once the vault first becomes available).
+    vault_migrated: bool,
     /// How this build was installed (fixed at startup; drives the updater).
     install_kind: crate::update::InstallKind,
     /// An in-flight "check for updates" worker, if any.
@@ -1324,6 +1317,7 @@ impl App {
             vault,
             vault_path,
             dialog: Dialog::None,
+            vault_migrated: false,
             install_kind: crate::update::install_kind(),
             // A quiet check on startup surfaces a menu hint if an update is out.
             update_check: Some(crate::update::CheckHandle::spawn(
@@ -2024,7 +2018,7 @@ impl App {
                     .as_deref()
                     .ok_or("Choose a vault entry.".to_string())?;
                 let vault = self.vault.unlocked().ok_or("Unlock the vault first.".to_string())?;
-                let secret = vault.get(name).ok_or(format!("No vault entry named '{name}'."))?;
+                let secret = vault.resolve(name).ok_or(format!("No vault entry '{name}'."))?;
                 Ok(ResolvedAuth { material: material_from(secret), username: secret.username().map(str::to_owned) })
             }
         }
@@ -2045,7 +2039,7 @@ impl App {
             .vault
             .unlocked()
             .ok_or(AuthProblem::Message("Unlock the vault to use saved credentials.".into()))?;
-        match vault.get(name) {
+        match vault.resolve(name) {
             Some(secret) => Ok(ResolvedAuth {
                 material: material_from(secret),
                 username: secret.username().map(str::to_owned),
@@ -3653,31 +3647,32 @@ impl App {
             VaultState::Unlocked(_) => {}
         }
 
-        // Collect names by type, then render (drops the vault borrow first).
+        // Collect entries (id + name) by type, then render (drops the vault borrow).
         let needle = self.filter_vault.to_lowercase();
-        let (passwords, keys) = {
+        let (passwords, keys): (Vec<EntryInfo>, Vec<EntryInfo>) = {
             let vault = self.vault.unlocked().expect("unlocked");
             let (mut p, mut k) = (Vec::new(), Vec::new());
-            for name in vault.names() {
-                if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+            for info in vault.entries() {
+                if !needle.is_empty() && !info.name.to_lowercase().contains(&needle) {
                     continue;
                 }
-                match vault.get(&name) {
-                    Some(Secret::Password { .. }) => p.push(name),
-                    Some(Secret::PrivateKey { .. }) => k.push(name),
+                match vault.get(&info.id) {
+                    Some(Secret::Password { .. }) => p.push(info),
+                    Some(Secret::PrivateKey { .. }) => k.push(info),
                     None => {}
                 }
             }
             (p, k)
         };
 
+        // Each action carries the entry's id.
         enum RowAct {
             Open(String),
             Duplicate(String),
             Delete(String),
         }
         let mut act: Option<RowAct> = None;
-        let selected_name = self.vault_selected.clone();
+        let selected_id = self.vault_selected.clone();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if passwords.is_empty() && keys.is_empty() {
                 let msg = if needle.is_empty() {
@@ -3688,24 +3683,24 @@ impl App {
                 ui.label(RichText::new(msg).weak());
             }
             // One credential row with its right-click menu.
-            let mut row = |ui: &mut egui::Ui, label: String, name: &str| {
-                let selected = selected_name.as_deref() == Some(name);
+            let mut row = |ui: &mut egui::Ui, label: String, id: &str| {
+                let selected = selected_id.as_deref() == Some(id);
                 let resp = ui.selectable_label(selected, label);
                 if resp.clicked() {
-                    act = Some(RowAct::Open(name.to_owned()));
+                    act = Some(RowAct::Open(id.to_owned()));
                 }
                 resp.context_menu(|ui| {
                     // Generic actions only, in alphanumeric order.
                     if ui.button("Delete").clicked() {
-                        act = Some(RowAct::Delete(name.to_owned()));
+                        act = Some(RowAct::Delete(id.to_owned()));
                         ui.close();
                     }
                     if ui.button("Duplicate").clicked() {
-                        act = Some(RowAct::Duplicate(name.to_owned()));
+                        act = Some(RowAct::Duplicate(id.to_owned()));
                         ui.close();
                     }
                     if ui.button("Edit").clicked() {
-                        act = Some(RowAct::Open(name.to_owned()));
+                        act = Some(RowAct::Open(id.to_owned()));
                         ui.close();
                     }
                 });
@@ -3713,65 +3708,69 @@ impl App {
             if !passwords.is_empty() {
                 ui.add_space(2.0);
                 ui.label(RichText::new("Passwords").strong());
-                for name in &passwords {
-                    row(ui, format!("🔑 {name}"), name);
+                for e in &passwords {
+                    row(ui, format!("🔑 {}", e.name), &e.id);
                 }
             }
             if !keys.is_empty() {
                 ui.add_space(6.0);
                 ui.label(RichText::new("SSH keypairs").strong());
-                for name in &keys {
-                    row(ui, format!("🗝 {name}"), name);
+                for e in &keys {
+                    row(ui, format!("🗝 {}", e.name), &e.id);
                 }
             }
         });
         match act {
-            Some(RowAct::Open(name)) => self.select_credential(&name),
-            Some(RowAct::Duplicate(name)) => self.duplicate_credential(&name),
-            Some(RowAct::Delete(name)) => self.delete_credential_named(&name),
+            Some(RowAct::Open(id)) => self.select_credential(&id),
+            Some(RowAct::Duplicate(id)) => self.duplicate_credential(&id),
+            Some(RowAct::Delete(id)) => self.delete_credential_named(&id),
             None => {}
         }
     }
 
-    /// Copies a credential to a new, unique name (e.g. "name copy") and selects it.
-    fn duplicate_credential(&mut self, name: &str) {
-        let Some(secret) = self.vault.unlocked().and_then(|v| v.get(name)).cloned() else { return };
-        let existing: Vec<String> = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
-        let mut new_name = format!("{name} copy");
+    /// Copies a credential (by id) to a new, uniquely-named entry and selects it.
+    fn duplicate_credential(&mut self, id: &str) {
+        let Some(secret) = self.vault.unlocked().and_then(|v| v.get(id)).cloned() else { return };
+        let base = self.vault.unlocked().and_then(|v| v.name_of(id)).unwrap_or(id).to_owned();
+        let taken: std::collections::HashSet<String> = self
+            .vault
+            .unlocked()
+            .map(|v| v.entries().into_iter().map(|e| e.name.to_lowercase()).collect())
+            .unwrap_or_default();
+        let mut new_name = format!("{base} copy");
         let mut n = 2;
-        while existing.iter().any(|e| e == &new_name) {
-            new_name = format!("{name} copy {n}");
+        while taken.contains(&new_name.to_lowercase()) {
+            new_name = format!("{base} copy {n}");
             n += 1;
         }
-        if let Some(vault) = self.vault.unlocked_mut() {
-            if let Err(e) = vault.put(&new_name, secret) {
-                self.error = Some(format!("{e:#}"));
-                return;
-            }
-            self.select_credential(&new_name);
+        match self.vault.unlocked_mut().map(|v| v.add(&new_name, secret)) {
+            Some(Ok(new_id)) => self.select_credential(&new_id),
+            Some(Err(e)) => self.error = Some(format!("{e:#}")),
+            None => {}
         }
     }
 
-    /// Deletes a credential by name, clearing the editor if it was selected.
-    fn delete_credential_named(&mut self, name: &str) {
+    /// Deletes a credential by id, clearing the editor if it was selected.
+    fn delete_credential_named(&mut self, id: &str) {
         if let Some(vault) = self.vault.unlocked_mut()
-            && let Err(e) = vault.remove(name)
+            && let Err(e) = vault.remove(id)
         {
             self.error = Some(format!("{e:#}"));
             return;
         }
-        if self.vault_selected.as_deref() == Some(name) {
+        if self.vault_selected.as_deref() == Some(id) {
             self.vault_selected = None;
             self.vault_form = None;
         }
     }
 
-    /// Loads the selected credential into an editable form (value left blank).
-    fn select_credential(&mut self, name: &str) {
+    /// Loads the selected credential (by id) into an editable form (value blank).
+    fn select_credential(&mut self, id: &str) {
         self.vault_show_value = false;
         self.vault_show_passphrase = false;
         let Some(vault) = self.vault.unlocked() else { return };
-        let Some(secret) = vault.get(name) else { return };
+        let Some(secret) = vault.get(id) else { return };
+        let display_name = vault.name_of(id).unwrap_or(id).to_owned();
         let (kind, username, public, has_passphrase) = match secret {
             Secret::Password { username, .. } => {
                 (SecretKind::Password, username.clone(), String::new(), false)
@@ -3783,10 +3782,10 @@ impl App {
                 passphrase.is_some(),
             ),
         };
-        self.vault_selected = Some(name.to_owned());
+        self.vault_selected = Some(id.to_owned());
         self.vault_form = Some(SecretForm {
-            original: Some(name.to_owned()),
-            name: name.to_owned(),
+            original: Some(id.to_owned()),
+            name: display_name,
             kind,
             username: username.unwrap_or_default(),
             value: String::new(),
@@ -5294,7 +5293,7 @@ impl App {
         if let Auth::Password { secret } = &session.auth
             && !secret.is_empty()
             && let Some(vault) = self.vault.unlocked()
-            && let Some(Secret::Password { username, password: pw }) = vault.get(secret)
+            && let Some(Secret::Password { username, password: pw }) = vault.resolve(secret)
         {
             if user.is_empty()
                 && let Some(u) = username
@@ -6138,10 +6137,9 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             egui::Grid::new("vault-edit").num_columns(2).spacing([8.0, 8.0]).show(ui, |ui| {
                 ui.label("Name:");
-                ui.add_enabled(
-                    !editing,
-                    egui::TextEdit::singleline(&mut form.name).desired_width(240.0),
-                );
+                // The name is freely editable, including when editing (a rename
+                // keeps the entry's id, so sessions stay linked).
+                ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(240.0));
                 ui.end_row();
                 ui.label("Type:");
                 egui::ComboBox::from_id_salt("vault-type")
@@ -6336,42 +6334,61 @@ impl App {
         self.vault_form = Some(form);
     }
 
-    /// Saves a credential form into the unlocked vault. Returns its name.
+    /// Saves a credential form into the unlocked vault. Returns the entry's id.
+    /// `form.original` holds the id when editing (the name may be changed freely
+    /// — that's a rename, keeping the id).
     fn save_vault_credential(&mut self, form: &SecretForm) -> Result<String, String> {
         let name = form.name.trim().to_owned();
         if name.is_empty() {
             return Err("Give the credential a name.".into());
         }
-        let keep_existing = form.original.is_some() && form.value.trim().is_empty();
-        let existing = self.vault.unlocked().and_then(|v| v.get(&name).cloned());
         let username = {
             let u = form.username.trim();
             (!u.is_empty()).then(|| u.to_owned())
         };
-        let secret = if keep_existing {
-            match (form.kind, existing.as_ref()) {
-                (SecretKind::Password, Some(Secret::Password { password, .. })) => {
-                    Secret::Password { username, password: password.clone() }
+        match form.original.clone() {
+            // Editing an existing entry (by id): rename if the name changed, then
+            // replace the secret (or keep it when no new value was entered).
+            Some(id) => {
+                let current = self.vault.unlocked().and_then(|v| v.name_of(&id)).map(str::to_owned);
+                if current.as_deref() != Some(name.as_str()) {
+                    let vault = self.vault.unlocked_mut().ok_or("The vault is locked.")?;
+                    vault.rename(&id, &name).map_err(|e| format!("{e:#}"))?;
                 }
-                (SecretKind::Key, Some(Secret::PrivateKey { pem, public, passphrase, .. })) => {
-                    Secret::PrivateKey {
-                        pem: pem.clone(),
-                        public: form.public_opt().or_else(|| public.clone()),
-                        passphrase: passphrase.clone(),
-                        username,
+                let existing = self.vault.unlocked().and_then(|v| v.get(&id).cloned());
+                let secret = if form.value.trim().is_empty() {
+                    match (form.kind, existing.as_ref()) {
+                        (SecretKind::Password, Some(Secret::Password { password, .. })) => {
+                            Secret::Password { username, password: password.clone() }
+                        }
+                        (
+                            SecretKind::Key,
+                            Some(Secret::PrivateKey { pem, public, passphrase, .. }),
+                        ) => Secret::PrivateKey {
+                            pem: pem.clone(),
+                            public: form.public_opt().or_else(|| public.clone()),
+                            passphrase: passphrase.clone(),
+                            username,
+                        },
+                        _ => return Err("Enter the new secret value to change its type.".into()),
                     }
+                } else {
+                    form.to_secret()
+                };
+                let vault = self.vault.unlocked_mut().ok_or("The vault is locked.")?;
+                vault.update_secret(&id, secret).map_err(|e| format!("{e:#}"))?;
+                Ok(id)
+            }
+            // New entry.
+            None => {
+                if form.value.trim().is_empty() {
+                    return Err("Enter the secret value.".into());
                 }
-                _ => return Err("Enter the new secret value to change its type.".into()),
+                let secret = form.to_secret();
+                let vault = self.vault.unlocked_mut().ok_or("The vault is locked.")?;
+                vault.add(&name, secret).map_err(|e| format!("{e:#}"))
             }
-        } else {
-            if form.value.trim().is_empty() {
-                return Err("Enter the secret value.".into());
-            }
-            form.to_secret()
-        };
-        let vault = self.vault.unlocked_mut().ok_or("The vault is locked.")?;
-        vault.put(&name, secret).map_err(|e| format!("{e:#}"))?;
-        Ok(name)
+        }
     }
 
     // --- Dialogs ------------------------------------------------------------
@@ -6482,12 +6499,15 @@ impl App {
                 username: (!username.is_empty()).then(|| username.clone()),
                 password: form.password.clone(),
             };
-            if let Err(e) = self.store_secret(&name, secret) {
-                self.error = Some(e);
-                return;
-            }
+            let id = match self.store_secret(&name, secret) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.error = Some(e);
+                    return;
+                }
+            };
             if form.rebind {
-                session.auth = Auth::Password { secret: name };
+                session.auth = Auth::Password { secret: id };
                 let store = self
                     .find_session_anywhere(&session.id)
                     .map(|(s, _)| s)
@@ -7341,9 +7361,10 @@ impl App {
         let mut add = false;
         let mut cancel = false;
         let mut browse_folder = false;
-        // Snapshot the vault entry names for the "Vault entry" auth picker (the
-        // dialog closure borrows self.dialog, so it can't also read self.vault).
-        let vault_names: Vec<String> = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
+        // Snapshot the vault entries for the "Vault entry" auth picker (the dialog
+        // closure borrows self.dialog, so it can't also read self.vault). The
+        // source stores the entry's id; the picker shows the name.
+        let vault_entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
         let vault_unlocked = self.vault.unlocked().is_some();
         if let Dialog::AddSource(f) = &mut self.dialog {
             let editing = f.edit_id.is_some();
@@ -7431,16 +7452,20 @@ impl App {
                                         let current = if f.vault_entry.is_empty() {
                                             "(choose…)".to_owned()
                                         } else {
-                                            f.vault_entry.clone()
+                                            vault_entries
+                                                .iter()
+                                                .find(|e| e.id == f.vault_entry)
+                                                .map(|e| e.name.clone())
+                                                .unwrap_or_else(|| f.vault_entry.clone())
                                         };
                                         egui::ComboBox::from_id_salt("git-vault-entry")
                                             .selected_text(current)
                                             .show_ui(ui, |ui| {
-                                                for name in &vault_names {
+                                                for e in &vault_entries {
                                                     ui.selectable_value(
                                                         &mut f.vault_entry,
-                                                        name.clone(),
-                                                        name,
+                                                        e.id.clone(),
+                                                        &e.name,
                                                     );
                                                 }
                                             });
@@ -8121,9 +8146,19 @@ impl App {
         }
         let name = prompt.form.name.clone();
         let secret = prompt.form.to_secret();
-        let session = prompt.then_connect.clone();
-        if let Err(e) = self.store_secret(&name, secret) {
-            return self.set_credential_error(&e);
+        let mut session = prompt.then_connect.clone();
+        let id = match self.store_secret(&name, secret) {
+            Ok(id) => id,
+            Err(e) => return self.set_credential_error(&e),
+        };
+        // Bind the session to the new entry's id so it stays linked if renamed.
+        session.auth = match &session.auth {
+            Auth::Password { .. } => Auth::Password { secret: id },
+            Auth::Key { .. } => Auth::Key { secret: id },
+            Auth::Agent => Auth::Agent,
+        };
+        if let Some((store, _)) = self.find_session_anywhere(&session.id) {
+            let _ = self.store_upsert(&store, session.clone());
         }
         self.dialog = Dialog::None;
         self.start_connect(&session, ctx);
@@ -8238,9 +8273,10 @@ impl App {
                 self.vault = VaultState::Unlocked(Box::new(vault));
                 self.dialog = Dialog::None;
                 self.apply_remember(remember);
-                // Vault-backed git sources could not authenticate while locked;
-                // re-open them now so they sync with the resolved credential.
-                self.reopen_vault_sources();
+                // Migrate any legacy name references to ids and re-open sources so
+                // vault-backed auth resolves with the now-unlocked vault.
+                self.on_vault_unlocked();
+                self.vault_migrated = true;
             }
             Err(VaultError::BadPassword) => {
                 *error = Some("Incorrect master password.".into());
@@ -8252,17 +8288,81 @@ impl App {
     /// Re-opens shared sources that authenticate from the vault, so they pick up
     /// their credential once the vault is unlocked (they stay on the offline
     /// cache while it is locked). Only touches `GitAuthKind::Vault` sources.
-    fn reopen_vault_sources(&mut self) {
+    /// Runs once the vault becomes available: migrate legacy name references to
+    /// stable ids, then rebuild shared sources so vault-backed auth resolves with
+    /// the now-unlocked vault (and picks up any migrated ids).
+    fn on_vault_unlocked(&mut self) {
         if self.vault.unlocked().is_none() {
             return;
         }
+        self.migrate_vault_refs();
         let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
-        for i in 0..self.shared.len() {
-            let def = self.shared[i].def().clone();
-            if def.auth == GitAuthKind::Vault {
-                let auth = vault_git_auth(&def, self.vault.unlocked());
-                self.shared[i] = SharedSource::open(def, &cache, auth);
+        let vault = self.vault.unlocked();
+        self.shared = self
+            .sources_config
+            .defs
+            .iter()
+            .map(|def| SharedSource::open(def.clone(), &cache, vault_git_auth(def, vault)))
+            .collect();
+    }
+
+    /// Rewrites local session and source references from legacy vault-entry
+    /// *names* to stable *ids*, so an entry can later be renamed without breaking
+    /// them. Idempotent: a reference that's already an id is left alone; shared
+    /// sessions (in shared sources) are left name-based for portability.
+    fn migrate_vault_refs(&mut self) {
+        // Snapshot the vault's id set and name→id map (owned, so the borrow ends).
+        let (ids, name_to_id): (
+            std::collections::HashSet<String>,
+            std::collections::HashMap<String, String>,
+        ) = {
+            let Some(vault) = self.vault.unlocked() else { return };
+            let entries = vault.entries();
+            (
+                entries.iter().map(|e| e.id.clone()).collect(),
+                entries.into_iter().map(|e| (e.name, e.id)).collect(),
+            )
+        };
+        let remap = |r: &str| -> Option<String> {
+            if r.is_empty() || ids.contains(r) {
+                None // empty or already an id
+            } else {
+                name_to_id.get(r).cloned() // legacy name → id
             }
+        };
+        // Local sessions (shared sessions stay name-based for portability).
+        let updated: Vec<Session> = self
+            .sessions
+            .all()
+            .iter()
+            .filter_map(|s| {
+                let auth = match &s.auth {
+                    Auth::Password { secret } => {
+                        Auth::Password { secret: remap(secret)? }
+                    }
+                    Auth::Key { secret } => Auth::Key { secret: remap(secret)? },
+                    Auth::Agent => return None,
+                };
+                let mut s2 = s.clone();
+                s2.auth = auth;
+                Some(s2)
+            })
+            .collect();
+        for s in updated {
+            let _ = self.sessions.upsert(s);
+        }
+        // Local git sources that authenticate from a vault entry.
+        let mut changed = false;
+        for def in &mut self.sources_config.defs {
+            if def.auth == GitAuthKind::Vault
+                && let Some(id) = remap(&def.vault_entry)
+            {
+                def.vault_entry = id;
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.sources_config.save();
         }
     }
 
@@ -8351,7 +8451,15 @@ impl App {
         let mut save = false;
         let mut cancel = false;
         let mut open_in_vault: Option<String> = None;
-        let secret_names = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
+        // Entries for the "from vault" picker: show the name, store the id.
+        let secret_entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
+        let entry_name = |id: &str| {
+            secret_entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| id.to_owned())
+        };
         let vault_unlocked = self.vault.unlocked().is_some();
         if let Dialog::EditSession(form) = &mut self.dialog {
             let title = if form.id.is_some() { "Edit session" } else { "New session" };
@@ -8495,26 +8603,27 @@ impl App {
                                 ui.horizontal(|ui| {
                                     let selected = form
                                         .existing_name
-                                        .clone()
+                                        .as_deref()
+                                        .map(entry_name)
                                         .unwrap_or_else(|| "Choose…".into());
                                     egui::ComboBox::from_id_salt("session-secret")
                                         .selected_text(selected)
                                         .show_ui(ui, |ui| {
-                                            for name in &secret_names {
+                                            for e in &secret_entries {
                                                 ui.selectable_value(
                                                     &mut form.existing_name,
-                                                    Some(name.clone()),
-                                                    name,
+                                                    Some(e.id.clone()),
+                                                    &e.name,
                                                 );
                                             }
                                         });
-                                    if let Some(name) = form.existing_name.clone()
+                                    if let Some(id) = form.existing_name.clone()
                                         && ui
                                             .button("↪ Vault")
                                             .on_hover_text("Open this credential in the Vault")
                                             .clicked()
                                     {
-                                        open_in_vault = Some(name);
+                                        open_in_vault = Some(id);
                                     }
                                 });
                                 ui.end_row();
@@ -8565,26 +8674,27 @@ impl App {
                                 ui.horizontal(|ui| {
                                     let selected = form
                                         .existing_name
-                                        .clone()
+                                        .as_deref()
+                                        .map(entry_name)
                                         .unwrap_or_else(|| "Choose…".into());
                                     egui::ComboBox::from_id_salt("session-secret-rv")
                                         .selected_text(selected)
                                         .show_ui(ui, |ui| {
-                                            for name in &secret_names {
+                                            for e in &secret_entries {
                                                 ui.selectable_value(
                                                     &mut form.existing_name,
-                                                    Some(name.clone()),
-                                                    name,
+                                                    Some(e.id.clone()),
+                                                    &e.name,
                                                 );
                                             }
                                         });
-                                    if let Some(name) = form.existing_name.clone()
+                                    if let Some(id) = form.existing_name.clone()
                                         && ui
                                             .button("↪ Vault")
                                             .on_hover_text("Open this credential in the Vault")
                                             .clicked()
                                     {
-                                        open_in_vault = Some(name);
+                                        open_in_vault = Some(id);
                                     }
                                 });
                                 ui.end_row();
@@ -8721,13 +8831,15 @@ impl App {
         } else {
             // Resolve the vault entry name this session should reference. An empty
             // name (blank password, no existing entry) means "prompt every time".
-            let secret_name = match source {
+            // A session references a vault entry by its stable id (so the entry
+            // can be renamed later without breaking the link).
+            let secret_ref = match source {
                 SecretSource::Existing => match existing_name {
-                    Some(n) => n,
+                    Some(id) => id, // the picker stores the entry's id
                     None => return self.set_form_error("Choose a vault entry, or switch to New."),
                 },
                 SecretSource::New => {
-                    let secret_name = if new_name.is_empty() {
+                    let entry_name = if new_name.is_empty() {
                         self.default_secret_name(&name, &host)
                     } else {
                         new_name
@@ -8747,13 +8859,18 @@ impl App {
                             },
                             AuthMethod::Agent => unreachable!("agent handled above"),
                         };
-                        if let Err(e) = self.store_secret(&secret_name, secret) {
-                            return self.set_form_error(&e);
+                        match self.store_secret(&entry_name, secret) {
+                            Ok(id) => id,
+                            Err(e) => return self.set_form_error(&e),
                         }
-                        secret_name
-                    } else if self.vault.unlocked().and_then(|v| v.get(&secret_name)).is_some() {
-                        // Keep referencing the existing entry.
-                        secret_name
+                    } else if let Some(id) = self
+                        .vault
+                        .unlocked()
+                        .and_then(|v| v.id_for_name(&entry_name))
+                        .map(str::to_owned)
+                    {
+                        // Keep referencing the existing entry (by its id).
+                        id
                     } else if effective_method == AuthMethod::Password {
                         // Blank password with no entry: prompt at connect time.
                         String::new()
@@ -8765,8 +8882,8 @@ impl App {
                 }
             };
             match effective_method {
-                AuthMethod::Password => Auth::Password { secret: secret_name },
-                AuthMethod::Key => Auth::Key { secret: secret_name },
+                AuthMethod::Password => Auth::Password { secret: secret_ref },
+                AuthMethod::Key => Auth::Key { secret: secret_ref },
                 AuthMethod::Agent => unreachable!("agent handled above"),
             }
         };
@@ -8794,17 +8911,23 @@ impl App {
         if base.is_empty() {
             base = "credential".into();
         }
-        let existing: Vec<String> = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
-        if !existing.contains(&base) {
+        let taken: std::collections::HashSet<String> = self
+            .vault
+            .unlocked()
+            .map(|v| v.entries().into_iter().map(|e| e.name.to_lowercase()).collect())
+            .unwrap_or_default();
+        if !taken.contains(&base) {
             return base;
         }
-        (2..).map(|n| format!("{base}-{n}")).find(|c| !existing.contains(c)).unwrap_or(base)
+        (2..).map(|n| format!("{base}-{n}")).find(|c| !taken.contains(c)).unwrap_or(base)
     }
 
     /// Stores a secret in the vault, requiring it to be unlocked.
-    fn store_secret(&mut self, name: &str, secret: Secret) -> Result<(), String> {
+    /// Adds a new vault entry and returns its generated id (which sessions store
+    /// as their reference, so the entry can later be renamed freely).
+    fn store_secret(&mut self, name: &str, secret: Secret) -> Result<String, String> {
         match self.vault.unlocked_mut() {
-            Some(vault) => vault.put(name, secret).map_err(|e| format!("{e:#}")),
+            Some(vault) => vault.add(name, secret).map_err(|e| format!("{e:#}")),
             None => Err("Unlock or create the vault first.".into()),
         }
     }
@@ -8891,7 +9014,7 @@ impl App {
     fn show_quick_connect(&mut self, ctx: &egui::Context) {
         let mut connect = false;
         let mut cancel = false;
-        let secret_names = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
+        let secret_entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
         let vault_unlocked = self.vault.unlocked().is_some();
 
         if let Dialog::QuickConnect(form) = &mut self.dialog {
@@ -8931,19 +9054,23 @@ impl App {
                     ConnectAuth::VaultSecret => {
                         if !vault_unlocked {
                             ui.colored_label(Color32::LIGHT_YELLOW, "Unlock the vault first.");
-                        } else if secret_names.is_empty() {
+                        } else if secret_entries.is_empty() {
                             ui.colored_label(Color32::LIGHT_YELLOW, "The vault has no entries yet.");
                         } else {
-                            let selected =
-                                form.secret_name.clone().unwrap_or_else(|| "Choose…".into());
+                            let selected = form
+                                .secret_name
+                                .as_deref()
+                                .and_then(|id| secret_entries.iter().find(|e| e.id == id))
+                                .map(|e| e.name.clone())
+                                .unwrap_or_else(|| "Choose…".into());
                             egui::ComboBox::from_id_salt("quick-secret")
                                 .selected_text(selected)
                                 .show_ui(ui, |ui| {
-                                    for name in &secret_names {
+                                    for e in &secret_entries {
                                         ui.selectable_value(
                                             &mut form.secret_name,
-                                            Some(name.clone()),
-                                            name,
+                                            Some(e.id.clone()),
+                                            &e.name,
                                         );
                                     }
                                 });
@@ -9003,7 +9130,7 @@ impl App {
             Close,
         }
         let mut action = Action::None;
-        let names = self.vault.unlocked().map(|v| v.names()).unwrap_or_default();
+        let entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
 
         if let Dialog::VaultManager(state) = &mut self.dialog {
             egui::Modal::new(egui::Id::new("vault-manager")).show(ctx, |ui| {
@@ -9070,20 +9197,20 @@ impl App {
                     match &mut state.form {
                     None => {
                         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                            if names.is_empty() {
+                            if entries.is_empty() {
                                 ui.label(RichText::new("No secrets yet.").weak());
                             }
-                            for name in &names {
+                            for e in &entries {
                                 ui.horizontal(|ui| {
-                                    ui.monospace(name);
+                                    ui.monospace(&e.name);
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             if ui.small_button("Delete").clicked() {
-                                                action = Action::Delete(name.clone());
+                                                action = Action::Delete(e.id.clone());
                                             }
                                             if ui.small_button("Edit").clicked() {
-                                                action = Action::Edit(name.clone());
+                                                action = Action::Edit(e.id.clone());
                                             }
                                         },
                                     );
@@ -9108,10 +9235,8 @@ impl App {
                         ui.heading(if editing { "Edit secret" } else { "New secret" });
                         egui::Grid::new("secret-fields").num_columns(2).show(ui, |ui| {
                             ui.label("Name");
-                            ui.add_enabled(
-                                !editing,
-                                egui::TextEdit::singleline(&mut form.name),
-                            );
+                            // Freely editable (a rename keeps the entry's id).
+                            ui.add(egui::TextEdit::singleline(&mut form.name));
                             ui.end_row();
                             ui.label("Type");
                             egui::ComboBox::from_id_salt("secret-kind")
@@ -9252,7 +9377,7 @@ impl App {
         if name.is_empty() {
             return self.set_vault_error("Name is required.");
         }
-        if self.vault.unlocked().and_then(|v| v.get(&name)).is_some() {
+        if self.vault.unlocked().is_some_and(|v| v.name_taken(&name, None)) {
             return self.set_vault_error("A secret with that name already exists.");
         }
         let passphrase = (!passphrase.is_empty()).then_some(passphrase);
@@ -9276,26 +9401,27 @@ impl App {
         }
     }
 
-    /// Loads an existing secret into the manager's edit form (values left blank
-    /// so they are only overwritten when the user types a new value).
-    fn begin_edit_secret(&mut self, name: &str) {
-        let (kind, username, public, has_passphrase) =
-            match self.vault.unlocked().and_then(|v| v.get(name)) {
-                Some(secret @ Secret::Password { .. }) => {
-                    (SecretKind::Password, secret.username().unwrap_or_default().to_owned(), String::new(), false)
-                }
-                Some(Secret::PrivateKey { username, public, passphrase, .. }) => (
-                    SecretKind::Key,
-                    username.clone().unwrap_or_default(),
-                    public.clone().unwrap_or_default(),
-                    passphrase.is_some(),
-                ),
-                None => return,
-            };
+    /// Loads an existing secret (by id) into the manager's edit form (values left
+    /// blank so they are only overwritten when the user types a new value).
+    fn begin_edit_secret(&mut self, id: &str) {
+        let Some(vault) = self.vault.unlocked() else { return };
+        let display_name = vault.name_of(id).unwrap_or(id).to_owned();
+        let (kind, username, public, has_passphrase) = match vault.get(id) {
+            Some(secret @ Secret::Password { .. }) => {
+                (SecretKind::Password, secret.username().unwrap_or_default().to_owned(), String::new(), false)
+            }
+            Some(Secret::PrivateKey { username, public, passphrase, .. }) => (
+                SecretKind::Key,
+                username.clone().unwrap_or_default(),
+                public.clone().unwrap_or_default(),
+                passphrase.is_some(),
+            ),
+            None => return,
+        };
         if let Dialog::VaultManager(state) = &mut self.dialog {
             state.form = Some(SecretForm {
-                original: Some(name.to_owned()),
-                name: name.to_owned(),
+                original: Some(id.to_owned()),
+                name: display_name,
                 kind,
                 username,
                 value: String::new(),
@@ -9307,9 +9433,9 @@ impl App {
         }
     }
 
-    fn delete_secret(&mut self, name: &str) {
+    fn delete_secret(&mut self, id: &str) {
         let result = match self.vault.unlocked_mut() {
-            Some(vault) => vault.remove(name).map(|_| ()),
+            Some(vault) => vault.remove(id).map(|_| ()),
             None => return,
         };
         if let Dialog::VaultManager(state) = &mut self.dialog
@@ -9320,57 +9446,15 @@ impl App {
     }
 
     fn save_secret_form(&mut self) {
-        let Dialog::VaultManager(state) = &self.dialog else { return };
-        let Some(form) = &state.form else { return };
-        let editing = form.original.is_some();
-        let name = form.name.trim().to_owned();
-        if name.is_empty() {
-            return self.set_vault_error("Name is required.");
-        }
-        // When editing with the value (private key / password) left blank, keep
-        // the existing private key but still apply edits to a keypair's public
-        // key / passphrase / username. For a password, nothing to edit → close.
-        if editing && form.value.is_empty() {
-            let existing_pem = self.vault.unlocked().and_then(|v| v.get(&name)).and_then(|s| {
-                match s {
-                    Secret::PrivateKey { pem, .. } => Some(pem.clone()),
-                    Secret::Password { .. } => None,
-                }
-            });
-            if form.kind == SecretKind::Key
-                && let Some(pem) = existing_pem
-            {
-                let secret = form.to_secret_with_pem(pem);
-                let result = match self.vault.unlocked_mut() {
-                    Some(vault) => vault.put(&name, secret).map_err(|e| format!("{e:#}")),
-                    None => Err("The vault is locked.".into()),
-                };
-                match result {
-                    Ok(()) => {
-                        if let Dialog::VaultManager(state) = &mut self.dialog {
-                            state.form = None;
-                            state.error = None;
-                        }
-                    }
-                    Err(e) => self.set_vault_error(&e),
-                }
-                return;
-            }
-            if let Dialog::VaultManager(state) = &mut self.dialog {
-                state.form = None;
-            }
+        // Reuse the id-aware save (rename + update-by-id) used by the vault pane.
+        let Some(form) = (match &self.dialog {
+            Dialog::VaultManager(state) => state.form.clone(),
+            _ => None,
+        }) else {
             return;
-        }
-        if form.value.is_empty() {
-            return self.set_vault_error("Enter a value.");
-        }
-        let secret = form.to_secret();
-        let result = match self.vault.unlocked_mut() {
-            Some(vault) => vault.put(&name, secret).map_err(|e| format!("{e:#}")),
-            None => Err("The vault is locked.".into()),
         };
-        match result {
-            Ok(()) => {
+        match self.save_vault_credential(&form) {
+            Ok(_) => {
                 if let Dialog::VaultManager(state) = &mut self.dialog {
                     state.form = None;
                     state.error = None;
@@ -9397,6 +9481,13 @@ impl eframe::App for App {
         if self.active != self.last_active {
             self.broadcast = false;
             self.last_active = self.active;
+        }
+
+        // Once the vault is first available (incl. keyring auto-unlock at
+        // startup), migrate any legacy name references to stable ids.
+        if !self.vault_migrated && self.vault.unlocked().is_some() {
+            self.on_vault_unlocked();
+            self.vault_migrated = true;
         }
 
         // Deliver a requested clipboard paste to the active remote session.
@@ -10293,7 +10384,7 @@ fn vault_git_auth(def: &SourceDef, vault: Option<&Vault>) -> Option<GitAuth> {
     if def.auth != GitAuthKind::Vault {
         return None;
     }
-    let secret = vault?.get(&def.vault_entry)?;
+    let secret = vault?.resolve(&def.vault_entry)?;
     Some(git_auth_from_secret(secret, &def.username))
 }
 

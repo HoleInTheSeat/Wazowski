@@ -237,7 +237,7 @@ impl SourcesConfig {
         Ok(Self { path, defs })
     }
 
-    fn save(&self) -> Result<()> {
+    pub fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }

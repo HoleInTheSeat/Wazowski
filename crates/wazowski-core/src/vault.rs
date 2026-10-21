@@ -94,13 +94,79 @@ impl Secret {
     }
 }
 
-/// The decrypted contents of the vault: named secrets.
+/// One stored vault entry: an editable display `name` plus its secret. The map
+/// key (outside) is the entry's stable id (a slug derived from the first name).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Entry {
+    name: String,
+    secret: Secret,
+}
+
+/// An entry's id and display name, for listing/choosing in the UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryInfo {
+    pub id: String,
+    pub name: String,
+}
+
+/// The decrypted contents of the vault.
 ///
 /// Not `Zeroize` itself (its `BTreeMap` isn't), but each [`Secret`] it holds
 /// wipes itself on drop, so dropping the document clears the secrets.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Document {
+    /// Current format: stable id (slug) -> entry (display name + secret).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    entries: BTreeMap<String, Entry>,
+    /// Legacy format: name -> secret. Read on load and migrated into `entries`
+    /// (assigning slug ids); never written back.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     secrets: BTreeMap<String, Secret>,
+}
+
+impl Document {
+    /// Migrates any legacy `secrets` (keyed by name) into id-keyed `entries`,
+    /// giving each a slug id. Returns whether anything was migrated (so the
+    /// caller can persist the new format).
+    fn migrate(&mut self) -> bool {
+        if self.secrets.is_empty() {
+            return false;
+        }
+        let legacy = std::mem::take(&mut self.secrets);
+        for (name, secret) in legacy {
+            let id = unique_id(&slugify(&name), &self.entries);
+            self.entries.insert(id, Entry { name, secret });
+        }
+        true
+    }
+}
+
+/// Turns a display name into an id slug: lowercase, non-alphanumeric runs become
+/// a single `-`, trimmed. Empty results fall back to `entry`.
+fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = true; // true suppresses a leading dash
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() { "entry".to_owned() } else { slug }
+}
+
+/// A slug not already used as a key in `existing`; appends `-2`, `-3`, … if taken.
+fn unique_id(base: &str, existing: &BTreeMap<String, Entry>) -> String {
+    if !existing.contains_key(base) {
+        return base.to_owned();
+    }
+    (2..).map(|n| format!("{base}-{n}")).find(|c| !existing.contains_key(c)).unwrap()
 }
 
 /// Argon2id cost parameters, stored in the file so an old vault still opens if defaults change.
@@ -169,7 +235,18 @@ impl Vault {
         let key = derive_key(master_password, &parsed.salt, parsed.kdf)
             .map_err(VaultError::Other)?;
         let doc = decrypt(&key, &parsed)?;
-        Ok(Self { path, salt: parsed.salt, kdf: parsed.kdf, key, doc })
+        let mut vault = Self { path, salt: parsed.salt, kdf: parsed.kdf, key, doc };
+        vault.migrate_format();
+        Ok(vault)
+    }
+
+    /// If the decrypted document is in the legacy (name-keyed) format, assign
+    /// stable ids and persist the new format. Best-effort: a failed save leaves
+    /// the in-memory doc migrated (so this session works) and retries next save.
+    fn migrate_format(&mut self) {
+        if self.doc.migrate() {
+            let _ = self.save();
+        }
     }
 
     /// Changes the master password, re-deriving the key with a fresh salt and re-encrypting.
@@ -179,29 +256,97 @@ impl Vault {
         self.save()
     }
 
-    /// Stores (or replaces) a secret under `name` and flushes to disk.
-    pub fn put(&mut self, name: &str, secret: Secret) -> Result<()> {
-        self.doc.secrets.insert(name.to_owned(), secret);
+    /// Fetches a secret by its stable id.
+    pub fn get(&self, id: &str) -> Option<&Secret> {
+        self.doc.entries.get(id).map(|e| &e.secret)
+    }
+
+    /// Resolves a reference that may be an id (preferred) or, for legacy/shared
+    /// references, a display name. Ids win over names on any overlap.
+    pub fn resolve(&self, reference: &str) -> Option<&Secret> {
+        if let Some(e) = self.doc.entries.get(reference) {
+            return Some(&e.secret);
+        }
+        self.doc.entries.values().find(|e| e.name == reference).map(|e| &e.secret)
+    }
+
+    /// The id of the entry currently named `name` (first match), if any. Used to
+    /// migrate legacy name-based references to ids.
+    pub fn id_for_name(&self, name: &str) -> Option<&str> {
+        self.doc.entries.iter().find(|(_, e)| e.name == name).map(|(id, _)| id.as_str())
+    }
+
+    /// The display name for an id.
+    pub fn name_of(&self, id: &str) -> Option<&str> {
+        self.doc.entries.get(id).map(|e| e.name.as_str())
+    }
+
+    /// Whether `name` (case-insensitive) is already used by another entry.
+    pub fn name_taken(&self, name: &str, except_id: Option<&str>) -> bool {
+        let lower = name.trim().to_lowercase();
+        self.doc
+            .entries
+            .iter()
+            .any(|(id, e)| e.name.to_lowercase() == lower && Some(id.as_str()) != except_id)
+    }
+
+    /// All entries (id + name), sorted by name (case-insensitive).
+    pub fn entries(&self) -> Vec<EntryInfo> {
+        let mut v: Vec<EntryInfo> = self
+            .doc
+            .entries
+            .iter()
+            .map(|(id, e)| EntryInfo { id: id.clone(), name: e.name.clone() })
+            .collect();
+        v.sort_by_key(|e| e.name.to_lowercase());
+        v
+    }
+
+    /// Adds a new entry, returning its generated stable id. Errors if the name
+    /// is empty or already used.
+    pub fn add(&mut self, name: &str, secret: Secret) -> Result<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("the entry needs a name");
+        }
+        if self.name_taken(name, None) {
+            bail!("an entry named '{name}' already exists");
+        }
+        let id = unique_id(&slugify(name), &self.doc.entries);
+        self.doc.entries.insert(id.clone(), Entry { name: name.to_owned(), secret });
+        self.save()?;
+        Ok(id)
+    }
+
+    /// Replaces an existing entry's secret value (keeping its id and name).
+    pub fn update_secret(&mut self, id: &str, secret: Secret) -> Result<()> {
+        let entry = self.doc.entries.get_mut(id).context("that vault entry no longer exists")?;
+        entry.secret = secret;
         self.save()
     }
 
-    /// Fetches a secret by name.
-    pub fn get(&self, name: &str) -> Option<&Secret> {
-        self.doc.secrets.get(name)
+    /// Renames an entry (its id stays the same). Errors if the new name is empty
+    /// or already used by another entry.
+    pub fn rename(&mut self, id: &str, new_name: &str) -> Result<()> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            bail!("the entry needs a name");
+        }
+        if self.name_taken(new_name, Some(id)) {
+            bail!("an entry named '{new_name}' already exists");
+        }
+        let entry = self.doc.entries.get_mut(id).context("that vault entry no longer exists")?;
+        entry.name = new_name.to_owned();
+        self.save()
     }
 
-    /// Removes a secret, flushing to disk. Returns whether it existed.
-    pub fn remove(&mut self, name: &str) -> Result<bool> {
-        let existed = self.doc.secrets.remove(name).is_some();
+    /// Removes an entry by id, flushing to disk. Returns whether it existed.
+    pub fn remove(&mut self, id: &str) -> Result<bool> {
+        let existed = self.doc.entries.remove(id).is_some();
         if existed {
             self.save()?;
         }
         Ok(existed)
-    }
-
-    /// Names of all stored secrets, sorted.
-    pub fn names(&self) -> Vec<String> {
-        self.doc.secrets.keys().cloned().collect()
     }
 
     /// Caches the master key in the OS keyring so the vault can later be opened
@@ -255,7 +400,9 @@ impl Vault {
         let mut key = MasterKey([0u8; KEY_LEN]);
         key.0.copy_from_slice(&blob[SALT_LEN..]);
         let doc = decrypt(&key, &parsed)?;
-        Ok(Some(Self { path, salt: parsed.salt, kdf: parsed.kdf, key, doc }))
+        let mut vault = Self { path, salt: parsed.salt, kdf: parsed.kdf, key, doc };
+        vault.migrate_format();
+        Ok(Some(vault))
     }
 
     /// Encrypts the current document and writes it to the vault file atomically.
@@ -409,10 +556,13 @@ mod tests {
         let path = dir.path().join("vault.enc");
 
         let mut vault = Vault::create(path.clone(), "correct horse").unwrap();
-        vault.put("prod-root", Secret::Password { username: None, password: "hunter2".into() }).unwrap();
+        let root_id = vault
+            .add("prod root", Secret::Password { username: None, password: "hunter2".into() })
+            .unwrap();
+        assert_eq!(root_id, "prod-root", "id is a slug of the name");
         vault
-            .put(
-                "deploy-key",
+            .add(
+                "deploy key",
                 Secret::PrivateKey {
                     pem: "-----BEGIN-----\nx\n".into(),
                     public: Some("ssh-ed25519 AAAA deploy".into()),
@@ -424,10 +574,54 @@ mod tests {
         drop(vault);
 
         let reopened = Vault::open(path, "correct horse").unwrap();
-        assert_eq!(reopened.names(), vec!["deploy-key", "prod-root"]);
-        assert_eq!(reopened.get("prod-root"), Some(&Secret::Password { username: None, password: "hunter2".into() }));
+        let names: Vec<String> = reopened.entries().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["deploy key", "prod root"]);
+        assert_eq!(
+            reopened.get("prod-root"),
+            Some(&Secret::Password { username: None, password: "hunter2".into() })
+        );
         // The keypair's public key survives the round-trip.
         assert_eq!(reopened.get("deploy-key").and_then(Secret::public_key), Some("ssh-ed25519 AAAA deploy"));
+        // Resolution also works by name (for legacy/shared references).
+        assert!(reopened.resolve("prod root").is_some());
+    }
+
+    #[test]
+    fn rename_keeps_id_and_secret() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let mut vault = Vault::create(path, "pw").unwrap();
+        let id = vault
+            .add("VNC password", Secret::Password { username: None, password: "p".into() })
+            .unwrap();
+        assert_eq!(id, "vnc-password");
+        vault.rename(&id, "VNC login").unwrap();
+        // Same id still resolves to the same secret; the display name changed.
+        assert_eq!(vault.name_of(&id), Some("VNC login"));
+        assert!(vault.get(&id).is_some());
+        // A duplicate name is refused.
+        vault.add("Other", Secret::Password { username: None, password: "q".into() }).unwrap();
+        assert!(vault.rename(&id, "Other").is_err());
+    }
+
+    #[test]
+    fn duplicate_slug_gets_suffix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let mut vault = Vault::create(path, "pw").unwrap();
+        // Two distinct names that slugify the same get distinct ids.
+        let a = vault.add("My Key", Secret::Password { username: None, password: "1".into() }).unwrap();
+        let b = vault.add("my-key", Secret::Password { username: None, password: "2".into() }).unwrap();
+        assert_eq!(a, "my-key");
+        assert_eq!(b, "my-key-2");
+    }
+
+    #[test]
+    fn slugify_cases() {
+        assert_eq!(slugify("VNC password"), "vnc-password");
+        assert_eq!(slugify("  Prod / DB  "), "prod-db");
+        assert_eq!(slugify("a@@@b"), "a-b");
+        assert_eq!(slugify("!!!"), "entry");
     }
 
     #[test]
@@ -484,7 +678,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
         let mut vault = fast_vault(path.clone(), "old");
-        vault.put("x", Secret::Password { username: None, password: "secret".into() }).unwrap();
+        vault.add("x", Secret::Password { username: None, password: "secret".into() }).unwrap();
         let old_salt = vault.salt;
         vault.change_password("new").unwrap();
         assert_ne!(vault.salt, old_salt, "salt should be rotated");
@@ -502,7 +696,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
         let mut vault = Vault::create(path.clone(), "master").unwrap();
-        vault.put("x", Secret::Password { username: None, password: "s3cret".into() }).unwrap();
+        vault.add("x", Secret::Password { username: None, password: "s3cret".into() }).unwrap();
         vault.enable_keyring_unlock().unwrap();
         drop(vault);
 
@@ -513,12 +707,41 @@ mod tests {
     }
 
     #[test]
+    fn migrates_legacy_name_keyed_vault() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let mut vault = fast_vault(path.clone(), "pw");
+        // Simulate an old vault: secrets keyed by name in the legacy map.
+        vault.doc.secrets.insert(
+            "Prod DB".into(),
+            Secret::Password { username: Some("admin".into()), password: "x".into() },
+        );
+        vault.save().unwrap();
+        let salt = vault.salt;
+        let kdf = vault.kdf;
+        drop(vault);
+
+        // Reopen with the same (fast) key material via open_with... emulate by
+        // reading and decrypting through the normal open path.
+        let key = derive_key("pw", &salt, kdf).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let parsed = ParsedFile::parse(&bytes).unwrap();
+        let doc = decrypt(&key, &parsed).unwrap();
+        let mut reopened = Vault { path, salt, kdf, key, doc };
+        reopened.migrate_format();
+
+        assert!(reopened.doc.secrets.is_empty(), "legacy map is migrated away");
+        assert_eq!(reopened.get("prod-db").and_then(Secret::username), Some("admin"));
+        assert_eq!(reopened.name_of("prod-db"), Some("Prod DB"));
+    }
+
+    #[test]
     fn remove_secret() {
         let dir = tempdir().unwrap();
         let mut vault = fast_vault(dir.path().join("vault.enc"), "pw");
-        vault.put("a", Secret::Password { username: None, password: "1".into() }).unwrap();
-        assert!(vault.remove("a").unwrap());
-        assert!(!vault.remove("a").unwrap());
-        assert!(vault.get("a").is_none());
+        let id = vault.add("a", Secret::Password { username: None, password: "1".into() }).unwrap();
+        assert!(vault.remove(&id).unwrap());
+        assert!(!vault.remove(&id).unwrap());
+        assert!(vault.get(&id).is_none());
     }
 }
