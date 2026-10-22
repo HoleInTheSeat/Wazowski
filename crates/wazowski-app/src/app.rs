@@ -971,6 +971,10 @@ struct ConnectCredsForm {
 /// Prompt to create a missing named credential, then continue connecting.
 struct CredentialPrompt {
     form: SecretForm,
+    /// The exact vault-entry id the session references. The created entry is given
+    /// this id regardless of the display name, so the session (and any shared
+    /// session that references the same id) resolves afterwards.
+    expected_id: String,
     /// The session to connect once the credential exists.
     then_connect: Session,
 }
@@ -1033,10 +1037,19 @@ pub struct App {
     /// Held for the process lifetime to enforce single-instance; `None` when
     /// multiple instances are allowed.
     _instance_lock: Option<std::fs::File>,
+    /// A connection URI passed at launch (ssh:// / telnet://), handled on the
+    /// first frame.
+    pending_uri: Option<String>,
+    /// URIs handed off by a second instance (via the inbox), drained each frame.
+    uri_rx: std::sync::mpsc::Receiver<String>,
     /// The find-in-terminals bar, when open.
     find: Option<FindState>,
     /// Which list the left pane is showing.
     sidebar_view: SidebarView,
+    /// When true (and a tab is showing), the left pane's content is hidden to give
+    /// the tab more room; the icon rail stays. Toggled by re-clicking the current
+    /// view's rail icon.
+    sidebar_collapsed: bool,
     /// The network toolbox state.
     network: NetworkState,
     webtools: WebToolsState,
@@ -1313,7 +1326,40 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context, instance_lock: Option<std::fs::File>) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        instance_lock: Option<std::fs::File>,
+        launch_uri: Option<String>,
+    ) -> Self {
+        // Watch the URI inbox on a background thread so a second instance's
+        // ssh://… hand-off opens here. Only wakes the UI when one arrives, so it
+        // costs nothing while idle.
+        let (uri_tx, uri_rx) = std::sync::mpsc::channel();
+        if let Some(dir) = crate::uri::inbox_dir() {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = std::fs::create_dir_all(&dir);
+                loop {
+                    let mut got = false;
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().is_some_and(|e| e == "uri") {
+                                if let Ok(uri) = std::fs::read_to_string(&path) {
+                                    let _ = uri_tx.send(uri.trim().to_owned());
+                                    got = true;
+                                }
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                    if got {
+                        ctx.request_repaint();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            });
+        }
         install_fonts(ctx);
         let sessions_path = SessionStore::default_path().unwrap_or_else(|_| "sessions.toml".into());
         let sessions = SessionStore::load(sessions_path).unwrap_or_default();
@@ -1384,8 +1430,11 @@ impl App {
             macro_run: None,
             settings,
             _instance_lock: instance_lock,
+            pending_uri: launch_uri,
+            uri_rx,
             find: None,
             sidebar_view: SidebarView::Sessions,
+            sidebar_collapsed: false,
             network: NetworkState::default(),
             webtools: WebToolsState::default(),
             serial_ports: sorted_serial_devices(),
@@ -1784,6 +1833,25 @@ impl App {
             self.prompt_connect_creds(session);
             return;
         }
+        // For RDP/VNC with a vault entry that doesn't resolve, surface the same
+        // create-credential / unlock prompts SSH gets — instead of connecting with
+        // no credentials (SSH gets this inside `start_connect`).
+        if session.protocol != Protocol::Ssh
+            && matches!(&session.auth, Auth::Vault { entry } if !entry.is_empty())
+        {
+            match self.resolve_auth(&session.auth) {
+                Ok(_) => {} // the entry resolves — fall through and connect
+                Err(AuthProblem::Missing { name, kind }) => {
+                    return self.prompt_create_credential(session, name, kind);
+                }
+                Err(AuthProblem::Message(m)) => {
+                    self.error = Some(m);
+                    return;
+                }
+                // An empty entry is handled above; prompt defensively otherwise.
+                Err(AuthProblem::NeedPassword) => return self.prompt_connect_creds(session),
+            }
+        }
         match session.protocol {
             Protocol::Ssh => self.start_connect(session, ctx),
             Protocol::Rdp => {
@@ -1926,18 +1994,28 @@ impl App {
         match self.resolve_auth(&session.auth) {
             Ok(resolved) => self.connect_with(&session.name, session, resolved, ctx),
             Err(AuthProblem::Missing { name, kind }) => {
-                let mut form = SecretForm::new();
-                form.name = name;
-                form.username = session.username.clone();
-                form.kind = kind;
-                self.dialog = Dialog::CreateCredential(CredentialPrompt {
-                    form,
-                    then_connect: session.clone(),
-                });
+                self.prompt_create_credential(session, name, kind);
             }
             Err(AuthProblem::NeedPassword) => self.prompt_connect_creds(session),
             Err(AuthProblem::Message(m)) => self.error = Some(m),
         }
+    }
+
+    /// Opens the create-credential dialog for a session referencing a vault entry
+    /// id (`missing_id`) that doesn't exist yet. The entry is created under that
+    /// exact id, then the connection resumes (for any protocol).
+    fn prompt_create_credential(&mut self, session: &Session, missing_id: String, kind: SecretKind) {
+        let mut form = SecretForm::new();
+        // Prefill the display name with the expected id (editable); the id itself
+        // is kept exactly so the session still resolves.
+        form.name = missing_id.clone();
+        form.username = session.username.clone();
+        form.kind = kind;
+        self.dialog = Dialog::CreateCredential(CredentialPrompt {
+            form,
+            expected_id: missing_id,
+            then_connect: session.clone(),
+        });
     }
 
     /// Opens the connect-time credential prompt for a Prompt-Everytime session,
@@ -1954,6 +2032,48 @@ impl App {
             title: session.name.clone(),
             session: session.clone(),
         }));
+    }
+
+    /// Handles a connection URI (`ssh://` / `telnet://`, both SSH): connects a
+    /// matching saved session (local or shared) using its stored credentials, or
+    /// falls back to a quick-connect prompt prefilled from the URI. Raises the
+    /// window so a browser hand-off comes to the front.
+    fn handle_connect_uri(&mut self, raw: &str, ctx: &egui::Context) {
+        let Some(target) = crate::uri::parse_connect_uri(raw) else {
+            self.error = Some(format!("Unrecognized connection URI: {raw}"));
+            return;
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if let Some(session) = self.find_session_for_host(&target.host, target.user.as_deref()) {
+            // A saved SSH session for this host exists — use it (and its credentials).
+            self.connect_session(&session, ctx);
+        } else {
+            // No saved session: quick-connect, prefilled, prompting for login.
+            let mut session = Session::new(String::new(), &target.host, target.user.unwrap_or_default());
+            session.port = target.port.unwrap_or(22);
+            self.dialog = Dialog::QuickConnect(ConnectAuthForm::new(session));
+        }
+    }
+
+    /// Finds a saved SSH session (local or in any shared source) whose host
+    /// matches `host` (case-insensitive). When `user` is given, a session with a
+    /// matching username is preferred; otherwise the first host match is used.
+    fn find_session_for_host(&self, host: &str, user: Option<&str>) -> Option<Session> {
+        let is_match = |s: &&Session| {
+            s.protocol == Protocol::Ssh && s.host.eq_ignore_ascii_case(host)
+        };
+        let local = self.sessions.all().iter();
+        let shared = self.shared.iter().flat_map(|src| src.store().all().iter());
+        let candidates: Vec<&Session> = local.chain(shared).filter(is_match).collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        if let Some(u) = user.filter(|u| !u.is_empty())
+            && let Some(s) = candidates.iter().find(|s| s.username.eq_ignore_ascii_case(u))
+        {
+            return Some((*s).clone());
+        }
+        Some(candidates[0].clone())
     }
 
     /// Opens the "Connect as…" one-off credential prompt for a session.
@@ -2437,6 +2557,11 @@ impl App {
         }
         if triggered(Action::ViewFiles, ctx, &self.keymap) {
             self.sidebar_view = SidebarView::Files;
+        }
+        // F11 toggles window fullscreen (read the current state and flip it).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F11)) {
+            let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
         }
         if triggered(Action::FontSizeUp, ctx, &self.keymap) {
             self.nudge_active_font_size(1.0);
@@ -3489,61 +3614,57 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(4.0);
+        let prev = self.sidebar_view;
+        let collapsed = self.sidebar_collapsed && self.can_collapse_sidebar();
+        let mut clicked: Option<SidebarView> = None;
         // A vertical icon rail to switch views, beside the view's content.
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                let view = &mut self.sidebar_view;
                 const SIZE: f32 = 26.0;
-                let icon = |glyph: &str, color: Color32| {
-                    RichText::new(glyph).size(SIZE).color(color)
-                };
-                ui.selectable_value(
-                    view,
-                    SidebarView::Sessions,
-                    icon("🖥", Color32::from_rgb(90, 170, 255)),
-                )
-                .on_hover_text("Sessions");
-                ui.selectable_value(
-                    view,
-                    SidebarView::Macros,
-                    icon("📜", Color32::from_rgb(240, 170, 60)),
-                )
-                .on_hover_text("Macros");
-                ui.selectable_value(
-                    view,
-                    SidebarView::Files,
-                    icon("📁", Color32::from_rgb(120, 200, 120)),
-                )
-                .on_hover_text("Files (SFTP)");
-                ui.selectable_value(
-                    view,
-                    SidebarView::Tools,
-                    icon("🔧", Color32::from_rgb(200, 150, 110)),
-                )
-                .on_hover_text("Tools (servers & network)");
-                ui.selectable_value(
-                    view,
-                    SidebarView::Vault,
-                    icon("🔒", Color32::from_rgb(210, 190, 90)),
-                )
-                .on_hover_text("Vault (credentials)");
-                ui.selectable_value(
-                    view,
-                    SidebarView::Settings,
-                    icon("⚙", Color32::from_rgb(170, 170, 180)),
-                )
-                .on_hover_text("Settings");
+                let icon = |glyph: &str, color: Color32| RichText::new(glyph).size(SIZE).color(color);
+                for (view, glyph, color, tip) in [
+                    (SidebarView::Sessions, "🖥", Color32::from_rgb(90, 170, 255), "Sessions"),
+                    (SidebarView::Macros, "📜", Color32::from_rgb(240, 170, 60), "Macros"),
+                    (SidebarView::Files, "📁", Color32::from_rgb(120, 200, 120), "Files (SFTP)"),
+                    (SidebarView::Tools, "🔧", Color32::from_rgb(200, 150, 110), "Tools (servers & network)"),
+                    (SidebarView::Vault, "🔒", Color32::from_rgb(210, 190, 90), "Vault (credentials)"),
+                    (SidebarView::Settings, "⚙", Color32::from_rgb(170, 170, 180), "Settings"),
+                ] {
+                    let hint = if prev == view && self.can_collapse_sidebar() {
+                        let verb = if collapsed { "show" } else { "hide" };
+                        format!("{tip} — click to {verb} the pane")
+                    } else {
+                        tip.to_owned()
+                    };
+                    if ui.selectable_label(prev == view, icon(glyph, color)).on_hover_text(hint).clicked() {
+                        clicked = Some(view);
+                    }
+                }
             });
-            ui.separator();
-            ui.vertical(|ui| match self.sidebar_view {
-                SidebarView::Sessions => self.sidebar_sessions(ui, ctx),
-                SidebarView::Macros => self.sidebar_macros(ui),
-                SidebarView::Files => self.sidebar_files(ui, ctx),
-                SidebarView::Tools => self.sidebar_tools(ui),
-                SidebarView::Vault => self.sidebar_vault(ui),
-                SidebarView::Settings => self.sidebar_settings_categories(ui),
-            });
+            // Hide the content pane when collapsed; the rail stays.
+            if !collapsed {
+                ui.separator();
+                ui.vertical(|ui| match self.sidebar_view {
+                    SidebarView::Sessions => self.sidebar_sessions(ui, ctx),
+                    SidebarView::Macros => self.sidebar_macros(ui),
+                    SidebarView::Files => self.sidebar_files(ui, ctx),
+                    SidebarView::Tools => self.sidebar_tools(ui),
+                    SidebarView::Vault => self.sidebar_vault(ui),
+                    SidebarView::Settings => self.sidebar_settings_categories(ui),
+                });
+            }
         });
+        if let Some(view) = clicked {
+            if view == prev {
+                // Re-clicking the current view toggles the pane (where applicable).
+                if self.can_collapse_sidebar() {
+                    self.sidebar_collapsed = !self.sidebar_collapsed;
+                }
+            } else {
+                self.sidebar_view = view;
+                self.sidebar_collapsed = false;
+            }
+        }
     }
 
     /// The Settings view's left pane: the category selector.
@@ -3668,8 +3789,9 @@ impl App {
         if new_credential {
             self.vault_selected = None;
             self.vault_form = Some(SecretForm::new());
-            self.vault_show_value = true;
-            self.vault_show_passphrase = true;
+            // Start masked — the eye button reveals it.
+            self.vault_show_value = false;
+            self.vault_show_passphrase = false;
         }
         if import {
             self.import_vault();
@@ -4870,18 +4992,32 @@ impl App {
         }
     }
 
+    /// Whether the left pane can be collapsed right now: only for the tab-showing
+    /// views (Sessions / Files / Macros) and only when a tab is actually open. In
+    /// Tools / Vault / Settings the pane *is* the content, so collapsing it makes
+    /// no sense.
+    fn can_collapse_sidebar(&self) -> bool {
+        !self.tabs.is_empty()
+            && !matches!(
+                self.sidebar_view,
+                SidebarView::Tools | SidebarView::Vault | SidebarView::Settings
+            )
+    }
+
     fn central(&mut self, ui: &mut egui::Ui) {
         // Left-rail views (Settings / Tools / Vault) replace the terminal area.
+        // A small left margin keeps their content off the pane edge.
+        let pad = egui::Frame::new().inner_margin(egui::Margin { left: 10, right: 0, top: 0, bottom: 0 });
         if self.sidebar_view == SidebarView::Settings {
-            self.render_settings(ui);
+            pad.show(ui, |ui| self.render_settings(ui));
             return;
         }
         if self.sidebar_view == SidebarView::Tools {
-            self.render_tools(ui);
+            pad.show(ui, |ui| self.render_tools(ui));
             return;
         }
         if self.sidebar_view == SidebarView::Vault {
-            self.render_vault_view(ui);
+            pad.show(ui, |ui| self.render_vault_view(ui));
             return;
         }
         match self.tabs.get(self.active).map(|t| &t.content) {
@@ -8221,19 +8357,28 @@ impl App {
         let mut save = false;
         let mut cancel = false;
         if let Dialog::CreateCredential(prompt) = &mut self.dialog {
+            let expected_id = prompt.expected_id.clone();
             let form = &mut prompt.form;
             egui::Modal::new(egui::Id::new("create-credential")).show(ctx, |ui| {
                 ui.set_width(400.0);
                 ui.heading("Create credential");
                 ui.label(
                     RichText::new(format!(
-                        "This session needs a vault entry named '{}'. Create it now.",
-                        form.name
+                        "This session references a vault entry (id “{expected_id}”) that isn't \
+                         here yet. Create it — the id stays the same (so shared sessions resolve \
+                         for everyone), but you can change the name, type, and value.",
                     ))
                     .weak(),
                 );
                 ui.add_space(6.0);
                 egui::Grid::new("cred-fields").num_columns(2).show(ui, |ui| {
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.name)
+                            .hint_text(&expected_id)
+                            .desired_width(240.0),
+                    );
+                    ui.end_row();
                     ui.label("Type");
                     egui::ComboBox::from_id_salt("cred-kind")
                         .selected_text(secret_kind_label(form.kind))
@@ -8245,7 +8390,7 @@ impl App {
                     ui.label("Username");
                     ui.add(
                         egui::TextEdit::singleline(&mut form.username)
-                            .hint_text("(optional, overrides the session's)"),
+                            .hint_text("(optional)"),
                     );
                     ui.end_row();
                     match form.kind {
@@ -8298,26 +8443,34 @@ impl App {
         }
     }
 
-    /// Stores the prompted credential, then resumes connecting to its session.
+    /// Stores the prompted credential under the session's exact expected id, then
+    /// resumes connecting. The entry id is preserved (not derived from the name),
+    /// so the session — and any shared session referencing the same id — resolves
+    /// without rebinding anything.
     fn save_credential_and_connect(&mut self, ctx: &egui::Context) {
         let Dialog::CreateCredential(prompt) = &self.dialog else { return };
-        if prompt.form.value.is_empty() {
+        if prompt.form.value.trim().is_empty() {
             return self.set_credential_error("Enter the credential value.");
         }
-        let name = prompt.form.name.clone();
-        let secret = prompt.form.to_secret();
-        let mut session = prompt.then_connect.clone();
-        let id = match self.store_secret(&name, secret) {
-            Ok(id) => id,
-            Err(e) => return self.set_credential_error(&e),
+        let expected_id = prompt.expected_id.clone();
+        // A blank name falls back to the id.
+        let name = {
+            let n = prompt.form.name.trim();
+            if n.is_empty() { expected_id.clone() } else { n.to_owned() }
         };
-        // Bind the session to the new entry's id so it stays linked if renamed.
-        session.auth = Auth::Vault { entry: id };
-        if let Some((store, _)) = self.find_session_anywhere(&session.id) {
-            let _ = self.store_upsert(&store, session.clone());
+        let secret = prompt.form.to_secret();
+        let session = prompt.then_connect.clone();
+        let result = match self.vault.unlocked_mut() {
+            Some(vault) => vault.add_with_id(&expected_id, &name, secret).map_err(|e| format!("{e:#}")),
+            None => Err("Unlock or create the vault first.".into()),
+        };
+        if let Err(e) = result {
+            return self.set_credential_error(&e);
         }
         self.dialog = Dialog::None;
-        self.start_connect(&session, ctx);
+        // The session already references `expected_id`, which now exists. Re-enter
+        // by protocol so RDP/VNC open a native tab (not an SSH terminal).
+        self.connect_session(&session, ctx);
     }
 
     fn set_credential_error(&mut self, message: &str) {
@@ -9380,7 +9533,7 @@ impl App {
                             ui.label("Username");
                             ui.add(
                                 egui::TextEdit::singleline(&mut form.username)
-                                    .hint_text("(optional, overrides session)"),
+                                    .hint_text("(optional)"),
                             );
                             ui.end_row();
                             match form.kind {
@@ -9617,6 +9770,18 @@ impl eframe::App for App {
             self.vault_migrated = true;
         }
 
+        // A connection URI passed at launch is handled once the vault has had a
+        // chance to auto-unlock, so a matched session's credentials are available.
+        if (self.vault_migrated || self.vault.unlocked().is_none())
+            && let Some(uri) = self.pending_uri.take()
+        {
+            self.handle_connect_uri(&uri, &ctx);
+        }
+        // URIs handed off by a second instance (while this one was running).
+        while let Ok(uri) = self.uri_rx.try_recv() {
+            self.handle_connect_uri(&uri, &ctx);
+        }
+
         // Deliver a requested clipboard paste to the active remote session.
         self.drain_remote_paste(&ctx);
 
@@ -9781,11 +9946,14 @@ impl eframe::App for App {
             .show(ui, |ui| self.title_bar(ui, &ctx))
             .response
             .rect;
-        egui::Panel::left("sessions")
-            .resizable(true)
-            .default_size(240.0)
-            .size_range(160.0..=420.0)
-            .show(ui, |ui| self.sidebar(ui, &ctx));
+        // Collapse the pane to just the icon rail when the user hid it.
+        let left = egui::Panel::left("sessions");
+        let left = if self.sidebar_collapsed && self.can_collapse_sidebar() {
+            left.resizable(false).default_size(48.0).size_range(48.0..=48.0)
+        } else {
+            left.resizable(true).default_size(240.0).size_range(160.0..=420.0)
+        };
+        left.show(ui, |ui| self.sidebar(ui, &ctx));
         egui::Panel::top("tabs").show(ui, |ui| self.tab_strip(ui));
         if let Some(error) = self.error.clone() {
             egui::Panel::bottom("error").show(ui, |ui| {

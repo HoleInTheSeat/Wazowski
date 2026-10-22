@@ -17,6 +17,7 @@ mod smb_ui;
 mod sources;
 mod servers_ui;
 mod update;
+mod uri;
 
 use std::fs::{File, OpenOptions};
 
@@ -40,6 +41,9 @@ fn acquire_instance_lock() -> Option<File> {
 fn main() -> eframe::Result {
     conn_log::init();
 
+    // A connection URI argument (ssh:// or telnet://), e.g. from a browser.
+    let launch_uri = std::env::args().skip(1).find(|a| uri::is_connect_uri(a));
+
     // Single-instance guard, unless the user allowed multiple instances.
     let settings = Settings::load_or_default();
     let instance_lock = if settings.allow_multiple_instances {
@@ -48,10 +52,19 @@ fn main() -> eframe::Result {
         match acquire_instance_lock() {
             Some(lock) => Some(lock),
             None => {
-                eprintln!(
-                    "Wazowski is already running. Enable \"Allow multiple instances\" in \
-                     Settings to run more than one."
-                );
+                // Another instance owns the window. If we were launched to open a
+                // URI, hand it off so it opens there (a new tab) instead of here.
+                match &launch_uri {
+                    Some(u) => {
+                        if let Err(e) = uri::write_to_inbox(u) {
+                            eprintln!("Could not hand off the connection to Wazowski: {e}");
+                        }
+                    }
+                    None => eprintln!(
+                        "Wazowski is already running. Enable \"Allow multiple instances\" in \
+                         Settings to run more than one."
+                    ),
+                }
                 return Ok(());
             }
         }
@@ -71,6 +84,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Wazowski",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, instance_lock)))),
+        Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, instance_lock, launch_uri)))),
     )
 }

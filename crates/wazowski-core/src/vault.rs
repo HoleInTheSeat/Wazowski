@@ -356,6 +356,28 @@ impl Vault {
         Ok(id)
     }
 
+    /// Adds an entry under an *explicit* id — used when a session (often a shared
+    /// one) references an entry id that doesn't exist here yet, so the created
+    /// entry matches exactly regardless of the chosen display name. Errors if the
+    /// id or the name is already taken.
+    pub fn add_with_id(&mut self, id: &str, name: &str, secret: Secret) -> Result<()> {
+        let name = name.trim();
+        if id.is_empty() {
+            bail!("the entry needs an id");
+        }
+        if name.is_empty() {
+            bail!("the entry needs a name");
+        }
+        if self.doc.entries.contains_key(id) {
+            bail!("an entry with id '{id}' already exists");
+        }
+        if self.name_taken(name, None) {
+            bail!("an entry named '{name}' already exists");
+        }
+        self.doc.entries.insert(id.to_owned(), Entry { name: name.to_owned(), secret });
+        self.save()
+    }
+
     /// Replaces an existing entry's secret value (keeping its id and name).
     pub fn update_secret(&mut self, id: &str, secret: Secret) -> Result<()> {
         let entry = self.doc.entries.get_mut(id).context("that vault entry no longer exists")?;
@@ -662,6 +684,30 @@ mod tests {
         // A duplicate name is refused.
         vault.add("Other", Secret::Password { username: None, password: "q".into() }).unwrap();
         assert!(vault.rename(&id, "Other").is_err());
+    }
+
+    #[test]
+    fn add_with_id_forces_the_id_regardless_of_name() {
+        let dir = tempdir().unwrap();
+        let mut vault = Vault::create(dir.path().join("v.enc"), "pw").unwrap();
+        vault
+            .add_with_id(
+                "vnc-password",
+                "My VNC login",
+                Secret::Password { username: None, password: "p".into() },
+            )
+            .unwrap();
+        // The id is exactly what was requested, even though the name differs.
+        assert_eq!(vault.name_of("vnc-password"), Some("My VNC login"));
+        assert!(vault.get("vnc-password").is_some());
+        // A session referencing "vnc-password" now resolves.
+        assert!(vault.resolve("vnc-password").is_some());
+        // Re-adding the same id fails.
+        assert!(
+            vault
+                .add_with_id("vnc-password", "other", Secret::Password { username: None, password: "x".into() })
+                .is_err()
+        );
     }
 
     #[test]
