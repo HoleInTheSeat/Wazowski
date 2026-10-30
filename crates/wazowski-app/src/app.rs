@@ -6616,7 +6616,7 @@ impl App {
         }
         if let Some(algo) = gen_request {
             let passphrase = (!form.passphrase.is_empty()).then(|| form.passphrase.clone());
-            match wazowski_ssh::generate(algo, form.username.trim(), passphrase.as_deref()) {
+            match wazowski_ssh::generate(algo, &default_key_comment(), passphrase.as_deref()) {
                 Ok(k) => {
                     form.value = k.private_pem;
                     form.public = k.public_openssh;
@@ -9623,7 +9623,8 @@ impl App {
             Action::SaveForm => self.save_secret_form(),
             Action::GenerateOpen => {
                 if let Dialog::VaultManager(state) = &mut self.dialog {
-                    state.gen_form = Some(GenForm::default());
+                    // Prefill the comment with the default `<os-user>-wazowski`.
+                    state.gen_form = Some(GenForm { comment: default_key_comment(), ..Default::default() });
                     state.error = None;
                 }
             }
@@ -10705,6 +10706,18 @@ fn material_from(secret: &Secret) -> AuthMaterial {
         // password so a misconfigured session fails clearly rather than panics.
         Secret::Token { token, .. } => AuthMaterial::Password(token.clone()),
     }
+}
+
+/// The default comment for a generated SSH key: `<os-username>-wazowski`. The
+/// user can edit it (the Comment field, or the public-key box) before saving.
+fn default_key_comment() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .map(|u| u.trim().to_owned())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "user".to_owned());
+    format!("{user}-wazowski")
 }
 
 /// The display label for a credential kind.
