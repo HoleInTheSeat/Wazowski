@@ -43,7 +43,7 @@ async-tftp = "0.4"
 if-addrs = "0.13"
 wazowski-servers = { path = "crates/wazowski-servers" }
 
-rfd = "0.15"
+rfd = "0.17"
 wazowski-core = { path = "crates/wazowski-core" }
 wazowski-term = { path = "crates/wazowski-term" }
 wazowski-remote = { path = "crates/wazowski-remote" }
