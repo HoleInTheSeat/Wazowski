@@ -61,7 +61,7 @@ jobs:
           echo "ASSET=$asset" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ASSET }}
           path: dist/${{ env.ASSET }}
@@ -128,7 +128,7 @@ jobs:
           cp "$img" "dist/wazowski-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
 
       - name: Upload Linux packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wazowski-linux-packages
           path: dist/*
@@ -158,7 +158,7 @@ jobs:
           Copy-Item packaging/windows/Output/Wazowski-Setup.exe "dist/wazowski-${{ github.ref_name }}-windows-x86_64-setup.exe"
 
       - name: Upload Windows installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wazowski-windows-installer
           path: dist/*
