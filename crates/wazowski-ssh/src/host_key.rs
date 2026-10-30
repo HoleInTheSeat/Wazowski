@@ -198,7 +198,7 @@ mod tests {
         learn_known_hosts_path(host, port, &new, &path).unwrap();
 
         // Now the new key is trusted and the old one is gone (no more loop).
-        assert_eq!(check_known_hosts_path(host, port, &new, &path).unwrap(), true);
+        assert!(check_known_hosts_path(host, port, &new, &path).unwrap());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.contains(KEY_OLD.split(' ').nth(1).unwrap()));
         assert!(content.contains(KEY_NEW.split(' ').nth(1).unwrap()));
@@ -212,6 +212,6 @@ mod tests {
         // No prior entry: removal is a no-op, learn adds it.
         remove_stale_host_keys("fresh.test", 22, &new, &path).unwrap();
         learn_known_hosts_path("fresh.test", 22, &new, &path).unwrap();
-        assert_eq!(check_known_hosts_path("fresh.test", 22, &new, &path).unwrap(), true);
+        assert!(check_known_hosts_path("fresh.test", 22, &new, &path).unwrap());
     }
 }
