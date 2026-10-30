@@ -77,6 +77,36 @@ pub fn generate_ed25519(comment: &str) -> Result<GeneratedKey> {
     generate(KeyAlgo::Ed25519, comment, None)
 }
 
+/// Derives the OpenSSH public key from a private key, so a user who pastes only a
+/// private key gets the matching public key filled in for them.
+///
+/// The private key must be OpenSSH-format (`-----BEGIN OPENSSH PRIVATE KEY-----`);
+/// if it's encrypted, pass its `passphrase` so it can be opened. `comment`, when
+/// non-empty, sets the public key's comment (the same `<user>-wazowski` flow as
+/// generation); an empty `comment` keeps whatever the key already carries.
+///
+/// Returns an error for a key that isn't OpenSSH-format or can't be decrypted,
+/// so callers can fall back (e.g. ask for the public key) rather than guess.
+pub fn public_from_private(
+    pem: &str,
+    passphrase: Option<&str>,
+    comment: &str,
+) -> Result<String> {
+    let key = PrivateKey::from_openssh(pem.trim())
+        .context("this isn't an OpenSSH-format private key")?;
+    let key = if key.is_encrypted() {
+        key.decrypt(passphrase.unwrap_or(""))
+            .context("could not decrypt the private key (wrong passphrase?)")?
+    } else {
+        key
+    };
+    let mut public = key.public_key().clone();
+    if !comment.is_empty() {
+        public.set_comment(comment);
+    }
+    public.to_openssh().context("could not encode the public key")
+}
+
 /// Returns an OpenSSH private key that `ssh -i` can use without prompting: if the
 /// input is an encrypted OpenSSH key it is decrypted with `passphrase`; an
 /// already-unencrypted key is re-encoded as-is. Keys that aren't OpenSSH-format
@@ -151,6 +181,30 @@ mod tests {
 
         // Non-OpenSSH text is passed through untouched for ssh to handle.
         assert_eq!(to_unencrypted_openssh("not a key", None).unwrap(), "not a key");
+    }
+
+    #[test]
+    fn derives_public_from_private() {
+        // A plain key: deriving reproduces its public half, with our comment.
+        let pair = generate(KeyAlgo::Ed25519, "orig-comment", None).unwrap();
+        let derived = public_from_private(&pair.private_pem, None, "dbusse-wazowski").unwrap();
+        let a = PublicKey::from_openssh(&derived).unwrap();
+        let b = PublicKey::from_openssh(&pair.public_openssh).unwrap();
+        assert_eq!(a.key_data(), b.key_data());
+        assert!(derived.ends_with(" dbusse-wazowski"), "comment should be applied: {derived}");
+
+        // An empty comment keeps the key's own.
+        let kept = public_from_private(&pair.private_pem, None, "").unwrap();
+        assert!(kept.ends_with(" orig-comment"), "empty comment keeps the original: {kept}");
+
+        // An encrypted key needs its passphrase.
+        let enc = generate(KeyAlgo::Ed25519, "", Some("pw")).unwrap();
+        assert!(public_from_private(&enc.private_pem, None, "x").is_err());
+        let ok = public_from_private(&enc.private_pem, Some("pw"), "x").unwrap();
+        assert!(ok.starts_with("ssh-ed25519 "));
+
+        // Non-OpenSSH text is an error, so the caller can fall back.
+        assert!(public_from_private("not a key", None, "x").is_err());
     }
 
     #[test]

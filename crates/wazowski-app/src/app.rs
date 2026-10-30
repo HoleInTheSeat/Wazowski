@@ -804,6 +804,13 @@ struct SecretForm {
     value: String,
     /// For a keypair: the optional public key (OpenSSH single-line form).
     public: String,
+    /// For a keypair: the comment to put on an auto-derived public key
+    /// (`<os-username>-wazowski` by default, like the generate flow).
+    comment: String,
+    /// Whether the public-key box was filled by deriving it from the private key
+    /// (so editing the comment or passphrase can refresh it, but a public key the
+    /// user typed themselves is left alone).
+    public_derived: bool,
     passphrase: String,
     /// For an existing private key: whether it has a passphrase (so the field
     /// can hint one is set before the value is revealed). Not used when saving.
@@ -835,8 +842,27 @@ impl SecretForm {
             username: String::new(),
             value: String::new(),
             public: String::new(),
+            comment: default_key_comment(),
+            public_derived: false,
             passphrase: String::new(),
             has_passphrase: false,
+        }
+    }
+
+    /// Derives the public key from the entered private key (using the comment and
+    /// passphrase) and fills the public-key box. A no-op if there's no private key
+    /// yet or it can't be parsed/decrypted (e.g. an encrypted key before its
+    /// passphrase is typed); marks the box as derived so later edits refresh it.
+    fn derive_public_key(&mut self) {
+        if self.value.trim().is_empty() {
+            return;
+        }
+        let passphrase = (!self.passphrase.is_empty()).then_some(self.passphrase.as_str());
+        if let Ok(public) =
+            wazowski_ssh::public_from_private(&self.value, passphrase, self.comment.trim())
+        {
+            self.public = public;
+            self.public_derived = true;
         }
     }
 
@@ -3986,6 +4012,8 @@ impl App {
             username: username.unwrap_or_default(),
             value: String::new(),
             public,
+            comment: default_key_comment(),
+            public_derived: false,
             passphrase: String::new(),
             has_passphrase,
         });
@@ -6427,6 +6455,7 @@ impl App {
         let (mut save, mut delete, mut reveal, mut cancel) = (false, false, false, false);
         let mut eye_clicked = false;
         let mut eye_clicked_pass = false;
+        let mut derive_public = false;
         let mut gen_request: Option<wazowski_ssh::KeyAlgo> = None;
 
         ui.heading(if editing { "Edit credential" } else { "New credential" });
@@ -6491,12 +6520,17 @@ impl App {
                     ui.label("Private key:");
                     ui.horizontal(|ui| {
                         if show {
-                            ui.add(
+                            let resp = ui.add(
                                 egui::TextEdit::multiline(&mut form.value)
                                     .hint_text(if editing { "" } else { "-----BEGIN ..." })
                                     .desired_width(360.0)
                                     .desired_rows(6),
                             );
+                            // Paste or type a private key and the public half is
+                            // filled in automatically (when the public box is empty).
+                            if resp.changed() && form.public.trim().is_empty() {
+                                derive_public = true;
+                            }
                         } else {
                             // Masked placeholder (multiline can't show asterisks).
                             let mut masked = if form.value.is_empty() && !editing {
@@ -6512,26 +6546,53 @@ impl App {
                         eye_clicked |= eye_button(ui, show);
                     });
                     ui.add_space(6.0);
-                    ui.label("Public key:");
-                    ui.add(
+                    ui.label("Comment:");
+                    // The comment put on an auto-derived public key (defaults to
+                    // <os-username>-wazowski, the same as the generate flow).
+                    let comment_resp = ui.add(
+                        egui::TextEdit::singleline(&mut form.comment)
+                            .hint_text("<user>-wazowski")
+                            .desired_width(300.0),
+                    );
+                    // Editing the comment refreshes a public key we derived.
+                    if comment_resp.changed() && form.public_derived {
+                        derive_public = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Public key:");
+                        if ui.small_button("Derive from private key").clicked() {
+                            derive_public = true;
+                        }
+                    });
+                    let public_resp = ui.add(
                         egui::TextEdit::multiline(&mut form.public)
                             .font(egui::TextStyle::Monospace)
-                            .hint_text("(optional) ssh-ed25519 AAAA… user@host")
+                            .hint_text("auto-filled from the private key, or paste ssh-ed25519 AAAA…")
                             .desired_width(360.0)
                             .desired_rows(2),
                     );
+                    // A public key the user edits by hand is theirs; stop refreshing it.
+                    if public_resp.changed() {
+                        form.public_derived = false;
+                    }
                     ui.add_space(6.0);
                     ui.label("Passphrase:");
                     // Before reveal we can't show the value, but we know whether
                     // one is set: dots = set (hidden), "(none)" = no passphrase.
                     let pp_hint = if form.has_passphrase { "••••••••" } else { "(none)" };
                     ui.horizontal(|ui| {
-                        ui.add(
+                        let resp = ui.add(
                             egui::TextEdit::singleline(&mut form.passphrase)
                                 .password(!show_pass)
                                 .hint_text(pp_hint)
                                 .desired_width(300.0),
                         );
+                        // An encrypted key can only be opened once its passphrase is
+                        // typed, so retry the derivation when the passphrase changes.
+                        if resp.changed() && (form.public.trim().is_empty() || form.public_derived) {
+                            derive_public = true;
+                        }
                         eye_clicked_pass |= eye_button(ui, show_pass);
                     });
                 }
@@ -6571,6 +6632,12 @@ impl App {
             } else {
                 self.vault_show_passphrase = true;
             }
+        }
+
+        // Auto-fill the public key from the pasted private key (live, and as a
+        // safety net on save in case the field wasn't touched this frame).
+        if derive_public || (save && form.kind == SecretKind::Key && form.public.trim().is_empty()) {
+            form.derive_public_key();
         }
 
         if cancel {
@@ -8356,6 +8423,7 @@ impl App {
     fn show_create_credential(&mut self, ctx: &egui::Context) {
         let mut save = false;
         let mut cancel = false;
+        let mut derive_public = false;
         if let Dialog::CreateCredential(prompt) = &mut self.dialog {
             let expected_id = prompt.expected_id.clone();
             let form = &mut prompt.form;
@@ -8404,22 +8472,50 @@ impl App {
                         }
                         SecretKind::Key => {
                             ui.label("Private key");
-                            ui.add(
+                            let resp = ui.add(
                                 egui::TextEdit::multiline(&mut form.value)
                                     .hint_text("Paste the PEM private key")
                                     .desired_rows(3),
                             );
+                            // Paste a private key and the public half fills itself in.
+                            if resp.changed() && form.public.trim().is_empty() {
+                                derive_public = true;
+                            }
                             ui.end_row();
-                            ui.label("Public key");
-                            ui.add(
+                            ui.label("Comment");
+                            let comment_resp = ui.add(
+                                egui::TextEdit::singleline(&mut form.comment)
+                                    .hint_text("<user>-wazowski"),
+                            );
+                            if comment_resp.changed() && form.public_derived {
+                                derive_public = true;
+                            }
+                            ui.end_row();
+                            ui.horizontal(|ui| {
+                                ui.label("Public key");
+                                if ui.small_button("Derive").clicked() {
+                                    derive_public = true;
+                                }
+                            });
+                            let public_resp = ui.add(
                                 egui::TextEdit::multiline(&mut form.public)
                                     .desired_rows(2)
                                     .font(egui::TextStyle::Monospace)
-                                    .hint_text("(optional) ssh-ed25519 AAAA… user@host"),
+                                    .hint_text("auto-filled from the private key"),
                             );
+                            if public_resp.changed() {
+                                form.public_derived = false;
+                            }
                             ui.end_row();
                             ui.label("Passphrase");
-                            ui.add(egui::TextEdit::singleline(&mut form.passphrase).password(true));
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut form.passphrase).password(true),
+                            );
+                            // An encrypted key opens only once its passphrase is typed.
+                            if resp.changed() && (form.public.trim().is_empty() || form.public_derived)
+                            {
+                                derive_public = true;
+                            }
                             ui.end_row();
                         }
                     }
@@ -8434,6 +8530,13 @@ impl App {
                     }
                 });
             });
+            // Auto-fill the public key from the pasted private key (live, and as a
+            // safety net on save) before the credential is stored.
+            if derive_public
+                || (save && form.kind == SecretKind::Key && form.public.trim().is_empty())
+            {
+                form.derive_public_key();
+            }
         }
         if save {
             self.save_credential_and_connect(ctx);
@@ -9707,6 +9810,8 @@ impl App {
                 username,
                 value: String::new(),
                 public,
+                comment: default_key_comment(),
+                public_derived: false,
                 passphrase: String::new(),
                 has_passphrase,
             });
