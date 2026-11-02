@@ -34,7 +34,7 @@ jobs:
             bin: wazowski.exe
             ext: ".exe"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -61,7 +61,7 @@ jobs:
           echo "ASSET=$asset" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ASSET }}
           path: dist/${{ env.ASSET }}
@@ -70,7 +70,7 @@ jobs:
     name: Package Linux (RPM + AppImage)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build + packaging dependencies
         run: |
@@ -128,7 +128,7 @@ jobs:
           cp "$img" "dist/wazowski-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
 
       - name: Upload Linux packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wazowski-linux-packages
           path: dist/*
@@ -137,7 +137,7 @@ jobs:
     name: Package Windows (installer)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -158,7 +158,7 @@ jobs:
           Copy-Item packaging/windows/Output/Wazowski-Setup.exe "dist/wazowski-${{ github.ref_name }}-windows-x86_64-setup.exe"
 
       - name: Upload Windows installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wazowski-windows-installer
           path: dist/*
@@ -174,11 +174,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Publish to GitHub Releases
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*
           generate_release_notes: true
