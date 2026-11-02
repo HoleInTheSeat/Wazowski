@@ -1,7 +1,7 @@
 //! The Wazowski application: tabs, the session-manager sidebar, the encrypted
 //! vault, and the dialogs that tie them together.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, RichText};
@@ -630,6 +630,31 @@ enum Dialog {
     About,
     /// Prompt for a username/password at connect time.
     ConnectCreds(Box<ConnectCredsForm>),
+    /// Apply a color and/or icon to several selected sessions at once.
+    BulkStyle {
+        store: StoreId,
+        ids: Vec<String>,
+        icon: String,
+        color: Option<[u8; 3]>,
+        set_icon: bool,
+        set_color: bool,
+    },
+    /// Apply one auth choice (and optional username) to several selected sessions.
+    BulkCredentials(Box<BulkCredsForm>),
+}
+
+/// Fields for the bulk "Set credentials" dialog.
+struct BulkCredsForm {
+    store: StoreId,
+    ids: Vec<String>,
+    auth: AuthChoice,
+    /// Selected vault entry id when `auth` is `Vault` (empty = none).
+    entry: String,
+    picker: VaultPickerState,
+    /// Whether to also overwrite each session's username.
+    set_username: bool,
+    username: String,
+    error: Option<String>,
 }
 
 /// Fields for the macro editor dialog.
@@ -1126,6 +1151,12 @@ pub struct App {
     app_icon: Option<egui::TextureHandle>,
     /// The keybinding action awaiting a new key press (Settings ▸ Keybindings).
     keybind_capturing: Option<Action>,
+    /// Multi-selection in the sessions pane. Selection lives in exactly one store
+    /// at a time (`sel_store`); `sel_ids` are the chosen session ids within it, and
+    /// `sel_anchor` is the pivot for Shift-range selection.
+    sel_store: Option<StoreId>,
+    sel_ids: HashSet<String>,
+    sel_anchor: Option<String>,
     /// Per-pane quick-filter text (Sessions/Macros/Files/Tools/Vault/Settings).
     filter_sessions: String,
     filter_macros: String,
@@ -1497,6 +1528,9 @@ impl App {
             vault_show_passphrase: false,
             app_icon: load_app_icon(ctx),
             keybind_capturing: None,
+            sel_store: None,
+            sel_ids: HashSet::new(),
+            sel_anchor: None,
             filter_sessions: String::new(),
             filter_macros: String::new(),
             filter_files: String::new(),
@@ -4268,8 +4302,11 @@ impl App {
             }
         }
 
-        // Local sessions.
-        render_store(ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action, &filter);
+        // Local sessions. The selection is passed only to the store that owns it.
+        let local_sel = (self.sel_store == Some(StoreId::Local)).then_some(&self.sel_ids);
+        render_store(
+            ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action, &filter, local_sel,
+        );
 
         // Each shared source as its own collapsible section.
         for source in &self.shared {
@@ -4288,11 +4325,14 @@ impl App {
                 .default_open(true);
             let store = StoreId::Shared(source.id().to_owned());
             let editable = source.available();
+            let share_sel = (self.sel_store.as_ref() == Some(&store)).then_some(&self.sel_ids);
             let resp = header.show(ui, |ui| {
                 if let Some(note) = source.status() {
                     ui.label(RichText::new(format!("⚠ {note}")).color(ui.visuals().warn_fg_color));
                 }
-                render_store(ui, &store, source.store(), editable, &destinations, &mut action, &filter);
+                render_store(
+                    ui, &store, source.store(), editable, &destinations, &mut action, &filter, share_sel,
+                );
             });
             let desc = source.description().to_owned();
             let hint = source_hint(source.def());
@@ -4352,6 +4392,10 @@ impl App {
         // Fill the remaining blank space as a drop zone + right-click menu for
         // the local store, so the whole empty pane is usable.
         let bg = ui.allocate_response(ui.available_size(), egui::Sense::click());
+        // Clicking empty space clears the multi-selection.
+        if bg.clicked() {
+            self.clear_selection();
+        }
         if let Some(payload) = bg.dnd_release_payload::<DragPayload>() {
             action = Some(TreeAction::Dropped {
                 payload: (*payload).clone(),
@@ -4571,10 +4615,205 @@ impl App {
                     Ok(())
                 }
             }
+            TreeAction::Select { store, id, ctrl, shift } => {
+                self.update_selection(store, id, ctrl, shift);
+                Ok(())
+            }
+            TreeAction::BulkConnect(store, ids) => {
+                for id in ids {
+                    if let Some(session) = self.session_in(&store, &id) {
+                        self.connect_session(&session, ctx);
+                    }
+                }
+                Ok(())
+            }
+            TreeAction::BulkDelete(store, ids) => {
+                let mut last = Ok(());
+                for id in &ids {
+                    if let Err(e) = self.store_remove(&store, id) {
+                        last = Err(e);
+                    }
+                }
+                self.clear_selection();
+                last
+            }
+            TreeAction::BulkDuplicate(store, ids) => {
+                let mut last = Ok(());
+                for id in &ids {
+                    if let Some(original) = self.session_in(&store, id) {
+                        let mut copy = original.clone();
+                        copy.id = Session::new("", "", "").id; // fresh id
+                        copy.name = format!("{} copy", original.name);
+                        if let Err(e) = self.store_upsert(&store, copy) {
+                            last = Err(e);
+                        }
+                    }
+                }
+                last
+            }
+            TreeAction::BulkMoveTo { from, ids, to, folder } => {
+                let mut last = Ok(());
+                for id in &ids {
+                    let r = if from == to {
+                        self.store_move(&from, id, &folder)
+                    } else if let Some(mut session) = self.session_in(&from, id) {
+                        session.folder = folder.clone();
+                        self.store_upsert(&to, session).and_then(|()| self.store_remove(&from, id))
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(e) = r {
+                        last = Err(e);
+                    }
+                }
+                self.clear_selection();
+                last
+            }
+            TreeAction::BulkCopyTo { from, ids, to, folder } => {
+                let mut last = Ok(());
+                for id in &ids {
+                    if let Some(original) = self.session_in(&from, id) {
+                        let mut copy = original.clone();
+                        copy.id = Session::new("", "", "").id; // fresh id so it's independent
+                        copy.folder = folder.clone();
+                        if let Err(e) = self.store_upsert(&to, copy) {
+                            last = Err(e);
+                        }
+                    }
+                }
+                last
+            }
+            TreeAction::BulkStyle(store, ids) => {
+                self.dialog = Dialog::BulkStyle {
+                    store,
+                    ids,
+                    icon: String::new(),
+                    color: None,
+                    set_icon: false,
+                    set_color: false,
+                };
+                Ok(())
+            }
+            TreeAction::BulkCredentials(store, ids) => {
+                self.dialog = Dialog::BulkCredentials(Box::new(BulkCredsForm {
+                    store,
+                    ids,
+                    auth: AuthChoice::Vault,
+                    entry: String::new(),
+                    picker: VaultPickerState::default(),
+                    set_username: false,
+                    username: String::new(),
+                    error: None,
+                }));
+                Ok(())
+            }
+            TreeAction::BulkExport(store, ids) => self.export_sessions(&store, &ids),
         };
         if let Err(e) = result {
             self.error = Some(format!("{e:#}"));
         }
+    }
+
+    // --- Session multi-selection -------------------------------------------
+
+    /// Clears the sessions-pane multi-selection.
+    fn clear_selection(&mut self) {
+        self.sel_store = None;
+        self.sel_ids.clear();
+        self.sel_anchor = None;
+    }
+
+    /// Applies a click on `id` in `store` to the selection. `ctrl` toggles the one
+    /// row, `shift` selects the range from the anchor, neither selects just it.
+    /// Selection is confined to a single store, so clicking in another store first
+    /// resets it.
+    fn update_selection(&mut self, store: StoreId, id: String, ctrl: bool, shift: bool) {
+        if self.sel_store.as_ref() != Some(&store) {
+            // Selection moves to the newly clicked store.
+            self.sel_store = Some(store.clone());
+            self.sel_ids.clear();
+            self.sel_anchor = None;
+        }
+        if shift && self.sel_anchor.is_some() {
+            let anchor = self.sel_anchor.clone().unwrap();
+            let order = self.session_visible_order(&store);
+            let (ai, bi) = (
+                order.iter().position(|x| *x == anchor),
+                order.iter().position(|x| *x == id),
+            );
+            if let (Some(mut a), Some(mut b)) = (ai, bi) {
+                if a > b {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                self.sel_ids = order[a..=b].iter().cloned().collect();
+            } else {
+                // Anchor no longer visible — fall back to a single selection.
+                self.sel_ids.clear();
+                self.sel_ids.insert(id.clone());
+                self.sel_anchor = Some(id);
+            }
+        } else if ctrl {
+            if !self.sel_ids.remove(&id) {
+                self.sel_ids.insert(id.clone());
+            }
+            self.sel_anchor = Some(id);
+        } else {
+            self.sel_ids.clear();
+            self.sel_ids.insert(id.clone());
+            self.sel_anchor = Some(id);
+        }
+        if self.sel_ids.is_empty() {
+            self.clear_selection();
+        }
+    }
+
+    /// The session ids of `store` in the order the tree renders them (root
+    /// sessions, then folders alphabetically, recursing), honouring the active
+    /// name filter — the order Shift-range selection walks.
+    fn session_visible_order(&self, store: &StoreId) -> Vec<String> {
+        let Some(data) = self.store_ref(store) else { return Vec::new() };
+        let filter = self.filter_sessions.to_lowercase();
+        let mut root = FolderNode::default();
+        for folder in data.folders() {
+            root.at(&folder);
+        }
+        for session in data.all() {
+            if !filter.is_empty() && !session.name.to_lowercase().contains(&filter) {
+                continue;
+            }
+            root.at(&session.folder).sessions.push(session);
+        }
+        let mut out = Vec::new();
+        fn walk(node: &FolderNode, out: &mut Vec<String>) {
+            for s in &node.sessions {
+                out.push(s.id.clone());
+            }
+            for child in node.children.values() {
+                walk(child, out);
+            }
+        }
+        walk(&root, &mut out);
+        out
+    }
+
+    /// Exports the given sessions to a JSON file the user picks.
+    fn export_sessions(&mut self, store: &StoreId, ids: &[String]) -> anyhow::Result<()> {
+        let sessions: Vec<Session> =
+            ids.iter().filter_map(|id| self.session_in(store, id)).collect();
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export selected sessions")
+            .set_file_name("wazowski-sessions.json")
+            .add_filter("JSON", &["json"])
+            .save_file()
+        else {
+            return Ok(());
+        };
+        let json = serde_json::to_string_pretty(&sessions)?;
+        std::fs::write(&path, json)?;
+        Ok(())
     }
 
     // --- Store routing ------------------------------------------------------
@@ -6810,6 +7049,175 @@ impl App {
             Dialog::ConfirmMacro { .. } => self.show_confirm_macro(ctx),
             Dialog::About => self.show_about(ctx),
             Dialog::ConnectCreds(_) => self.show_connect_creds(ctx),
+            Dialog::BulkStyle { .. } => self.show_bulk_style(ctx),
+            Dialog::BulkCredentials(_) => self.show_bulk_credentials(ctx),
+        }
+    }
+
+    /// The bulk "Set color / icon" dialog: apply either/both to all selected.
+    fn show_bulk_style(&mut self, ctx: &egui::Context) {
+        let mut apply = false;
+        let mut cancel = false;
+        if let Dialog::BulkStyle { ids, icon, color, set_icon, set_color, .. } = &mut self.dialog {
+            let count = ids.len();
+            egui::Modal::new(egui::Id::new("bulk-style")).show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.heading("Set color / icon");
+                ui.label(RichText::new(format!("Applies to {count} selected sessions.")).weak());
+                ui.add_space(6.0);
+                ui.checkbox(set_icon, "Set icon (emoji)");
+                if *set_icon {
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        ui.add(egui::TextEdit::singleline(icon).desired_width(70.0).hint_text("emoji"));
+                        ui.label(RichText::new("leave blank to clear").weak());
+                    });
+                }
+                ui.add_space(4.0);
+                ui.checkbox(set_color, "Set color");
+                if *set_color {
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        let mut rgb = color.unwrap_or([200, 200, 200]);
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            *color = Some(rgb);
+                        }
+                        if ui.button("Clear color").clicked() {
+                            *color = None;
+                        }
+                        ui.label(RichText::new(if color.is_some() { "" } else { "(default)" }).weak());
+                    });
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    apply = ui.button("Apply").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+            return;
+        }
+        if apply
+            && let Dialog::BulkStyle { store, ids, icon, color, set_icon, set_color } =
+                std::mem::replace(&mut self.dialog, Dialog::None)
+        {
+            let mut last = Ok(());
+            for id in &ids {
+                if let Some(mut s) = self.session_in(&store, id) {
+                    if set_icon {
+                        s.icon = icon.trim().to_owned();
+                    }
+                    if set_color {
+                        s.color = color;
+                    }
+                    if let Err(e) = self.store_upsert(&store, s) {
+                        last = Err(e);
+                    }
+                }
+            }
+            if let Err(e) = last {
+                self.error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    /// The bulk "Set credentials" dialog: apply one auth choice (Prompt or a vault
+    /// entry) and optionally a username to all selected sessions.
+    fn show_bulk_credentials(&mut self, ctx: &egui::Context) {
+        let mut apply = false;
+        let mut cancel = false;
+        let entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
+        if let Dialog::BulkCredentials(form) = &mut self.dialog {
+            let count = form.ids.len();
+            egui::Modal::new(egui::Id::new("bulk-credentials")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.heading("Set credentials");
+                ui.label(RichText::new(format!("Applies to {count} selected sessions.")).weak());
+                ui.add_space(6.0);
+                egui::ComboBox::from_id_salt("bulk-auth")
+                    .selected_text(form.auth.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut form.auth, AuthChoice::Vault, AuthChoice::Vault.label());
+                        ui.selectable_value(
+                            &mut form.auth,
+                            AuthChoice::Prompt,
+                            AuthChoice::Prompt.label(),
+                        );
+                    });
+                if form.auth == AuthChoice::Vault {
+                    ui.add_space(4.0);
+                    if entries.is_empty() {
+                        ui.label(RichText::new("The vault has no entries (or is locked).").weak());
+                    } else {
+                        let all = [
+                            SecretCategory::Password,
+                            SecretCategory::Key,
+                            SecretCategory::Token,
+                        ];
+                        vault_picker_ui(ui, &entries, &all, &mut form.entry, &mut form.picker);
+                    }
+                }
+                ui.add_space(6.0);
+                ui.checkbox(&mut form.set_username, "Also set username");
+                if form.set_username {
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.username)
+                                .desired_width(200.0)
+                                .hint_text("username"),
+                        );
+                    });
+                }
+                if let Some(err) = &form.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(Color32::LIGHT_RED, err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    apply = ui.button("Apply").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+            return;
+        }
+        if apply {
+            // Validate before consuming the dialog.
+            if let Dialog::BulkCredentials(form) = &mut self.dialog
+                && form.auth == AuthChoice::Vault
+                && form.entry.is_empty()
+            {
+                form.error = Some("Pick a vault entry, or choose Prompt Everytime.".into());
+                return;
+            }
+            if let Dialog::BulkCredentials(form) =
+                std::mem::replace(&mut self.dialog, Dialog::None)
+            {
+                let auth = match form.auth {
+                    AuthChoice::Prompt => Auth::Prompt,
+                    AuthChoice::Vault => Auth::Vault { entry: form.entry.clone() },
+                };
+                let mut last = Ok(());
+                for id in &form.ids {
+                    if let Some(mut s) = self.session_in(&form.store, id) {
+                        s.auth = auth.clone();
+                        if form.set_username {
+                            s.username = form.username.trim().to_owned();
+                        }
+                        if let Err(e) = self.store_upsert(&form.store, s) {
+                            last = Err(e);
+                        }
+                    }
+                }
+                if let Err(e) = last {
+                    self.error = Some(format!("{e:#}"));
+                }
+            }
         }
     }
 
@@ -10195,6 +10603,21 @@ enum TreeAction {
     RemoveSource(String),
     /// A drag-and-drop release onto a folder (or root) of a destination store.
     Dropped { payload: DragPayload, to: StoreId, folder: String },
+    /// A click on a session row that changes the multi-selection. `ctrl` toggles,
+    /// `shift` extends a range from the anchor, neither selects just this one.
+    Select { store: StoreId, id: String, ctrl: bool, shift: bool },
+    /// Bulk actions over several selected sessions in one store.
+    BulkConnect(StoreId, Vec<String>),
+    BulkDelete(StoreId, Vec<String>),
+    BulkDuplicate(StoreId, Vec<String>),
+    BulkMoveTo { from: StoreId, ids: Vec<String>, to: StoreId, folder: String },
+    BulkCopyTo { from: StoreId, ids: Vec<String>, to: StoreId, folder: String },
+    /// Open the dialog to apply a color/icon to all selected sessions.
+    BulkStyle(StoreId, Vec<String>),
+    /// Open the dialog to apply one auth choice to all selected sessions.
+    BulkCredentials(StoreId, Vec<String>),
+    /// Export the selected sessions to a JSON file.
+    BulkExport(StoreId, Vec<String>),
 }
 
 /// Renders one store's folders and sessions, emitting a [`TreeAction`] on
@@ -10242,6 +10665,7 @@ fn render_store(
     destinations: &[Destination],
     action: &mut Option<TreeAction>,
     filter: &str,
+    sel: Option<&HashSet<String>>,
 ) {
     // Build a nested tree; folder paths synthesize their ancestor nodes. When a
     // filter is active, only sessions whose name matches are included (and empty
@@ -10260,7 +10684,7 @@ fn render_store(
 
     // Root-level sessions, then each top-level folder recursively.
     for &session in &root.sessions {
-        session_row(ui, store, session, destinations, editable, action);
+        session_row(ui, store, session, destinations, editable, action, sel);
     }
     let children: Vec<_> = root.children.iter().collect();
     for (segment, node) in children {
@@ -10268,7 +10692,7 @@ fn render_store(
             continue;
         }
         render_folder(
-            ui, store, sessions, segment, segment, node, destinations, editable, action, filter,
+            ui, store, sessions, segment, segment, node, destinations, editable, action, filter, sel,
         );
     }
 }
@@ -10287,6 +10711,7 @@ fn render_folder<'a>(
     editable: bool,
     action: &mut Option<TreeAction>,
     filter: &str,
+    sel: Option<&HashSet<String>>,
 ) {
     use egui::containers::collapsing_header::CollapsingState;
 
@@ -10337,7 +10762,7 @@ fn render_folder<'a>(
             })
             .body(|ui| {
                 for &session in &node.sessions {
-                    session_row(ui, store, session, destinations, editable, action);
+                    session_row(ui, store, session, destinations, editable, action, sel);
                 }
                 for (child_segment, child) in &node.children {
                     if !filter.is_empty() && !child.has_sessions() {
@@ -10346,7 +10771,7 @@ fn render_folder<'a>(
                     let child_full = format!("{full}/{child_segment}");
                     render_folder(
                         ui, store, data, child_segment, &child_full, child, destinations,
-                        editable, action, filter,
+                        editable, action, filter, sel,
                     );
                 }
             });
@@ -10576,6 +11001,8 @@ fn store_salt(store: &StoreId) -> String {
 }
 
 /// Renders one session row: double-click connects, right-click opens its menu.
+/// `sel` is the set of selected ids when this row's store owns the selection.
+#[allow(clippy::too_many_arguments)]
 fn session_row(
     ui: &mut egui::Ui,
     store: &StoreId,
@@ -10583,8 +11010,17 @@ fn session_row(
     destinations: &[Destination],
     editable: bool,
     action: &mut Option<TreeAction>,
+    sel: Option<&HashSet<String>>,
 ) {
     let (id, name) = (session.id.as_str(), session.name.as_str());
+    let selected = sel.is_some_and(|s| s.contains(id));
+    // The full selection, used when this row drives a bulk action (right-clicked
+    // while part of a multi-selection).
+    let selected_ids = || -> Vec<String> {
+        let mut v: Vec<String> = sel.map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        v.sort();
+        v
+    };
     let default_icon = match session.protocol {
         Protocol::Ssh => "🖥",
         Protocol::Rdp => "🖵",
@@ -10607,13 +11043,22 @@ fn session_row(
     };
     // Indent so the session name lines up with folder names, which sit after the
     // collapse triangle. The row drags with the primary button; right-click still
-    // opens the menu.
-    let resp = ui
-        .horizontal(|ui| {
-            let indent = ui.spacing().indent;
-            ui.spacing_mut().item_spacing.x = 0.0;
-            ui.add_space(indent);
-            drag_label(ui, text, DragPayload::Session { store: store.clone(), id: id.to_owned() })
+    // opens the menu. A selected row gets a highlighted background.
+    let fill = if selected { ui.visuals().selection.bg_fill } else { Color32::TRANSPARENT };
+    let resp = egui::Frame::NONE
+        .fill(fill)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let indent = ui.spacing().indent;
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_space(indent);
+                drag_label(
+                    ui,
+                    text,
+                    DragPayload::Session { store: store.clone(), id: id.to_owned() },
+                )
+            })
+            .inner
         })
         .inner;
     // Compute the tooltip text only when it's actually about to show (hovered,
@@ -10621,6 +11066,61 @@ fn session_row(
     delayed_tooltip_lazy(ui, &resp, || session_hint(session));
     if resp.double_clicked() {
         *action = Some(TreeAction::Connect(store.clone(), id.to_owned()));
+    } else if resp.clicked() {
+        let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+        *action = Some(TreeAction::Select { store: store.clone(), id: id.to_owned(), ctrl, shift });
+    }
+    // Right-clicking a row that's part of a multi-selection acts on the whole
+    // selection; otherwise it's the usual single-session menu.
+    let bulk = editable && selected && sel.is_some_and(|s| s.len() > 1);
+    if bulk {
+        resp.context_menu(|ui| {
+            let ids = selected_ids();
+            ui.label(RichText::new(format!("{} sessions selected", ids.len())).weak());
+            ui.separator();
+            if ui.button("Connect all").clicked() {
+                *action = Some(TreeAction::BulkConnect(store.clone(), ids.clone()));
+                ui.close();
+            }
+            ui.separator();
+            destination_menu(ui, "Copy to", destinations, |to, folder| {
+                *action = Some(TreeAction::BulkCopyTo {
+                    from: store.clone(),
+                    ids: ids.clone(),
+                    to,
+                    folder,
+                });
+            });
+            if ui.button("Delete").clicked() {
+                *action = Some(TreeAction::BulkDelete(store.clone(), ids.clone()));
+                ui.close();
+            }
+            if ui.button("Duplicate").clicked() {
+                *action = Some(TreeAction::BulkDuplicate(store.clone(), ids.clone()));
+                ui.close();
+            }
+            if ui.button("Export selected…").clicked() {
+                *action = Some(TreeAction::BulkExport(store.clone(), ids.clone()));
+                ui.close();
+            }
+            destination_menu(ui, "Move to", destinations, |to, folder| {
+                *action = Some(TreeAction::BulkMoveTo {
+                    from: store.clone(),
+                    ids: ids.clone(),
+                    to,
+                    folder,
+                });
+            });
+            if ui.button("Set color / icon…").clicked() {
+                *action = Some(TreeAction::BulkStyle(store.clone(), ids.clone()));
+                ui.close();
+            }
+            if ui.button("Set credentials…").clicked() {
+                *action = Some(TreeAction::BulkCredentials(store.clone(), ids.clone()));
+                ui.close();
+            }
+        });
+        return;
     }
     resp.context_menu(|ui| {
         if ui.button("Connect").clicked() {
