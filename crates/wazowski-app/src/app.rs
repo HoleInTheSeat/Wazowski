@@ -518,6 +518,28 @@ struct Connecting {
     status: String,
     /// Set when the attempt failed; enables Retry.
     error: Option<String>,
+    /// Set when the attempt is awaiting a host-key decision. The prompt renders
+    /// inline in this tab (not as a global overlay), so quick-connecting to several
+    /// untrusted hosts at once gives each tab its own prompt instead of one
+    /// clobbering another.
+    host_key: Option<HostKeyPrompt>,
+}
+
+/// A pending host-key confirmation shown inline in a connecting tab.
+struct HostKeyPrompt {
+    info: UnknownHostKey,
+    /// Whether the key *changed* from a previously trusted one (vs. simply unknown).
+    changed: bool,
+}
+
+/// A decision taken in a connecting tab's inline UI, applied after rendering.
+enum ConnectingAction {
+    /// Retry the attempt (the Retry button after a failure).
+    Retry(u64),
+    /// Trust the awaited host key, then reconnect.
+    TrustHost(u64),
+    /// Reject the awaited host key, marking the tab cancelled.
+    RejectHost(u64),
 }
 
 /// Where the encrypted vault stands this session.
@@ -564,7 +586,6 @@ enum Dialog {
     /// Re-authenticate the master password to reveal a stored secret's value.
     RevealSecret { name: String, password: String, error: Option<String> },
     EditSession(SessionForm),
-    HostKey { info: UnknownHostKey, changed: bool, tab_id: u64 },
     QuickConnect(ConnectAuthForm),
     VaultManager(VaultManagerState),
     CreateCredential(CredentialPrompt),
@@ -2174,6 +2195,7 @@ impl App {
             log: Vec::new(),
             status: "Connecting…".into(),
             error: None,
+            host_key: None,
         };
         self.push_tab(title, TabContent::Connecting(Box::new(connecting)), None);
         if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -2299,20 +2321,12 @@ impl App {
                 Progress::PromptUnknownHost(info) => {
                     c.pending = None;
                     c.status = "Awaiting host-key confirmation".into();
-                    self.dialog = Dialog::HostKey {
-                        info,
-                        changed: false,
-                        tab_id: self.tabs[index].id,
-                    };
+                    c.host_key = Some(HostKeyPrompt { info, changed: false });
                 }
                 Progress::PromptChangedHost(info) => {
                     c.pending = None;
                     c.status = "Awaiting host-key confirmation".into();
-                    self.dialog = Dialog::HostKey {
-                        info,
-                        changed: true,
-                        tab_id: self.tabs[index].id,
-                    };
+                    c.host_key = Some(HostKeyPrompt { info, changed: true });
                 }
             }
         }
@@ -2327,6 +2341,7 @@ impl App {
         let TabContent::Connecting(c) = &mut tab.content else { return };
         c.log.clear();
         c.error = None;
+        c.host_key = None;
         c.status = "Connecting…".into();
         c.pending = Some(PendingConnect::spawn(c.params.clone(), ctx));
     }
@@ -5149,9 +5164,13 @@ impl App {
             self.remember_recent(&id);
             self.connect_session(&session, &ctx);
         }
-        if let Some(tab_id) = retry {
+        if let Some(action) = retry {
             let ctx = ui.ctx().clone();
-            self.retry_tab(tab_id, &ctx);
+            match action {
+                ConnectingAction::Retry(tab_id) => self.retry_tab(tab_id, &ctx),
+                ConnectingAction::TrustHost(tab_id) => self.trust_host_for_tab(tab_id, &ctx),
+                ConnectingAction::RejectHost(tab_id) => self.reject_host_for_tab(tab_id),
+            }
         }
         if let Some(action) = pane_action {
             let ctx = ui.ctx().clone();
@@ -5411,6 +5430,7 @@ impl App {
                     log: Vec::new(),
                     status: "Reconnecting…".into(),
                     error: None,
+                    host_key: None,
                 }));
                 tab.files = None;
             }
@@ -6765,7 +6785,6 @@ impl App {
             Dialog::CreateVault { .. } => self.show_create_vault(ctx),
             Dialog::RevealSecret { .. } => self.show_reveal_secret(ctx),
             Dialog::EditSession(_) => self.show_edit_session(ctx),
-            Dialog::HostKey { .. } => self.show_host_key(ctx),
             Dialog::QuickConnect(_) => self.show_quick_connect(ctx),
             Dialog::VaultManager(_) => self.show_vault_manager(ctx),
             Dialog::CreateCredential(_) => self.show_create_credential(ctx),
@@ -9325,80 +9344,27 @@ impl App {
         }
     }
 
-    fn show_host_key(&mut self, ctx: &egui::Context) {
-        let mut accept = false;
-        let mut reject = false;
-        if let Dialog::HostKey { info, changed, .. } = &self.dialog {
-            let info = info.clone();
-            let changed = *changed;
-            egui::Modal::new(egui::Id::new("host-key")).show(ctx, |ui| {
-                ui.set_width(440.0);
-                if changed {
-                    ui.heading(RichText::new("⚠ Host key changed").color(Color32::LIGHT_RED));
-                    ui.label(
-                        "The server's key is different from the one previously recorded. \
-                         This can mean a man-in-the-middle attack — or that the server was \
-                         reinstalled. Only continue if you expected this.",
-                    );
-                } else {
-                    ui.heading("Unknown host");
-                    ui.label("This host's key is not yet trusted. Verify the fingerprint before continuing.");
-                }
-                ui.add_space(6.0);
-                egui::Grid::new("host-key-info").num_columns(2).show(ui, |ui| {
-                    ui.label("Host");
-                    ui.monospace(format!("{}:{}", info.host, info.port));
-                    ui.end_row();
-                    ui.label("Algorithm");
-                    ui.monospace(&info.algorithm);
-                    ui.end_row();
-                    ui.label("Fingerprint");
-                    ui.monospace(&info.fingerprint);
-                    ui.end_row();
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let accept_label = if changed { "Trust the new key" } else { "Trust and connect" };
-                    if ui.button(accept_label).clicked() {
-                        accept = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        reject = true;
-                    }
-                });
-            });
-        }
-        if accept {
-            self.trust_and_reconnect(ctx);
-        }
-        if reject {
-            self.reject_host_key();
-        }
-    }
-
-    /// Records the host key as trusted and retries the originating tab.
-    fn trust_and_reconnect(&mut self, ctx: &egui::Context) {
-        let Dialog::HostKey { info, tab_id, .. } =
-            std::mem::replace(&mut self.dialog, Dialog::None)
-        else {
-            return;
-        };
+    /// Records the awaited host key (from the tab's inline prompt) as trusted and
+    /// retries that tab's attempt.
+    fn trust_host_for_tab(&mut self, tab_id: u64, ctx: &egui::Context) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
+        let TabContent::Connecting(c) = &mut tab.content else { return };
+        let Some(prompt) = c.host_key.take() else { return };
+        let info = prompt.info;
         if let Err(e) = trust_host(&info.host, info.port, &info.key_openssh) {
+            c.host_key = Some(HostKeyPrompt { info, changed: prompt.changed });
             self.error = Some(format!("Could not record the host key: {e:#}"));
             return;
         }
         self.retry_tab(tab_id, ctx);
     }
 
-    /// Dismisses the host-key prompt, marking the originating tab as failed.
-    fn reject_host_key(&mut self) {
-        let Dialog::HostKey { tab_id, .. } = std::mem::replace(&mut self.dialog, Dialog::None)
-        else {
-            return;
-        };
+    /// Dismisses a tab's inline host-key prompt, marking the tab as cancelled.
+    fn reject_host_for_tab(&mut self, tab_id: u64) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
             && let TabContent::Connecting(c) = &mut tab.content
         {
+            c.host_key = None;
             c.status = "Cancelled".into();
             c.error = Some("Host key was not trusted.".into());
         }
@@ -10968,11 +10934,11 @@ fn parse_target(input: &str) -> Result<Session, String> {
 
 /// Renders a connecting tab (status, live log, and Retry/Copy on failure).
 /// Returns the tab id if the user asked to retry.
-fn connecting_view(ui: &mut egui::Ui, c: &Connecting, tab_id: u64) -> Option<u64> {
-    let mut retry = None;
+fn connecting_view(ui: &mut egui::Ui, c: &Connecting, tab_id: u64) -> Option<ConnectingAction> {
+    let mut action = None;
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if c.error.is_none() {
+        if c.error.is_none() && c.host_key.is_none() {
             ui.spinner();
         }
         ui.heading(&c.title);
@@ -10982,10 +10948,16 @@ fn connecting_view(ui: &mut egui::Ui, c: &Connecting, tab_id: u64) -> Option<u64
         ui.add_space(4.0);
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
+    // An unknown/changed host key prompts inline, right in this tab, so other
+    // tabs stay usable and several prompts can be open at once.
+    if let Some(prompt) = &c.host_key {
+        ui.add_space(6.0);
+        host_key_prompt_ui(ui, prompt, tab_id, &mut action);
+    }
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if c.error.is_some() && ui.button("Retry").clicked() {
-            retry = Some(tab_id);
+            action = Some(ConnectingAction::Retry(tab_id));
         }
         if ui.button("Copy log").on_hover_text("Copy the handshake log").clicked() {
             ui.ctx().copy_text(c.log.join("\n"));
@@ -10999,7 +10971,52 @@ fn connecting_view(ui: &mut egui::Ui, c: &Connecting, tab_id: u64) -> Option<u64
             ui.label(RichText::new(line).monospace().size(11.0));
         }
     });
-    retry
+    action
+}
+
+/// The inline unknown/changed host-key confirmation, shown within a connecting tab.
+fn host_key_prompt_ui(
+    ui: &mut egui::Ui,
+    prompt: &HostKeyPrompt,
+    tab_id: u64,
+    action: &mut Option<ConnectingAction>,
+) {
+    let info = &prompt.info;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        if prompt.changed {
+            ui.label(RichText::new("⚠ Host key changed").color(Color32::LIGHT_RED).strong());
+            ui.label(
+                "The server's key is different from the one previously recorded. This can mean a \
+                 man-in-the-middle attack — or that the server was reinstalled. Only continue if \
+                 you expected this.",
+            );
+        } else {
+            ui.label(RichText::new("Unknown host").strong());
+            ui.label("This host's key is not yet trusted. Verify the fingerprint before continuing.");
+        }
+        ui.add_space(6.0);
+        egui::Grid::new(("host-key-info", tab_id)).num_columns(2).show(ui, |ui| {
+            ui.label("Host");
+            ui.monospace(format!("{}:{}", info.host, info.port));
+            ui.end_row();
+            ui.label("Algorithm");
+            ui.monospace(&info.algorithm);
+            ui.end_row();
+            ui.label("Fingerprint");
+            ui.monospace(&info.fingerprint);
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let accept_label = if prompt.changed { "Trust the new key" } else { "Trust and connect" };
+            if ui.button(accept_label).clicked() {
+                *action = Some(ConnectingAction::TrustHost(tab_id));
+            }
+            if ui.button("Cancel").clicked() {
+                *action = Some(ConnectingAction::RejectHost(tab_id));
+            }
+        });
+    });
 }
 
 /// Requests focus for a field only when nothing else is focused, so auto-focus
