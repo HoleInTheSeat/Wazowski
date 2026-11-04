@@ -3620,6 +3620,8 @@ impl App {
             Some(Act::Restart) => crate::update::relaunch(&self.install_kind),
             Some(Act::OpenUrl(url)) => {
                 let _ = open::that_detached(url);
+                // Viewing the release in the browser dismisses the update popup.
+                self.dialog = Dialog::None;
             }
             Some(Act::Recheck) => self.start_update_check(),
             None => {}
