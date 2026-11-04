@@ -319,9 +319,15 @@ fn eye_button(ui: &mut egui::Ui, shown: bool) -> bool {
     ui.button(text).on_hover_text(tip).clicked()
 }
 
-/// A full-width quick-filter text field with a magnifier hint.
-fn filter_box(ui: &mut egui::Ui, buf: &mut String) {
-    ui.add(egui::TextEdit::singleline(buf).hint_text("🔍 filter").desired_width(f32::INFINITY));
+/// A full-width quick-filter text field with a magnifier hint. When `focus` is
+/// set it grabs keyboard focus, so opening a sidebar section lands the cursor in
+/// its filter (type to filter immediately, instead of into the terminal tab).
+fn filter_box(ui: &mut egui::Ui, buf: &mut String, focus: bool) {
+    let resp =
+        ui.add(egui::TextEdit::singleline(buf).hint_text("🔍 filter").desired_width(f32::INFINITY));
+    if focus {
+        resp.request_focus();
+    }
 }
 
 /// A single-line field with history autocomplete: as the user types, a dropdown
@@ -1157,6 +1163,9 @@ pub struct App {
     sel_store: Option<StoreId>,
     sel_ids: HashSet<String>,
     sel_anchor: Option<String>,
+    /// Set when a sidebar section is opened, so its filter box grabs focus on the
+    /// next frame (the cursor lands in the filter, not the active terminal tab).
+    focus_filter: bool,
     /// Per-pane quick-filter text (Sessions/Macros/Files/Tools/Vault/Settings).
     filter_sessions: String,
     filter_macros: String,
@@ -1531,6 +1540,7 @@ impl App {
             sel_store: None,
             sel_ids: HashSet::new(),
             sel_anchor: None,
+            focus_filter: false,
             filter_sessions: String::new(),
             filter_macros: String::new(),
             filter_files: String::new(),
@@ -3734,10 +3744,14 @@ impl App {
                 // Re-clicking the current view toggles the pane (where applicable).
                 if self.can_collapse_sidebar() {
                     self.sidebar_collapsed = !self.sidebar_collapsed;
+                    // Expanding the pane focuses its filter; collapsing doesn't.
+                    self.focus_filter = !self.sidebar_collapsed;
                 }
             } else {
                 self.sidebar_view = view;
                 self.sidebar_collapsed = false;
+                // Opening a different section lands the cursor in its filter box.
+                self.focus_filter = true;
             }
         }
     }
@@ -3745,7 +3759,8 @@ impl App {
     /// The Settings view's left pane: the category selector.
     fn sidebar_settings_categories(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
-        filter_box(ui, &mut self.filter_settings);
+        let focus = std::mem::take(&mut self.focus_filter);
+        filter_box(ui, &mut self.filter_settings, focus);
         ui.separator();
         let needle = self.filter_settings.to_lowercase();
         let all = [
@@ -3781,7 +3796,8 @@ impl App {
     /// The Tools view's left pane: server/network/host tool categories.
     fn sidebar_tools(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tools");
-        filter_box(ui, &mut self.filter_tools);
+        let focus = std::mem::take(&mut self.focus_filter);
+        filter_box(ui, &mut self.filter_tools, focus);
         ui.separator();
         let needle = self.filter_tools.to_lowercase();
         let item = &mut self.tools_item;
@@ -3878,7 +3894,8 @@ impl App {
             self.dialog = Dialog::ConfirmDeleteVault;
         }
         if unlocked {
-            filter_box(ui, &mut self.filter_vault);
+            let focus = std::mem::take(&mut self.focus_filter);
+            filter_box(ui, &mut self.filter_vault, focus);
         }
         ui.separator();
         match &self.vault {
@@ -4071,6 +4088,8 @@ impl App {
     /// The Files view: the SFTP browser for the active single-pane SSH tab.
     fn sidebar_files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let highlight = self.filter_files.clone();
+        // Whichever branch renders below, its filter box grabs focus on open.
+        let focus = std::mem::take(&mut self.focus_filter);
         // An RDP tab browses its host over SMB; an unsplit SSH tab uses SFTP.
         let has_smb = self.tabs.get(self.active).is_some_and(|t| t.smb.is_some());
         let has_sftp = self.tabs.get(self.active).is_some_and(|t| {
@@ -4081,7 +4100,7 @@ impl App {
             let loc = self.tabs[self.active].smb.as_ref().map(|s| s.location()).unwrap_or_default();
             ui.heading("Files (SMB)");
             ui.label(RichText::new(loc).monospace().weak());
-            filter_box(ui, &mut self.filter_files);
+            filter_box(ui, &mut self.filter_files, focus);
             ui.separator();
             if let Some(tab) = self.tabs.get_mut(self.active)
                 && let Some(smb) = &mut tab.smb
@@ -4091,7 +4110,7 @@ impl App {
             }
         } else if has_sftp {
             ui.heading("Files (SFTP)");
-            filter_box(ui, &mut self.filter_files);
+            filter_box(ui, &mut self.filter_files, focus);
             ui.separator();
             if let Some(tab) = self.tabs.get_mut(self.active)
                 && let Some(files) = &mut tab.files
@@ -4101,7 +4120,7 @@ impl App {
             }
         } else {
             ui.heading("Files");
-            filter_box(ui, &mut self.filter_files);
+            filter_box(ui, &mut self.filter_files, focus);
             ui.separator();
             ui.add_space(8.0);
             ui.label(
@@ -4128,7 +4147,8 @@ impl App {
                 self.dialog = Dialog::AddSource(AddSourceForm::default());
             }
         });
-        filter_box(ui, &mut self.filter_sessions);
+        let focus = std::mem::take(&mut self.focus_filter);
+        filter_box(ui, &mut self.filter_sessions, focus);
 
         match &self.vault {
             VaultState::Locked => {
@@ -4194,7 +4214,8 @@ impl App {
                 act = Some(Act::New);
             }
         });
-        filter_box(ui, &mut self.filter_macros);
+        let focus = std::mem::take(&mut self.focus_filter);
+        filter_box(ui, &mut self.filter_macros, focus);
         ui.separator();
         let needle = self.filter_macros.to_lowercase();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
