@@ -43,6 +43,20 @@ fn default_file() -> String {
     "wazowski-sessions.toml".to_owned()
 }
 
+/// Renders a folder path (`work/prod`) with a folder emoji between segments, so
+/// the hierarchy reads top-down in the git log: `work 📂 prod`. Empty for the
+/// root. Used to build descriptive git commit messages for shared sources.
+fn folder_breadcrumb(folder: &str) -> String {
+    folder.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" 📂 ")
+}
+
+/// A session's name, a `|` divider, then the folder path that contains it, e.g.
+/// `Switches | DataCenter 📂 z_Tech Office 📂 Deven's Desk` (just the name at root).
+fn session_location(folder: &str, name: &str) -> String {
+    let crumb = folder_breadcrumb(folder);
+    if crumb.is_empty() { name.to_owned() } else { format!("{name} | {crumb}") }
+}
+
 /// A configured shared source (persisted in `sources.toml`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SourceDef {
@@ -128,7 +142,8 @@ impl Backend {
     /// Records bytes locally without publishing to the remote. For a folder share
     /// this writes the file directly (there is nothing to push); for git it
     /// commits locally, leaving the commit to be pushed later via [`push`].
-    fn commit(&self, bytes: &[u8]) -> Result<()> {
+    /// `message` is the commit subject (git only; a folder share has no history).
+    fn commit(&self, message: &str, bytes: &[u8]) -> Result<()> {
         match self {
             Backend::Folder(path) => {
                 if let Some(parent) = path.parent() {
@@ -136,15 +151,15 @@ impl Backend {
                 }
                 fs::write(path, bytes).map_err(Into::into)
             }
-            Backend::Git(repo) => repo.commit(bytes),
+            Backend::Git(repo) => repo.commit(message, bytes),
         }
     }
 
     /// Publishes bytes to the share immediately (folder write / git commit+push).
-    fn publish(&self, bytes: &[u8]) -> Result<()> {
+    fn publish(&self, message: &str, bytes: &[u8]) -> Result<()> {
         match self {
-            Backend::Folder(_) => self.commit(bytes),
-            Backend::Git(repo) => repo.publish(bytes),
+            Backend::Folder(_) => self.commit(message, bytes),
+            Backend::Git(repo) => repo.publish(message, bytes),
         }
     }
 
@@ -417,9 +432,10 @@ impl SharedSource {
     /// Records a store change: writes the cache and commits it locally. For git
     /// this does not push — the change becomes "pending" until [`push`] or a sync
     /// sends it. For a folder share, committing writes the file directly.
-    fn write_through(&mut self) -> Result<()> {
+    /// `message` becomes the git commit subject describing the change.
+    fn write_through(&mut self, message: &str) -> Result<()> {
         let bytes = self.cache_bytes()?;
-        self.backend.commit(&bytes)?;
+        self.backend.commit(message, &bytes)?;
         self.available = true;
         self.missing = false;
         self.status = None;
@@ -434,7 +450,7 @@ impl SharedSource {
 
     /// Sets the description in the shared file (write-through to the share).
     pub fn set_description(&mut self, description: &str) -> Result<()> {
-        self.mutate(|s| s.set_description(description))
+        self.mutate("Update source description", |s| s.set_description(description))
     }
 
     /// Sets the description in the in-memory store only, to be persisted by the
@@ -465,20 +481,25 @@ impl SharedSource {
     }
 
     /// Applies a store mutation, then writes through to the share. Mutations are
-    /// refused while the share is offline, to avoid conflicting with it.
-    fn mutate(&mut self, f: impl FnOnce(&mut SessionStore) -> Result<()>) -> Result<()> {
+    /// refused while the share is offline, to avoid conflicting with it. `message`
+    /// describes the change and becomes the git commit subject.
+    fn mutate(
+        &mut self,
+        message: &str,
+        f: impl FnOnce(&mut SessionStore) -> Result<()>,
+    ) -> Result<()> {
         if !self.available {
             anyhow::bail!("the shared source is offline; changes are disabled");
         }
         f(&mut self.store)?;
-        self.write_through()
+        self.write_through(message)
     }
 
     /// (Re)creates the shared file from the current cache contents, publishing it
     /// immediately (this is a deliberate setup action, so it pushes right away).
     pub fn create(&mut self) -> Result<()> {
         let bytes = self.cache_bytes()?;
-        self.backend.publish(&bytes)?;
+        self.backend.publish("Create sessions file", &bytes)?;
         self.available = true;
         self.missing = false;
         self.status = None;
@@ -525,27 +546,42 @@ impl SharedSource {
     // --- Mutations (write-through to the share) --------------------------
 
     pub fn upsert(&mut self, session: Session) -> Result<()> {
-        self.mutate(|s| s.upsert(session))
+        // "created" for a new id, "updated" when replacing an existing session.
+        let verb = if self.store.get(&session.id).is_some() { "updated" } else { "created" };
+        let message = format!("Session {verb}: {}", session_location(&session.folder, &session.name));
+        self.mutate(&message, |s| s.upsert(session))
     }
 
     pub fn remove(&mut self, id: &str) -> Result<()> {
-        self.mutate(|s| s.remove(id).map(|_| ()))
+        // Resolve the name/location before the session is gone.
+        let message = match self.store.get(id) {
+            Some(s) => format!("Session deleted: {}", session_location(&s.folder, &s.name)),
+            None => "Session deleted".to_owned(),
+        };
+        self.mutate(&message, |s| s.remove(id).map(|_| ()))
     }
 
     pub fn add_folder(&mut self, name: &str) -> Result<()> {
-        self.mutate(|s| s.add_folder(name).map(|_| ()))
+        let message = format!("Folder created: {}", folder_breadcrumb(name));
+        self.mutate(&message, |s| s.add_folder(name).map(|_| ()))
     }
 
     pub fn remove_folder(&mut self, name: &str) -> Result<()> {
-        self.mutate(|s| s.remove_folder(name))
+        let message = format!("Folder deleted: {}", folder_breadcrumb(name));
+        self.mutate(&message, |s| s.remove_folder(name))
     }
 
     pub fn rename_folder(&mut self, old: &str, new: &str) -> Result<()> {
-        self.mutate(|s| s.rename_folder(old, new))
+        let message =
+            format!("Folder renamed: {} → {}", folder_breadcrumb(old), folder_breadcrumb(new));
+        self.mutate(&message, |s| s.rename_folder(old, new))
     }
 
     pub fn move_to_folder(&mut self, id: &str, folder: &str) -> Result<()> {
-        self.mutate(|s| s.move_to_folder(id, folder))
+        let name = self.store.get(id).map(|s| s.name.clone()).unwrap_or_else(|| "session".to_owned());
+        let dest = if folder.is_empty() { "root".to_owned() } else { folder_breadcrumb(folder) };
+        let message = format!("Session moved: {name} → {dest}");
+        self.mutate(&message, |s| s.move_to_folder(id, folder))
     }
 
     pub fn set_folder_style(
@@ -553,7 +589,8 @@ impl SharedSource {
         folder: &str,
         style: wazowski_core::FolderStyle,
     ) -> Result<()> {
-        self.mutate(|s| s.set_folder_style(folder, style))
+        let message = format!("Folder restyled: {}", folder_breadcrumb(folder));
+        self.mutate(&message, |s| s.set_folder_style(folder, style))
     }
 }
 
@@ -655,6 +692,20 @@ mod tests {
         assert!(!offline.available());
         assert_eq!(offline.store().all().len(), 1, "cache keeps sessions when offline");
         assert_eq!(offline.description(), "Team servers", "description available offline too");
+    }
+
+    #[test]
+    fn breadcrumbs_for_commit_messages() {
+        assert_eq!(folder_breadcrumb(""), "");
+        assert_eq!(folder_breadcrumb("work"), "work");
+        assert_eq!(folder_breadcrumb("work/prod"), "work 📂 prod");
+        assert_eq!(folder_breadcrumb("work/prod/db"), "work 📂 prod 📂 db");
+        // A trailing/leading slash doesn't produce empty crumbs.
+        assert_eq!(folder_breadcrumb("work/"), "work");
+
+        // Session name, a `|` divider, then the folder path that contains it.
+        assert_eq!(session_location("", "db"), "db");
+        assert_eq!(session_location("work/prod", "db"), "db | work 📂 prod");
     }
 
     #[test]

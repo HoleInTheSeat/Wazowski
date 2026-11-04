@@ -95,7 +95,9 @@ impl GitRepo {
 
     /// Writes the sessions file and commits it locally, without pushing. The
     /// commit becomes an "unpushed change" until [`push`](Self::push) runs.
-    pub fn commit(&self, bytes: &[u8]) -> Result<()> {
+    /// `message` is the commit subject describing the change (e.g. "Session
+    /// deleted: work > prod > db").
+    pub fn commit(&self, message: &str, bytes: &[u8]) -> Result<()> {
         self.ensure_clone()?;
         let path = self.work_dir.join(&self.file);
         if let Some(parent) = path.parent() {
@@ -106,7 +108,7 @@ impl GitRepo {
         // Attribute the commit to the user, not "Wazowski": use their own git
         // identity when configured, else a derived one (GitHub login / OS user).
         let mut args: Vec<String> = self.identity_args();
-        args.extend(["commit".into(), "-m".into(), "Update sessions".into()]);
+        args.extend(["commit".into(), "-m".into(), message.to_owned()]);
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         // Commit; a no-op commit returns non-zero, which is fine.
         let committed = self.git(&argv);
@@ -196,8 +198,8 @@ impl GitRepo {
     }
 
     /// Writes the sessions file, commits, and pushes in one step.
-    pub fn publish(&self, bytes: &[u8]) -> Result<()> {
-        self.commit(bytes)?;
+    pub fn publish(&self, message: &str, bytes: &[u8]) -> Result<()> {
+        self.commit(message, bytes)?;
         self.push()
     }
 
