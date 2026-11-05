@@ -86,6 +86,10 @@ pub struct Settings {
     pub allow_multiple_instances: bool,
     pub startup_tab: StartupTab,
     pub new_tab_placement: NewTabPlacement,
+    /// Whether the dark theme is active. Persisted so the chosen theme is restored
+    /// on the next launch instead of following the OS theme.
+    #[serde(default = "default_dark_mode")]
+    pub dark_mode: bool,
     pub vault_backup: VaultBackup,
     /// Ids of recently connected sessions, most recent first (for the launcher).
     #[serde(default)]
@@ -113,12 +117,17 @@ fn default_font_size() -> f32 {
     14.0
 }
 
+fn default_dark_mode() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             allow_multiple_instances: false,
             startup_tab: StartupTab::default(),
             new_tab_placement: NewTabPlacement::default(),
+            dark_mode: default_dark_mode(),
             vault_backup: VaultBackup::default(),
             recent: Vec::new(),
             terminal_font_size: default_font_size(),
@@ -195,6 +204,12 @@ impl Settings {
         })
     }
 
+    #[cfg(test)]
+    fn with_path(mut self, path: PathBuf) -> Self {
+        self.path = Some(path);
+        self
+    }
+
     /// Whether an automatic vault backup is due.
     pub fn auto_backup_due(&self) -> bool {
         if !self.vault_backup.enabled {
@@ -207,5 +222,29 @@ impl Settings {
                 last.elapsed().map(|e| e >= interval).unwrap_or(true)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dark_mode_defaults_true_and_persists() {
+        // A brand-new config defaults to dark (the app's intended default).
+        assert!(Settings::default().dark_mode);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+
+        // Save with the theme set to light, then reload: the choice is restored.
+        let mut s = Settings::default().with_path(path.clone());
+        s.dark_mode = false;
+        s.save().unwrap();
+        assert!(!Settings::load(path.clone()).unwrap().dark_mode);
+
+        // An older settings file without the field loads as the default (dark).
+        fs::write(&path, "allow_multiple_instances = false\n").unwrap();
+        assert!(Settings::load(path).unwrap().dark_mode);
     }
 }

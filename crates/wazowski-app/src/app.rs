@@ -1393,6 +1393,10 @@ enum DragPayload {
 /// Applies the base light/dark theme plus a visible outline on inactive widgets
 /// so text fields (and buttons) have an obvious border before you hover them.
 fn apply_visuals(ctx: &egui::Context, dark: bool) {
+    // Pin the theme preference so egui stops following the OS theme. Without this
+    // it resolves the theme from the system each frame (the default is
+    // `System`), which clobbers the user's saved choice on the next repaint.
+    ctx.set_theme(if dark { egui::ThemePreference::Dark } else { egui::ThemePreference::Light });
     let mut visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     let stroke = egui::Stroke::new(1.0, if dark { Color32::from_gray(95) } else { Color32::from_gray(150) });
     visuals.widgets.inactive.bg_stroke = stroke;
@@ -1483,6 +1487,8 @@ impl App {
         let macros =
             MacroStore::default_path().and_then(MacroStore::load).unwrap_or_else(|_| MacroStore::empty());
         let settings = Settings::load_or_default();
+        // Captured before `settings` is moved into the struct below.
+        let dark_mode = settings.dark_mode;
 
         let mut app = Self {
             tabs: Vec::new(),
@@ -1527,7 +1533,7 @@ impl App {
             webtools: WebToolsState::default(),
             serial_ports: sorted_serial_devices(),
             serial_ports_at: std::time::Instant::now(),
-            dark_mode: true,
+            dark_mode,
             highlights: HighlightStore::load_or_default(),
             settings_category: SettingsCategory::General,
             env_checks: None,
@@ -1550,7 +1556,7 @@ impl App {
             filter_settings: String::new(),
         };
         app.migrate_servers_one_per_kind();
-        apply_visuals(ctx, true);
+        apply_visuals(ctx, app.dark_mode);
         app.open_startup_tab(ctx);
         app
     }
@@ -2949,6 +2955,11 @@ impl App {
         if toggle_theme {
             self.dark_mode = !self.dark_mode;
             apply_visuals(ctx, self.dark_mode);
+            // Persist the choice so it's restored on the next launch.
+            self.settings.dark_mode = self.dark_mode;
+            if let Err(e) = self.settings.save() {
+                self.error = Some(format!("Could not save the theme setting: {e:#}"));
+            }
         }
     }
 
