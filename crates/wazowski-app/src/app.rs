@@ -5134,6 +5134,9 @@ impl App {
                 // A solid (non-floating) bar that shows when the tabs overflow,
                 // drawn under the tabs rather than over them.
                 ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                // The strip only scrolls horizontally, so let a plain (vertical)
+                // mouse wheel scroll it — no need to hold Shift to move through tabs.
+                ui.style_mut().always_scroll_the_only_direction = true;
                 egui::ScrollArea::horizontal()
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                     .show(ui, |ui| {
