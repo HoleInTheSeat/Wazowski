@@ -104,7 +104,7 @@ impl<'a> TerminalView<'a> {
         t.process(ui.ctx());
 
         let rect = ui.available_rect_before_wrap();
-        let id = Id::new(("wazowski-terminal", t.id()));
+        let id = Id::unique(("wazowski-terminal", t.id()));
         let sense = if interactive { Sense::click_and_drag() } else { Sense::hover() };
         let response = ui.interact(rect, id, sense);
         ui.advance_cursor_after_rect(rect);

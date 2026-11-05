@@ -2812,7 +2812,7 @@ impl App {
             ),
         ];
         for (i, (dir, rect, cursor)) in handles.into_iter().enumerate() {
-            let resp = Area::new(Id::new(("wz-resize", i)))
+            let resp = Area::new(Id::unique(("wz-resize", i)))
                 .order(Order::Foreground)
                 .fixed_pos(rect.min)
                 .show(ctx, |ui| ui.allocate_response(rect.size(), Sense::drag()))
@@ -2891,7 +2891,7 @@ impl App {
         }
         // Leave the top few pixels to the north resize grip.
         let strip = Rect::from_min_max(pos2(bar.left(), bar.top() + 6.0), bar.right_bottom());
-        let resp = Area::new(Id::new("wz-titlebar-drag"))
+        let resp = Area::new(Id::unique("wz-titlebar-drag"))
             .order(Order::Foreground)
             .fixed_pos(strip.min)
             .show(ctx, |ui| {
@@ -3528,7 +3528,7 @@ impl App {
         let path = path.clone();
         let mut import = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("import-settings")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("import-settings")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading("Import settings?");
             ui.label(format!("From: {}", path.display()));
@@ -3572,7 +3572,7 @@ impl App {
         let Dialog::Notice { title, body } = &self.dialog else { return };
         let (title, body) = (title.clone(), body.clone());
         let mut close = false;
-        egui::Modal::new(egui::Id::new("notice")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("notice")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading(title);
             ui.add_space(4.0);
@@ -3599,7 +3599,7 @@ impl App {
         let can_update = self.install_kind.can_self_update();
         let current = crate::update::current_version();
         if let Dialog::Update(phase) = &self.dialog {
-            egui::Modal::new(egui::Id::new("update")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("update")).show(ctx, |ui| {
                 ui.set_width(460.0);
                 ui.heading("Software update");
                 ui.add_space(4.0);
@@ -7244,7 +7244,7 @@ impl App {
         let mut cancel = false;
         if let Dialog::BulkStyle { ids, icon, color, set_icon, set_color, .. } = &mut self.dialog {
             let count = ids.len();
-            egui::Modal::new(egui::Id::new("bulk-style")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("bulk-style")).show(ctx, |ui| {
                 ui.set_width(320.0);
                 ui.heading("Set color / icon");
                 ui.label(RichText::new(format!("Applies to {count} selected sessions.")).weak());
@@ -7315,7 +7315,7 @@ impl App {
         let entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
         if let Dialog::BulkCredentials(form) = &mut self.dialog {
             let count = form.ids.len();
-            egui::Modal::new(egui::Id::new("bulk-credentials")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("bulk-credentials")).show(ctx, |ui| {
                 ui.set_width(380.0);
                 ui.heading("Set credentials");
                 ui.label(RichText::new(format!("Applies to {count} selected sessions.")).weak());
@@ -7412,7 +7412,7 @@ impl App {
         let mut cancel = false;
         if let Dialog::ConnectCreds(form) = &mut self.dialog {
             let title = form.title.clone();
-            egui::Modal::new(egui::Id::new("connect-creds")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("connect-creds")).show(ctx, |ui| {
                 ui.set_width(360.0);
                 ui.heading("Connect");
                 ui.label(RichText::new(title).weak());
@@ -7983,7 +7983,7 @@ impl App {
         };
         let mut chosen: Option<TreeAction> = None;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("drop-menu")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("drop-menu")).show(ctx, |ui| {
             ui.set_width(300.0);
             ui.heading(format!("Drop {what}"));
             ui.label(RichText::new(format!("Into: {dest_label}")).weak());
@@ -8013,7 +8013,7 @@ impl App {
         let mut cancel = false;
         let mut refresh = false;
         if let Dialog::SerialConnect(f) = &mut self.dialog {
-            egui::Modal::new(egui::Id::new("serial-connect")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("serial-connect")).show(ctx, |ui| {
                 ui.set_width(380.0);
                 ui.heading("New serial connection");
                 ui.add_space(6.0);
@@ -8180,7 +8180,7 @@ impl App {
             None
         };
         if let Dialog::StartServer { auto_stop, minutes, .. } = &mut self.dialog {
-            egui::Modal::new(egui::Id::new("start-server")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("start-server")).show(ctx, |ui| {
                 ui.set_width(340.0);
                 ui.heading(format!("Start {}", name.as_deref().unwrap_or("server")));
                 ui.add_space(6.0);
@@ -8235,7 +8235,7 @@ impl App {
         );
         let mut run = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("server-fix")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("server-fix")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.heading(RichText::new(format!("⚠ {title}")).color(Color32::LIGHT_YELLOW));
             ui.label(message);
@@ -8274,7 +8274,7 @@ impl App {
         let can_recreate = source.can_recreate();
         let status = source.status().unwrap_or("the shared source is unavailable").to_owned();
         let mut choice: Option<u8> = None;
-        egui::Modal::new(egui::Id::new("missing-share")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("missing-share")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.heading(RichText::new("⚠ Shared source unavailable").color(Color32::LIGHT_RED));
             ui.label(format!("'{name}': {status}"));
@@ -8329,7 +8329,7 @@ impl App {
             .unwrap_or_default();
         let mut push = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("confirm-sync-push")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("confirm-sync-push")).show(ctx, |ui| {
             ui.set_width(380.0);
             ui.heading("Push changes?");
             if changes.is_empty() {
@@ -8376,7 +8376,7 @@ impl App {
         let vault_unlocked = self.vault.unlocked().is_some();
         if let Dialog::AddSource(f) = &mut self.dialog {
             let editing = f.edit_id.is_some();
-            egui::Modal::new(egui::Id::new("add-source")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("add-source")).show(ctx, |ui| {
                 ui.set_width(460.0);
                 ui.heading(if editing { "Edit shared source" } else { "Add shared source" });
                 ui.label(
@@ -8689,7 +8689,7 @@ impl App {
         let pending = self.quit_pending.clone();
         let has_pending = !pending.is_empty();
         let mut act: Option<Act> = None;
-        egui::Modal::new(egui::Id::new("confirm-quit")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("confirm-quit")).show(ctx, |ui| {
             ui.set_width(380.0);
             ui.heading("Quit Wazowski?");
             if open > 0 {
@@ -8784,7 +8784,7 @@ impl App {
         let lines = text.lines().count();
         let mut send = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("confirm-type-text")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("confirm-type-text")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.heading("Type clipboard text?");
             ui.label(format!(
@@ -8823,7 +8823,7 @@ impl App {
         let (list, value) = (*list, value.clone());
         let mut delete = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("confirm-delete-history")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("confirm-delete-history")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.heading("Delete saved entry?");
             ui.add(egui::Label::new(egui::RichText::new(&value).monospace()).wrap());
@@ -8860,7 +8860,7 @@ impl App {
     fn show_confirm_import_vault(&mut self, ctx: &egui::Context) {
         let mut import = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("confirm-import")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("confirm-import")).show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading(RichText::new("⚠ Replace existing vault?").color(Color32::LIGHT_RED));
             ui.label(
@@ -8906,7 +8906,7 @@ impl App {
     fn show_confirm_delete_vault(&mut self, ctx: &egui::Context) {
         let mut delete = false;
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("delete-vault")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("delete-vault")).show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading(RichText::new("⚠ Delete vault").color(Color32::LIGHT_RED));
             ui.label(
@@ -8936,7 +8936,7 @@ impl App {
         let mut submit = false;
         let mut cancel = false;
         if let Dialog::AskUsername(prompt) = &mut self.dialog {
-            egui::Modal::new(egui::Id::new("ask-username")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("ask-username")).show(ctx, |ui| {
                 ui.set_width(320.0);
                 ui.heading("Username");
                 ui.label(
@@ -8985,7 +8985,7 @@ impl App {
         if let Dialog::NewFolder { parent, name, icon, color, .. } = &mut self.dialog {
             let heading =
                 if parent.is_empty() { "New folder".to_owned() } else { format!("New folder in {parent}") };
-            egui::Modal::new(egui::Id::new("new-folder")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("new-folder")).show(ctx, |ui| {
                 ui.set_width(300.0);
                 ui.heading(heading);
                 let field = ui.add(egui::TextEdit::singleline(name).hint_text("Folder name"));
@@ -9027,7 +9027,7 @@ impl App {
         let mut save = false;
         let mut cancel = false;
         if let Dialog::EditFolder { name, icon, color, .. } = &mut self.dialog {
-            egui::Modal::new(egui::Id::new("edit-folder")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("edit-folder")).show(ctx, |ui| {
                 ui.set_width(340.0);
                 ui.heading("Edit folder");
                 ui.horizontal(|ui| {
@@ -9076,7 +9076,7 @@ impl App {
         if let Dialog::CreateCredential(prompt) = &mut self.dialog {
             let expected_id = prompt.expected_id.clone();
             let form = &mut prompt.form;
-            egui::Modal::new(egui::Id::new("create-credential")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("create-credential")).show(ctx, |ui| {
                 ui.set_width(400.0);
                 ui.heading("Create credential");
                 ui.label(
@@ -9239,7 +9239,7 @@ impl App {
         let mut submit = false;
         let mut cancel = false;
         if let Dialog::UnlockVault { password, remember, error } = &mut self.dialog {
-            egui::Modal::new(egui::Id::new("unlock-vault")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("unlock-vault")).show(ctx, |ui| {
                 ui.set_width(320.0);
                 ui.heading("Unlock vault");
                 ui.add_space(6.0);
@@ -9275,7 +9275,7 @@ impl App {
         let mut cancel = false;
         if let Dialog::RevealSecret { name, password, error } = &mut self.dialog {
             let name = name.clone();
-            egui::Modal::new(egui::Id::new("reveal-secret")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("reveal-secret")).show(ctx, |ui| {
                 ui.set_width(340.0);
                 ui.heading("Show secret");
                 ui.label(RichText::new(format!("Confirm the master password to reveal \"{name}\".")).weak());
@@ -9447,7 +9447,7 @@ impl App {
         let mut submit = false;
         let mut cancel = false;
         if let Dialog::CreateVault { password, confirm, remember, error } = &mut self.dialog {
-            egui::Modal::new(egui::Id::new("create-vault")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("create-vault")).show(ctx, |ui| {
                 ui.set_width(340.0);
                 ui.heading("Create vault");
                 ui.label(
@@ -9536,7 +9536,7 @@ impl App {
         let vault_unlocked = self.vault.unlocked().is_some();
         if let Dialog::EditSession(form) = &mut self.dialog {
             let title = if form.id.is_some() { "Edit session" } else { "New session" };
-            egui::Modal::new(egui::Id::new("edit-session")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("edit-session")).show(ctx, |ui| {
                 ui.set_width(400.0);
                 ui.heading(title);
                 ui.add_space(6.0);
@@ -10013,7 +10013,7 @@ impl App {
         let vault_unlocked = self.vault.unlocked().is_some();
 
         if let Dialog::QuickConnect(form) = &mut self.dialog {
-            egui::Modal::new(egui::Id::new("quick-connect")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("quick-connect")).show(ctx, |ui| {
                 ui.set_width(360.0);
                 ui.heading(format!("Connect to {}", form.session.address()));
                 ui.add_space(6.0);
@@ -10115,7 +10115,7 @@ impl App {
         let existing_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
 
         if let Dialog::VaultManager(state) = &mut self.dialog {
-            egui::Modal::new(egui::Id::new("vault-manager")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("vault-manager")).show(ctx, |ui| {
                 ui.set_width(440.0);
                 ui.heading("Vault secrets");
                 ui.label(
@@ -10987,7 +10987,7 @@ fn render_folder<'a>(
             .inner;
         (resp.clone(), resp)
     } else {
-        let id = egui::Id::new((store_salt(store), "folder", full));
+        let id = egui::Id::unique((store_salt(store), "folder", full));
         // Folders start collapsed so large session trees stay readable.
         let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
         // While filtering, force folders open so matches are visible.

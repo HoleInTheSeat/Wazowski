@@ -561,7 +561,7 @@ fn show_pane(mut cx: Ctx, ui: &mut Ui, pane: &mut Pane, area: Rect) {
 
             show_pane(cx.reborrow(), ui, a, ra);
 
-            let did = Id::new(("wz-divider", a.first_leaf_id(), b.first_leaf_id()));
+            let did = Id::unique(("wz-divider", a.first_leaf_id(), b.first_leaf_id()));
             let dresp = ui.interact(divider, did, Sense::drag());
             let icon = match dir {
                 SplitDir::Horizontal => CursorIcon::ResizeHorizontal,
