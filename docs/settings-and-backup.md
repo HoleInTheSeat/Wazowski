@@ -13,6 +13,10 @@ plain TOML files in your config dir (`~/.config/wazowski/` on Linux).
 - **Open web GUI scheme** — whether the session "Open web GUI" action uses
   `https://` or `http://`.
 
+> **Theme:** the light/dark toggle is the **☀ / 🌙** button in the title bar (not a
+> Settings entry). Your choice is **remembered between launches** — Wazowski keeps
+> the theme you last picked rather than following the OS theme on each start.
+
 ### Tabs
 - **New-tab placement** — far right, next to the current tab, or only duplicates
   next to the current tab.

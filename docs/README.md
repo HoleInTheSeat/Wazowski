@@ -29,6 +29,8 @@ consoles, saved sessions, credentials, macros, quick servers, and network tools.
     `.mxtsessions` files.
 13. [Updating](updating.md) — in-app updates and the Windows installer.
 14. [Troubleshooting](troubleshooting.md) — common issues and fixes.
+15. [Releasing & CI](releasing.md) — how builds, tests, versioning, tagging, and
+    GitHub Releases work (for maintainers).
 
 ## Core concepts
 

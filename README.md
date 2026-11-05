@@ -21,9 +21,9 @@ a set of network tools into one tabbed window.
 - **Tabbed terminal** with a full emulator (colors, scrollback, selection,
   copy-on-select, right-click paste), split panes, and **broadcast** typing to
   many panes at once.
-- **SSH sessions** with password / private-key / SSH-agent auth, host-key
-  verification, a live handshake log, and a per-session **legacy mode** for old
-  gear (ProCurve/HPE, etc.).
+- **SSH sessions** with password / private-key auth (from the encrypted vault or a
+  connect-time prompt), host-key verification, a live handshake log, and a
+  per-session **legacy mode** for old gear (ProCurve/HPE, etc.).
 - **SFTP file browser** beside the active SSH tab; **SMB file browser** beside an
   RDP tab (`\\host\C$`).
 - **Native, in-window RDP and VNC** (no external client) with a per-session
@@ -61,6 +61,7 @@ Full docs live in [`docs/`](docs/README.md):
 - [Keyboard shortcuts](docs/keybindings.md)
 - [Importing from MobaXterm](docs/importing-from-mobaxterm.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [Releasing & CI](docs/releasing.md) — maintainer reference for builds, versioning, and releases
 
 ## Install
 

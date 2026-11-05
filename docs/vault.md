@@ -39,7 +39,14 @@ In the vault view you can:
   sessions reference that id — so you can **rename an entry freely** and every
   session that uses it stays linked. Because the id is derived from the name,
   teammates who name an entry the same way get the same id, so **shared sessions
-  resolve for everyone**.
+  resolve for everyone**. The id is shown in grey **next to the name box**: while
+  you're creating an entry it previews the slug the current name would get (live);
+  once the entry exists it's fixed and never changes, even on rename.
+- **Duplicate** an entry — this opens the editor as a **new** entry with the
+  original's fields prefilled, so its id follows the name you give the copy (and
+  locks in once saved, like any new entry). The copied secret is carried over
+  **without being shown**: it appears as dots, revealing it still requires the
+  master password, and it's saved into the duplicate even if you never reveal it.
 - **Reveal** a secret's value — this re-asks for the master password first.
 - **Generate an SSH keypair** to use for SSH auth. Choose the algorithm
   (**Ed25519**, **RSA 4096**, or **ECDSA P-256**) and optionally set a passphrase

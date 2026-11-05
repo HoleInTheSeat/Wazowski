@@ -34,15 +34,21 @@ when the share or remote is offline (read-only until it's reachable again).
 ## Adding a source
 
 Sessions pane → right-click → **Add shared source…**, then choose the kind and
-fill in the details. A **Description** field (below) and an icon/color round it
-out. A brand-new source's file is created for you so it's immediately usable.
+fill in the details, including an optional **description, icon, and color**. A
+brand-new source's file is created for you so it's immediately usable.
 
-### Description
+### Appearance & description
 
-The source's **description** is stored **inside the shared sessions file**, so it
-travels with the sessions — everyone who opens the source sees it. It appears at
-the top of the source's hover tooltip (above the connection details), and shows
-even when you're offline (read from the local cache).
+The source's **description, icon, and color** are all stored **inside the shared
+sessions file**, so they travel with the sessions — everyone who opens the source
+sees the same thing. The description appears at the top of the source's hover
+tooltip (above the connection details); the icon and color style the source's
+header in the Sessions pane. All of it shows even when you're offline (read from
+the local cache).
+
+> Sources created in an older version stored the icon/color locally; they still
+> display, and the appearance moves into the shared file the next time you edit
+> and save the source.
 
 ## Syncing and pushing changes
 
@@ -59,6 +65,11 @@ immediately. Pushing is a deliberate step:
 - **On quit**, if any source has unpushed changes, the quit dialog offers to
   **Push & quit** or **Discard & quit**. A failed push is non-destructive — the
   local commits remain and are offered again next launch.
+
+Each change you make is recorded as its own descriptive git commit (e.g.
+`Session deleted: db | work 📂 prod`), so the repo history is readable. Before you
+push, the confirmation dialog has a collapsible **preview** listing exactly which
+changes will go out — click to expand it, so nothing is pushed sight-unseen.
 
 For **folder** sources there's nothing to push: writes go straight to the shared
 file, and **Sync now** just re-reads it.
