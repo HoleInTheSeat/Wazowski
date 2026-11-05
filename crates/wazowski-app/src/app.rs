@@ -896,6 +896,11 @@ struct GenForm {
 struct SecretForm {
     /// Id of the entry being edited, or `None` when adding a new one.
     original: Option<String>,
+    /// When duplicating, the id of the entry to copy the secret from. The form is
+    /// otherwise a *new* entry (`original` is `None`, so the slug follows the new
+    /// name), but its secret is prefilled by reference — never shown in plaintext,
+    /// and still gated behind the master password to reveal.
+    dup_from: Option<String>,
     name: String,
     kind: SecretKind,
     /// Optional username stored with the credential (overrides the session's).
@@ -936,6 +941,7 @@ impl SecretForm {
     fn new() -> Self {
         Self {
             original: None,
+            dup_from: None,
             name: String::new(),
             kind: SecretKind::Password,
             username: String::new(),
@@ -968,6 +974,19 @@ impl SecretForm {
     /// The optional public key as an `Option`, trimmed and empty-filtered.
     fn public_opt(&self) -> Option<String> {
         (!self.public.trim().is_empty()).then(|| self.public.trim().to_owned())
+    }
+
+    /// Whether the form has a secret the user hasn't typed: an existing entry
+    /// being edited, or a duplicate's prefilled source. Such a secret is shown as
+    /// dots and only revealed after the master password.
+    fn has_hidden_secret(&self) -> bool {
+        self.original.is_some() || self.dup_from.is_some()
+    }
+
+    /// The entry id whose secret backs this form (for reveal): the edited entry,
+    /// or a duplicate's source.
+    fn secret_source_id(&self) -> Option<&str> {
+        self.original.as_deref().or(self.dup_from.as_deref())
     }
 
     /// Builds the vault secret this form describes (value assumed non-empty).
@@ -4075,25 +4094,55 @@ impl App {
     }
 
     /// Copies a credential (by id) to a new, uniquely-named entry and selects it.
+    /// Opens the editor to duplicate an entry: a *new* entry (so its slug follows
+    /// the name the user saves) with the original's non-secret fields prefilled and
+    /// its secret carried by reference (`dup_from`) — never shown in plaintext, and
+    /// still requiring the master password to reveal.
     fn duplicate_credential(&mut self, id: &str) {
-        let Some(secret) = self.vault.unlocked().and_then(|v| v.get(id)).cloned() else { return };
-        let base = self.vault.unlocked().and_then(|v| v.name_of(id)).unwrap_or(id).to_owned();
-        let taken: std::collections::HashSet<String> = self
-            .vault
-            .unlocked()
-            .map(|v| v.entries().into_iter().map(|e| e.name.to_lowercase()).collect())
-            .unwrap_or_default();
+        let Some(vault) = self.vault.unlocked() else { return };
+        let Some(secret) = vault.get(id) else { return };
+        // Copy only the non-secret metadata; the secret value stays by reference.
+        let (kind, username, public, has_passphrase) = match secret {
+            Secret::Password { username, .. } => {
+                (SecretKind::Password, username.clone().unwrap_or_default(), String::new(), false)
+            }
+            Secret::PrivateKey { username, public, passphrase, .. } => (
+                SecretKind::Key,
+                username.clone().unwrap_or_default(),
+                public.clone().unwrap_or_default(),
+                passphrase.is_some(),
+            ),
+            Secret::Token { username, .. } => {
+                (SecretKind::Token, username.clone().unwrap_or_default(), String::new(), false)
+            }
+        };
+        // Default the name to "<name> copy", deduped against existing names.
+        let base = vault.name_of(id).unwrap_or(id).to_owned();
+        let taken: HashSet<String> =
+            vault.entries().into_iter().map(|e| e.name.to_lowercase()).collect();
         let mut new_name = format!("{base} copy");
         let mut n = 2;
         while taken.contains(&new_name.to_lowercase()) {
             new_name = format!("{base} copy {n}");
             n += 1;
         }
-        match self.vault.unlocked_mut().map(|v| v.add(&new_name, secret)) {
-            Some(Ok(new_id)) => self.select_credential(&new_id),
-            Some(Err(e)) => self.error = Some(format!("{e:#}")),
-            None => {}
-        }
+        // All vault reads are done; drop the borrow before mutating self.
+        self.vault_show_value = false;
+        self.vault_show_passphrase = false;
+        self.vault_selected = None;
+        self.vault_form = Some(SecretForm {
+            original: None,
+            dup_from: Some(id.to_owned()),
+            name: new_name,
+            kind,
+            username,
+            value: String::new(),
+            public,
+            comment: default_key_comment(),
+            public_derived: false,
+            passphrase: String::new(),
+            has_passphrase,
+        });
     }
 
     /// Deletes a credential by id, clearing the editor if it was selected.
@@ -4134,6 +4183,7 @@ impl App {
         self.vault_selected = Some(id.to_owned());
         self.vault_form = Some(SecretForm {
             original: Some(id.to_owned()),
+            dup_from: None,
             name: display_name,
             kind,
             username: username.unwrap_or_default(),
@@ -6846,7 +6896,10 @@ impl App {
             // The secret value(s) render outside the grid so a revealed multiline
             // key grows downward without overlapping the fields below it.
             ui.add_space(8.0);
-            let dots = if editing { "••••••••" } else { "" };
+            // A hidden secret (editing, or a duplicate's prefilled source) shows as
+            // dots until revealed with the master password.
+            let hidden = form.has_hidden_secret();
+            let dots = if hidden { "••••••••" } else { "" };
             match form.kind {
                 SecretKind::Password | SecretKind::Token => {
                     ui.label(if form.kind == SecretKind::Token { "Token:" } else { "Password:" });
@@ -6884,7 +6937,7 @@ impl App {
                         if show {
                             let resp = ui.add(
                                 egui::TextEdit::multiline(&mut form.value)
-                                    .hint_text(if editing { "" } else { "-----BEGIN ..." })
+                                    .hint_text(if hidden { "" } else { "-----BEGIN ..." })
                                     .desired_width(360.0)
                                     .desired_rows(6),
                             );
@@ -6895,7 +6948,7 @@ impl App {
                             }
                         } else {
                             // Masked placeholder (multiline can't show asterisks).
-                            let mut masked = if form.value.is_empty() && !editing {
+                            let mut masked = if form.value.is_empty() && !hidden {
                                 "(nothing yet)".to_owned()
                             } else {
                                 "•".repeat(16)
@@ -6977,7 +7030,7 @@ impl App {
             if show {
                 // Currently shown → hide.
                 self.vault_show_value = false;
-            } else if editing && form.value.trim().is_empty() {
+            } else if form.has_hidden_secret() && form.value.trim().is_empty() {
                 // Value not loaded yet → re-authenticate, then reveal.
                 reveal = true;
             } else {
@@ -6988,7 +7041,7 @@ impl App {
         if eye_clicked_pass {
             if show_pass {
                 self.vault_show_passphrase = false;
-            } else if editing && form.value.trim().is_empty() {
+            } else if form.has_hidden_secret() && form.value.trim().is_empty() {
                 // Nothing loaded yet → reveal (loads the key and its passphrase).
                 reveal = true;
             } else {
@@ -7023,7 +7076,7 @@ impl App {
             return;
         }
         if reveal {
-            if let Some(name) = form.original.clone() {
+            if let Some(name) = form.secret_source_id().map(str::to_owned) {
                 self.dialog = Dialog::RevealSecret { name, password: String::new(), error: None };
             }
             self.vault_form = Some(form);
@@ -7106,8 +7159,36 @@ impl App {
                 vault.update_secret(&id, secret).map_err(|e| format!("{e:#}"))?;
                 Ok(id)
             }
-            // New entry.
+            // New entry (including a duplicate, which has no `original`).
             None => {
+                // A duplicate with no new value typed: copy the source entry's
+                // secret (applying any edited username / public key), without ever
+                // exposing the plaintext. A typed value overrides it, below.
+                if form.value.trim().is_empty()
+                    && let Some(src_id) = form.dup_from.clone()
+                {
+                    let existing = self.vault.unlocked().and_then(|v| v.get(&src_id).cloned());
+                    let secret = match (form.kind, existing.as_ref()) {
+                        (SecretKind::Password, Some(Secret::Password { password, .. })) => {
+                            Secret::Password { username, password: password.clone() }
+                        }
+                        (
+                            SecretKind::Key,
+                            Some(Secret::PrivateKey { pem, public, passphrase, .. }),
+                        ) => Secret::PrivateKey {
+                            pem: pem.clone(),
+                            public: form.public_opt().or_else(|| public.clone()),
+                            passphrase: passphrase.clone(),
+                            username,
+                        },
+                        (SecretKind::Token, Some(Secret::Token { token, .. })) => {
+                            Secret::Token { token: token.clone(), username }
+                        }
+                        _ => return Err("Enter the new secret value to change its type.".into()),
+                    };
+                    let vault = self.vault.unlocked_mut().ok_or("The vault is locked.")?;
+                    return vault.add(&name, secret).map_err(|e| format!("{e:#}"));
+                }
                 if form.value.trim().is_empty() {
                     return Err("Enter the secret value.".into());
                 }
@@ -9229,9 +9310,10 @@ impl App {
             Ok(_) => {
                 let name = name.clone();
                 // Populate the revealed value straight into the edit form fields.
+                // Matches both an entry being edited and a duplicate's source.
                 if let Some(secret) = self.vault.unlocked().and_then(|v| v.get(&name)).cloned()
                     && let Some(form) = &mut self.vault_form
-                    && form.original.as_deref() == Some(name.as_str())
+                    && form.secret_source_id() == Some(name.as_str())
                 {
                     match &secret {
                         Secret::Password { password, .. } => form.value = password.clone(),
@@ -10339,6 +10421,7 @@ impl App {
         if let Dialog::VaultManager(state) = &mut self.dialog {
             state.form = Some(SecretForm {
                 original: Some(id.to_owned()),
+                dup_from: None,
                 name: display_name,
                 kind,
                 username,
