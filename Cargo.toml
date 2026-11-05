@@ -9,7 +9,7 @@ license = "MIT"
 
 [workspace.dependencies]
 eframe = "0.36"
-egui = "0.36"
+egui = "0.37"
 regex = "1"
 alacritty_terminal = "0.26"
 portable-pty = "0.9"
