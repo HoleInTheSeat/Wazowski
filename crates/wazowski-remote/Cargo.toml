@@ -17,4 +17,4 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 # pin that otherwise conflicts with russh.
 ironrdp = { version = "0.17", default-features = false, features = ["connector", "session", "graphics", "input", "svc", "dvc", "pdu", "core"] }
 ironrdp-tokio = "0.10"
-ironrdp-tls = { version = "0.2", features = ["rustls-ring"] }
+ironrdp-tls = { version = "0.3", features = ["rustls-ring"] }
