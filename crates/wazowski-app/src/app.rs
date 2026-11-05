@@ -319,6 +319,26 @@ fn eye_button(ui: &mut egui::Ui, shown: bool) -> bool {
     ui.button(text).on_hover_text(tip).clicked()
 }
 
+/// A collapsed-by-default disclosure that previews the pending commit subjects a
+/// push would send, so the outgoing changes can be inspected without the list
+/// always taking up space. `salt` disambiguates multiple previews on screen.
+fn changes_preview(ui: &mut egui::Ui, salt: &str, header: &str, changes: &[String]) {
+    egui::CollapsingHeader::new(header)
+        .id_salt(("changes-preview", salt))
+        .default_open(false)
+        .show(ui, |ui| {
+            if changes.is_empty() {
+                ui.label(RichText::new("(no change details available)").weak());
+                return;
+            }
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                for c in changes {
+                    ui.label(format!("• {c}"));
+                }
+            });
+        });
+}
+
 /// A full-width quick-filter text field with a magnifier hint. When `focus` is
 /// set it grabs keyboard focus, so opening a sidebar section lands the cursor in
 /// its filter (type to filter immediately, instead of into the terminal tab).
@@ -619,8 +639,9 @@ enum Dialog {
     AskUsername(UsernamePrompt),
     AddSource(AddSourceForm),
     MissingShare { id: String },
-    /// Confirm pushing a shared source's local changes to its remote (on "Sync now").
-    ConfirmSyncPush { id: String },
+    /// Confirm pushing a shared source's local changes to its remote (on "Sync
+    /// now"). `changes` are the pending commit subjects, for the preview.
+    ConfirmSyncPush { id: String, changes: Vec<String> },
     /// Confirm importing a settings backup (overwrites the current config).
     ImportSettings { path: PathBuf },
     /// A plain informational modal (title + body) with an OK button.
@@ -1082,8 +1103,9 @@ pub struct App {
     /// Set once the user has confirmed quitting, so the window is allowed to close.
     quitting: bool,
     /// Shared sources with unpushed changes at the last close attempt, as
-    /// `(id, name)`, so the quit dialog can offer to push or discard them.
-    quit_pending: Vec<(String, String)>,
+    /// `(id, name, changes)` — `changes` are the pending commit subjects, so the
+    /// quit dialog can offer to push or discard them and preview what would push.
+    quit_pending: Vec<(String, String, Vec<String>)>,
     /// Configured shared sources and their live state.
     sources_config: SourcesConfig,
     shared: Vec<SharedSource>,
@@ -4621,7 +4643,8 @@ impl App {
                     } else if source.has_pending() {
                         // There are outgoing changes to push — confirm first. If the
                         // sync was purely incoming, has_pending() is false and we're done.
-                        self.dialog = Dialog::ConfirmSyncPush { id };
+                        let changes = source.pending_commits();
+                        self.dialog = Dialog::ConfirmSyncPush { id, changes };
                     }
                 }
                 Ok(())
@@ -8180,8 +8203,9 @@ impl App {
     /// Confirms pushing a shared source's local changes to its remote, from the
     /// "Sync now" action. Only shown when there are outgoing changes to push.
     fn show_confirm_sync_push(&mut self, ctx: &egui::Context) {
-        let Dialog::ConfirmSyncPush { id } = &self.dialog else { return };
+        let Dialog::ConfirmSyncPush { id, changes } = &self.dialog else { return };
         let id = id.clone();
+        let changes = changes.clone();
         let name = self
             .shared
             .iter()
@@ -8191,13 +8215,24 @@ impl App {
         let mut push = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::new("confirm-sync-push")).show(ctx, |ui| {
-            ui.set_width(360.0);
+            ui.set_width(380.0);
             ui.heading("Push changes?");
-            ui.label(format!(
-                "\u{201c}{name}\u{201d} has local changes that are not yet on the remote. \
-                 Push them now?"
-            ));
-            ui.add_space(6.0);
+            if changes.is_empty() {
+                ui.label(format!(
+                    "\u{201c}{name}\u{201d} has local changes that are not yet on the remote. \
+                     Push them now?"
+                ));
+            } else {
+                ui.label(format!(
+                    "\u{201c}{name}\u{201d} has {} change{} to push:",
+                    changes.len(),
+                    if changes.len() == 1 { "" } else { "s" },
+                ));
+                ui.add_space(2.0);
+                // Collapsed by default so the list doesn't take over the dialog.
+                changes_preview(ui, "sync-push-preview", "Show changes", &changes);
+            }
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 push |= ui.button("Push").clicked();
                 cancel |= ui.button("Cancel").clicked();
@@ -8509,13 +8544,14 @@ impl App {
         }
     }
 
-    /// Shared sources with unpushed local changes, as `(id, name)`. Runs git
-    /// per source, so call it sparingly (e.g. once per close attempt).
-    fn collect_pending_shared(&self) -> Vec<(String, String)> {
+    /// Shared sources with unpushed local changes, as `(id, name, changes)` where
+    /// `changes` are the pending commit subjects (for the quit-dialog preview).
+    /// Runs git per source, so call it sparingly (e.g. once per close attempt).
+    fn collect_pending_shared(&self) -> Vec<(String, String, Vec<String>)> {
         self.shared
             .iter()
             .filter(|s| s.has_pending())
-            .map(|s| (s.id().to_owned(), s.name().to_owned()))
+            .map(|s| (s.id().to_owned(), s.name().to_owned(), s.pending_commits()))
             .collect()
     }
 
@@ -8552,8 +8588,15 @@ impl App {
             if has_pending {
                 ui.add_space(4.0);
                 ui.label("These shared sources have changes not yet pushed:");
-                for (_, name) in &pending {
-                    ui.label(format!("   • {name}"));
+                // One collapsed preview per source: names stay visible, the change
+                // list is behind a toggle so the dialog stays compact.
+                for (id, name, changes) in &pending {
+                    let header = format!(
+                        "{name}  ({} change{})",
+                        changes.len(),
+                        if changes.len() == 1 { "" } else { "s" },
+                    );
+                    changes_preview(ui, id, &header, changes);
                 }
             }
             ui.add_space(8.0);
@@ -8578,7 +8621,7 @@ impl App {
                 // Push each pending source; if any fail, stay open and report it
                 // rather than closing silently. Local commits are kept either way.
                 let mut failed: Vec<String> = Vec::new();
-                for (id, name) in &pending {
+                for (id, name, _) in &pending {
                     if let Some(source) = self.shared.iter_mut().find(|s| s.id() == *id)
                         && let Err(e) = source.push()
                     {
@@ -8603,7 +8646,7 @@ impl App {
                 }
             }
             Some(Act::Discard) => {
-                for (id, _) in &pending {
+                for (id, _, _) in &pending {
                     if let Some(source) = self.shared.iter_mut().find(|s| s.id() == *id) {
                         let _ = source.discard();
                     }

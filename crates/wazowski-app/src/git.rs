@@ -232,6 +232,30 @@ impl GitRepo {
         Ok(n > 0)
     }
 
+    /// Subjects of the commits a push would send: those ahead of the tracked
+    /// upstream, or — before the first push — every commit on HEAD. Most-recent
+    /// first. Empty on error, for a non-clone, or when nothing is pending. Used
+    /// to preview outgoing changes before pushing.
+    pub fn pending_commits(&self) -> Vec<String> {
+        if !self.work_dir.join(".git").is_dir() {
+            return Vec::new();
+        }
+        let range = if self.has_upstream() { "@{u}..HEAD" } else { "HEAD" };
+        let out = match self
+            .command(Some(&self.work_dir))
+            .args(["log", "--format=%s", range])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
     /// Discards local commits/changes, resetting the clone to match the remote.
     pub fn discard(&self) -> Result<()> {
         self.ensure_clone()?;

@@ -179,6 +179,14 @@ impl Backend {
         }
     }
 
+    /// Subjects of the commits a push would send (git only; empty for a folder).
+    fn pending_commits(&self) -> Vec<String> {
+        match self {
+            Backend::Folder(_) => Vec::new(),
+            Backend::Git(repo) => repo.pending_commits(),
+        }
+    }
+
     /// Discards local changes, matching the remote (git only).
     fn discard(&self) -> Result<()> {
         match self {
@@ -496,6 +504,14 @@ impl SharedSource {
     /// Whether there are local changes not yet pushed to the remote (git only).
     pub fn has_pending(&self) -> bool {
         self.backend.has_pending()
+    }
+
+    /// Human-readable summaries of the changes a push would send — the pending
+    /// commit subjects (e.g. "Session deleted: …"), most recent first. Empty for
+    /// a folder share (no history) or when nothing is pending. For previewing a
+    /// push before confirming it.
+    pub fn pending_commits(&self) -> Vec<String> {
+        self.backend.pending_commits()
     }
 
     /// Pushes locally-committed changes to the remote.
@@ -832,8 +848,14 @@ mod tests {
         // Mutations now commit locally without pushing, so the change is pending
         // until an explicit push.
         assert!(a.has_pending(), "the local commit should be pending a push");
+        // The push preview lists only the genuinely-unpushed commit subjects
+        // (descriptive). create() already pushed "Create sessions file", so just
+        // the new session's commit is pending.
+        let preview = a.pending_commits();
+        assert_eq!(preview, vec!["Session created: web".to_owned()], "preview: {preview:?}");
         a.push().unwrap();
         assert!(!a.has_pending(), "pushing clears the pending state");
+        assert!(a.pending_commits().is_empty(), "nothing to preview after a push");
 
         // A second clone of the same remote sees the pushed session.
         let cache_b = dir.path().join("cache-b");
