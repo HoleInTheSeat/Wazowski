@@ -722,9 +722,10 @@ impl Default for AddSourceForm {
 }
 
 impl AddSourceForm {
-    /// Prefills the form from an existing source. The description lives in the
-    /// shared file, so it's passed in from the live store.
-    fn from_def(def: &SourceDef, description: &str) -> Self {
+    /// Prefills the form from an existing source. The description, icon and color
+    /// live in the shared file, so they're passed in from the live store (with the
+    /// SourceDef as the migration fallback, resolved by the caller).
+    fn from_def(def: &SourceDef, description: &str, icon: &str, color: Option<[u8; 3]>) -> Self {
         Self {
             edit_id: Some(def.id.clone()),
             name: def.name.clone(),
@@ -739,8 +740,8 @@ impl AddSourceForm {
             key_path: def.key_path.clone(),
             vault_entry: def.vault_entry.clone(),
             picker: VaultPickerState::default(),
-            icon: def.icon.clone(),
-            color: def.color,
+            icon: icon.to_owned(),
+            color,
         }
     }
 }
@@ -4334,11 +4335,13 @@ impl App {
         // Each shared source as its own collapsible section.
         for source in &self.shared {
             let badge = if source.available() { "" } else { "  (offline)" };
-            let def = source.def();
-            let icon = if def.icon.is_empty() { "🌐" } else { def.icon.as_str() };
+            // Icon/color live in the shared file (travelling to every user), with
+            // the local SourceDef as a fallback for not-yet-migrated sources.
+            let glyph = source.display_icon();
+            let icon = if glyph.is_empty() { "🌐" } else { glyph };
             let title = {
                 let t = RichText::new(format!("{icon} {}{badge}", source.name()));
-                match def.color {
+                match source.display_color() {
                     Some([r, g, b]) => t.color(Color32::from_rgb(r, g, b)),
                     None => t,
                 }
@@ -4623,8 +4626,14 @@ impl App {
                 if let Some(source) = self.shared.iter().find(|s| s.id() == id) {
                     let def = source.def().clone();
                     let description = source.description().to_owned();
-                    self.dialog =
-                        Dialog::AddSource(AddSourceForm::from_def(&def, &description));
+                    let icon = source.display_icon().to_owned();
+                    let color = source.display_color();
+                    self.dialog = Dialog::AddSource(AddSourceForm::from_def(
+                        &def,
+                        &description,
+                        &icon,
+                        color,
+                    ));
                 }
                 Ok(())
             }
@@ -8418,26 +8427,36 @@ impl App {
         }
         let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
         let auth = vault_git_auth(&def, self.vault.unlocked());
+        // Icon/color travel in the shared file; capture them before `def` moves.
+        let icon = def.icon.clone();
+        let color = def.color;
         let mut source = SharedSource::open(def, &cache, auth);
         // A new source's file usually doesn't exist yet; create it (with the
-        // description baked in) so the share is immediately usable.
+        // description and appearance baked in) so the share is immediately usable.
         if !source.available() && source.missing() {
             source.prime_description(description);
+            source.prime_appearance(&icon, color);
             if let Err(e) = source.create() {
                 self.error = Some(format!("Added, but could not create the shared file: {e:#}"));
             }
-        } else if source.available()
-            && source.description() != description
-            && let Err(e) = source.set_description(description)
-        {
-            self.error = Some(format!("Added, but could not save the description: {e:#}"));
+        } else if source.available() {
+            if source.description() != description
+                && let Err(e) = source.set_description(description)
+            {
+                self.error = Some(format!("Added, but could not save the description: {e:#}"));
+            }
+            if (source.stored_icon() != icon || source.stored_color() != color)
+                && let Err(e) = source.set_appearance(&icon, color)
+            {
+                self.error = Some(format!("Added, but could not save the appearance: {e:#}"));
+            }
         }
         self.shared.push(source);
     }
 
     /// Applies edits to an existing shared source: updates its token, config
     /// entry, live state (re-opening from the new definition), and the shared
-    /// description (which lives in the shared file, not the local config).
+    /// description/appearance (which live in the shared file, not the local config).
     fn update_source(&mut self, def: SourceDef, token: Option<String>, description: &str) {
         if def.auth == GitAuthKind::Https {
             if let Some(token) = token
@@ -8455,12 +8474,20 @@ impl App {
         }
         let cache = sources::cache_dir().unwrap_or_else(|_| "shared-cache".into());
         let auth = vault_git_auth(&def, self.vault.unlocked());
+        let icon = def.icon.clone();
+        let color = def.color;
         let mut source = SharedSource::open(def.clone(), &cache, auth);
-        if source.available()
-            && source.description() != description
-            && let Err(e) = source.set_description(description)
-        {
-            self.error = Some(format!("Saved, but could not update the description: {e:#}"));
+        if source.available() {
+            if source.description() != description
+                && let Err(e) = source.set_description(description)
+            {
+                self.error = Some(format!("Saved, but could not update the description: {e:#}"));
+            }
+            if (source.stored_icon() != icon || source.stored_color() != color)
+                && let Err(e) = source.set_appearance(&icon, color)
+            {
+                self.error = Some(format!("Saved, but could not update the appearance: {e:#}"));
+            }
         }
         match self.shared.iter_mut().find(|s| s.id() == def.id) {
             Some(slot) => *slot = source,

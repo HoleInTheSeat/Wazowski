@@ -256,6 +256,12 @@ pub struct SessionStore {
     /// Optional free-text description of this collection (used by shared sources,
     /// so it travels with the file and every user sees it).
     description: String,
+    /// Optional custom header icon (an emoji) for this collection; empty uses the
+    /// default. Like the description, it's stored in the file so a shared source's
+    /// appearance travels and every user sees it.
+    icon: String,
+    /// Optional custom header color, as sRGB `[r, g, b]` (shared, like `icon`).
+    color: Option<[u8; 3]>,
 }
 
 /// The serialized file shape: `[[session]]` tables plus a `folders` list.
@@ -263,6 +269,10 @@ pub struct SessionStore {
 struct StoreFile {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    icon: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<[u8; 3]>,
     #[serde(default, rename = "session")]
     sessions: Vec<Session>,
     #[serde(default)]
@@ -293,6 +303,8 @@ impl SessionStore {
             folders: file.folders,
             folder_styles: file.folder_styles,
             description: file.description,
+            icon: file.icon,
+            color: file.color,
         };
         // Migrate any legacy auth (agent / password / key) to the current model,
         // persisting best-effort so the file is upgraded for next time.
@@ -314,6 +326,24 @@ impl SessionStore {
     /// Sets the collection's description and saves.
     pub fn set_description(&mut self, description: impl Into<String>) -> Result<()> {
         self.description = description.into();
+        self.save()
+    }
+
+    /// This collection's custom header icon (an emoji), empty if none. Stored in
+    /// the file so a shared source's appearance travels to every user.
+    pub fn icon(&self) -> &str {
+        &self.icon
+    }
+
+    /// This collection's custom header color, if any (shared, like [`icon`]).
+    pub fn color(&self) -> Option<[u8; 3]> {
+        self.color
+    }
+
+    /// Sets the collection's icon and color (shared appearance) and saves.
+    pub fn set_appearance(&mut self, icon: impl Into<String>, color: Option<[u8; 3]>) -> Result<()> {
+        self.icon = icon.into();
+        self.color = color;
         self.save()
     }
 
@@ -464,6 +494,8 @@ impl SessionStore {
         }
         let file = StoreFile {
             description: self.description.clone(),
+            icon: self.icon.clone(),
+            color: self.color,
             sessions: self.sessions.clone(),
             folders: self.folders.clone(),
             folder_styles: self.folder_styles.clone(),
@@ -565,6 +597,24 @@ secret = "deploy-key"
             reloaded.get("dddddddddddddddd").unwrap().auth,
             Auth::Vault { entry: "deploy-key".into() }
         );
+    }
+
+    #[test]
+    fn appearance_persists_in_the_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.toml");
+        let mut store = SessionStore::load(path.clone()).unwrap();
+        assert_eq!(store.icon(), "");
+        assert_eq!(store.color(), None);
+
+        store.set_appearance("🌐", Some([10, 20, 30])).unwrap();
+        store.set_description("Team").unwrap();
+
+        // Icon, color and description all survive a reload from the file.
+        let reloaded = SessionStore::load(path).unwrap();
+        assert_eq!(reloaded.icon(), "🌐");
+        assert_eq!(reloaded.color(), Some([10, 20, 30]));
+        assert_eq!(reloaded.description(), "Team");
     }
 
     #[test]

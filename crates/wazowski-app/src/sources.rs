@@ -459,6 +459,40 @@ impl SharedSource {
         let _ = self.store.set_description(description);
     }
 
+    /// The source's effective header icon: the one stored in the shared file, or,
+    /// if the file has none yet, the local `SourceDef` icon (so appearance set by
+    /// an older build still shows and migrates into the file on the next save).
+    pub fn display_icon(&self) -> &str {
+        if self.store.icon().is_empty() { &self.def.icon } else { self.store.icon() }
+    }
+
+    /// The source's effective header color: the shared-file color, else the local
+    /// `SourceDef` color (same migration fallback as [`display_icon`]).
+    pub fn display_color(&self) -> Option<[u8; 3]> {
+        self.store.color().or(self.def.color)
+    }
+
+    /// The icon/color stored in the shared file itself (no `SourceDef` fallback).
+    pub fn stored_icon(&self) -> &str {
+        self.store.icon()
+    }
+
+    pub fn stored_color(&self) -> Option<[u8; 3]> {
+        self.store.color()
+    }
+
+    /// Sets the source's icon and color in the shared file (write-through), so the
+    /// appearance travels with the sessions and every user sees it.
+    pub fn set_appearance(&mut self, icon: &str, color: Option<[u8; 3]>) -> Result<()> {
+        self.mutate("Update source appearance", |s| s.set_appearance(icon, color))
+    }
+
+    /// Sets the icon/color in the in-memory store only, to be persisted by the next
+    /// `create()` — used when first creating a brand-new source's file.
+    pub fn prime_appearance(&mut self, icon: &str, color: Option<[u8; 3]>) {
+        let _ = self.store.set_appearance(icon, color);
+    }
+
     /// Whether there are local changes not yet pushed to the remote (git only).
     pub fn has_pending(&self) -> bool {
         self.backend.has_pending()
@@ -677,13 +711,16 @@ mod tests {
         assert!(source.available());
         source.upsert(Session::new("web", "example.com", "root")).unwrap();
         source.set_description("Team servers").unwrap();
+        source.set_appearance("🌐", Some([1, 2, 3])).unwrap();
         assert!(share.exists(), "share file should be written");
         assert_eq!(source.store().all().len(), 1);
 
-        // Reopen from the share: the description is stored in the file, so it and
-        // the session both come back.
+        // Reopen from the share: description and appearance are stored in the file,
+        // so they travel with the sessions (every user sees the same icon/color).
         let reopened = SharedSource::open(def.clone(), &cache, None);
         assert_eq!(reopened.description(), "Team servers", "description persists in the file");
+        assert_eq!(reopened.stored_icon(), "🌐", "icon travels in the file");
+        assert_eq!(reopened.stored_color(), Some([1, 2, 3]), "color travels in the file");
         assert_eq!(reopened.store().all().len(), 1);
 
         // Reopen from cache with the share removed: session still present, offline.
