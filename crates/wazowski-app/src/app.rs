@@ -319,6 +319,31 @@ fn eye_button(ui: &mut egui::Ui, shown: bool) -> bool {
     ui.button(text).on_hover_text(tip).clicked()
 }
 
+/// Renders a vault entry's stable id (slug) in gray next to its name box, with a
+/// tooltip. `id` is the entry's fixed id when editing, or the live preview slug a
+/// new entry's name would get. Empty renders nothing.
+fn vault_id_label(ui: &mut egui::Ui, id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    ui.add(egui::Label::new(RichText::new(format!("id: {id}")).weak().monospace()).truncate())
+        .on_hover_text(
+            "The entry's stable id, used to reference it. It's set when the entry is \
+             created and never changes, even if you rename it.",
+        );
+}
+
+/// The stable id to show for a vault-entry form: the fixed `original` id when
+/// editing, or the live slug the current `name` would get for a new entry
+/// (de-duplicated against `existing_ids`). New entries — including duplicates —
+/// follow their name until saved, then keep the id forever.
+fn form_entry_id(original: Option<&str>, name: &str, existing_ids: &[String]) -> String {
+    match original {
+        Some(id) => id.to_owned(),
+        None => wazowski_core::preview_slug(name, existing_ids),
+    }
+}
+
 /// A collapsed-by-default disclosure that previews the pending commit subjects a
 /// push would send, so the outgoing changes can be inspected without the list
 /// always taking up space. `salt` disambiguates multiple previews on screen.
@@ -6786,6 +6811,8 @@ impl App {
         let mut derive_public = false;
         let mut gen_request: Option<wazowski_ssh::KeyAlgo> = None;
 
+        // For the id hint next to the name (the vault borrow ends with the closure).
+        let id_vault = self.vault.unlocked();
         ui.heading(if editing { "Edit credential" } else { "New credential" });
         ui.separator();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -6793,7 +6820,14 @@ impl App {
                 ui.label("Name:");
                 // The name is freely editable, including when editing (a rename
                 // keeps the entry's id, so sessions stay linked).
-                ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(240.0));
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(240.0));
+                    let id = match &form.original {
+                        Some(id) => id.clone(),
+                        None => id_vault.map(|v| v.preview_id(&form.name)).unwrap_or_default(),
+                    };
+                    vault_id_label(ui, &id);
+                });
                 ui.end_row();
                 ui.label("Type:");
                 egui::ComboBox::from_id_salt("vault-type")
@@ -8975,11 +9009,16 @@ impl App {
                 ui.add_space(6.0);
                 egui::Grid::new("cred-fields").num_columns(2).show(ui, |ui| {
                     ui.label("Name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut form.name)
-                            .hint_text(&expected_id)
-                            .desired_width(240.0),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.name)
+                                .hint_text(&expected_id)
+                                .desired_width(240.0),
+                        );
+                        // The id is fixed here (the session already references it),
+                        // so it doesn't follow the name.
+                        vault_id_label(ui, &expected_id);
+                    });
                     ui.end_row();
                     ui.label("Type");
                     egui::ComboBox::from_id_salt("cred-kind")
@@ -9990,6 +10029,8 @@ impl App {
         }
         let mut action = Action::None;
         let entries = self.vault.unlocked().map(|v| v.entries()).unwrap_or_default();
+        // Existing ids, to preview the slug a new entry's name would get.
+        let existing_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
 
         if let Dialog::VaultManager(state) = &mut self.dialog {
             egui::Modal::new(egui::Id::new("vault-manager")).show(ctx, |ui| {
@@ -10006,7 +10047,11 @@ impl App {
                     ui.label(RichText::new("Creates a keypair and stores the private and public keys here.").weak());
                     egui::Grid::new("gen-fields").num_columns(2).show(ui, |ui| {
                         ui.label("Name");
-                        ui.text_edit_singleline(&mut gf.name);
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut gf.name);
+                            // A generated key is always a new entry: preview its id.
+                            vault_id_label(ui, &wazowski_core::preview_slug(&gf.name, &existing_ids));
+                        });
                         ui.end_row();
                         ui.label("Algorithm");
                         egui::ComboBox::from_id_salt("gen-algo")
@@ -10095,7 +10140,15 @@ impl App {
                         egui::Grid::new("secret-fields").num_columns(2).show(ui, |ui| {
                             ui.label("Name");
                             // Freely editable (a rename keeps the entry's id).
-                            ui.add(egui::TextEdit::singleline(&mut form.name));
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut form.name));
+                                let id = form_entry_id(
+                                    form.original.as_deref(),
+                                    &form.name,
+                                    &existing_ids,
+                                );
+                                vault_id_label(ui, &id);
+                            });
                             ui.end_row();
                             ui.label("Type");
                             egui::ComboBox::from_id_salt("secret-kind")

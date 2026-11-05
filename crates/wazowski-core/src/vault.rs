@@ -203,6 +203,21 @@ fn unique_id(base: &str, existing: &BTreeMap<String, Entry>) -> String {
     (2..).map(|n| format!("{base}-{n}")).find(|c| !existing.contains_key(c)).unwrap()
 }
 
+/// The id (slug) a new entry named `name` would get, de-duplicated against
+/// `existing_ids`. Standalone twin of [`Vault::preview_id`] for UI call sites
+/// that have only the id list at hand (not a live `&Vault`), so a form can show
+/// the id a new entry — or a duplicate — will receive before it's saved.
+pub fn preview_slug(name: &str, existing_ids: &[String]) -> String {
+    let base = slugify(name);
+    if !existing_ids.iter().any(|id| id == &base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|c| !existing_ids.iter().any(|id| id == c))
+        .unwrap()
+}
+
 /// Argon2id cost parameters, stored in the file so an old vault still opens if defaults change.
 #[derive(Clone, Copy)]
 struct KdfParams {
@@ -313,6 +328,14 @@ impl Vault {
     /// The display name for an id.
     pub fn name_of(&self, id: &str) -> Option<&str> {
         self.doc.entries.get(id).map(|e| e.name.as_str())
+    }
+
+    /// The id (slug) that [`add`](Self::add) would assign to a new entry named
+    /// `name`, given the entries already present. For previewing the stable id in
+    /// the UI while an entry is being created — the id never changes afterwards,
+    /// even if the entry is renamed.
+    pub fn preview_id(&self, name: &str) -> String {
+        unique_id(&slugify(name), &self.doc.entries)
     }
 
     /// Whether `name` (case-insensitive) is already used by another entry.
@@ -728,6 +751,26 @@ mod tests {
         assert_eq!(slugify("  Prod / DB  "), "prod-db");
         assert_eq!(slugify("a@@@b"), "a-b");
         assert_eq!(slugify("!!!"), "entry");
+    }
+
+    #[test]
+    fn preview_slug_matches_the_assigned_id() {
+        // Standalone preview with no existing ids: the bare slug.
+        assert_eq!(preview_slug("Prod DB", &[]), "prod-db");
+        assert_eq!(preview_slug("!!!", &[]), "entry");
+
+        // De-dupes against existing ids, matching what `add` would assign.
+        let existing = vec!["prod-db".to_owned()];
+        assert_eq!(preview_slug("Prod DB", &existing), "prod-db-2");
+
+        // And it agrees with the live Vault::preview_id (and the real add()).
+        let dir = tempdir().unwrap();
+        let mut vault = Vault::create(dir.path().join("v.enc"), "pw").unwrap();
+        assert_eq!(vault.preview_id("Prod DB"), "prod-db");
+        let id = vault.add("Prod DB", Secret::Password { username: None, password: "x".into() }).unwrap();
+        assert_eq!(id, "prod-db");
+        // After it exists, a second entry with the same name previews the deduped id.
+        assert_eq!(vault.preview_id("Prod DB"), "prod-db-2");
     }
 
     #[test]
