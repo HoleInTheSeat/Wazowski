@@ -71,7 +71,11 @@ impl Terminal {
     pub fn new(backend: Box<dyn Backend>, output: Receiver<BackendEvent>, size: TermSize) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let (tx, term_events) = mpsc::channel();
-        let config = Config::default();
+        // Keep far more scrollback than alacritty's 10k default, so long sessions
+        // stay fully scrollable and "Save/Print output" captures the whole thing.
+        // Scrollback is allocated lazily, so this costs nothing until a session
+        // actually produces that many lines.
+        let config = Config { scrolling_history: 100_000, ..Config::default() };
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             term: Term::new(config, &Dims(size), EventProxy(tx)),
@@ -389,6 +393,25 @@ mod tests {
         term.process(&egui::Context::default());
         assert_eq!(term.screen_text(), "hello\nworld");
         assert_eq!(term.title(), "my title");
+    }
+
+    #[test]
+    fn full_text_includes_scrollback() {
+        let (mut term, tx, _) = fake_terminal();
+        let mut out = String::new();
+        for i in 1..=300 {
+            out.push_str(&format!("line{i}\r\n"));
+        }
+        tx.send(BackendEvent::Output(out.into_bytes())).unwrap();
+        term.process(&egui::Context::default());
+        let full = term.full_text();
+        let screen = term.screen_text();
+        // The earliest lines have scrolled off the screen but must be in full_text.
+        assert!(!screen.contains("line1\n") && !screen.starts_with("line1"),
+            "sanity: line1 should have scrolled out of the visible screen");
+        assert!(full.contains("line1"), "full_text dropped early scrollback");
+        assert!(full.contains("line150"), "full_text dropped mid scrollback");
+        assert!(full.contains("line300"), "full_text dropped the latest output");
     }
 
     #[test]
