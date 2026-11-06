@@ -11,6 +11,12 @@ bandwidth. Find them under **Tools** (🔧) → **Quick servers**.
 - **HTTP** — serve a folder read-only over HTTP.
 - **TFTP** — serve a folder, read-only or **writable** (uploads), as network gear
   often expects for firmware/config.
+  > ⚠ **Binary files: use the client's `binary`/`octet` mode.** Many `tftp`
+  > clients default to `netascii`, which rewrites line endings and **corrupts
+  > binary files** (firmware images, archives, the vault backup, …) before they
+  > ever reach the server. Type `binary` (or `mode octet`) in your client first,
+  > or — simpler — use the **SFTP** or **HTTP** quick server for binary files;
+  > both are always byte-exact.
 - **SFTP** — serve a folder over SFTP with **password auth**, confined to that
   folder. Set a username (empty = anonymous / any username) and whether writes are
   allowed.

@@ -61,6 +61,23 @@ Open it anyway (a one-time step per download):
   (If `xattr -d` says "No such xattr", use `xattr -c <file>` to clear all
   attributes.)
 
+## A file transferred over the TFTP quick server is corrupted
+
+TFTP has two modes: **octet** (binary, byte-exact) and **netascii** (rewrites line
+endings). Many `tftp` clients **default to netascii**, which mangles binary files
+(firmware images, archives, an exported vault, …) *on the client side* before they
+reach Wazowski — so the saved file is broken even though the transfer "succeeded."
+
+Fixes:
+
+- In your TFTP client, switch to binary first: type `binary` (or `mode octet`)
+  before `get`/`put`.
+- Or avoid the gotcha entirely: use the **SFTP** or **HTTP** quick server for
+  binary files — both are always byte-exact (no mode to get wrong).
+
+(If a file already came across corrupted, re-transfer it in binary mode — the
+mangling can't be reversed after the fact.)
+
 ## Where is the log file?
 
 Wazowski writes a rolling log (connections, SSH handshakes, and shared-source
