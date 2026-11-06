@@ -2999,10 +2999,13 @@ impl App {
                 if ui.button("✕").on_hover_text("Close").clicked() {
                     quit = true;
                 }
-                if ui.button("🗖").on_hover_text("Maximize / restore").clicked() {
+                // Plain geometric glyphs (in the bundled DejaVu font) rather than the
+                // Windows-only 🗖/🗕 symbols, which have no glyph on macOS and render
+                // as tofu there.
+                if ui.button("□").on_hover_text("Maximize / restore").clicked() {
                     toggle_max = true;
                 }
-                if ui.button("🗕").on_hover_text("Minimize").clicked() {
+                if ui.button("—").on_hover_text("Minimize").clicked() {
                     minimize = true;
                 }
                 let (icon, hint) = if self.dark_mode {
