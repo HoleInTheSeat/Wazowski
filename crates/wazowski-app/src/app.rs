@@ -8666,12 +8666,19 @@ impl App {
                 self.error = Some(format!("Added, but could not create the shared file: {e:#}"));
             }
         } else if source.available() {
-            if source.description() != description
+            // The file already exists (e.g. a source a teammate created, or the same
+            // one re-added on another machine). Adopt its description/appearance —
+            // only fill a field the shared file is actually missing, so adding never
+            // clobbers metadata someone already set with our (often blank) add form.
+            if source.description().is_empty()
+                && !description.is_empty()
                 && let Err(e) = source.set_description(description)
             {
                 self.error = Some(format!("Added, but could not save the description: {e:#}"));
             }
-            if (source.stored_icon() != icon || source.stored_color() != color)
+            if source.stored_icon().is_empty()
+                && source.stored_color().is_none()
+                && (!icon.is_empty() || color.is_some())
                 && let Err(e) = source.set_appearance(&icon, color)
             {
                 self.error = Some(format!("Added, but could not save the appearance: {e:#}"));

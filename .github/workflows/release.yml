@@ -221,10 +221,25 @@ jobs:
           # Raw binary (what the in-app updater matches on: *-macos-aarch64).
           cp target/release/wazowski "dist/wazowski-${GITHUB_REF_NAME}-macos-aarch64"
 
-          # .dmg with an Applications shortcut for drag-to-install.
+          # .dmg with an Applications shortcut for drag-to-install, plus a
+          # first-launch note (the app is unsigned/un-notarized, so Gatekeeper
+          # warns once) shown right in the opened disk image.
           mkdir -p dmgroot
           cp -R "$app" dmgroot/
           ln -s /Applications dmgroot/Applications
+          cat > "dmgroot/How to open Wazowski (first launch).txt" <<'READ'
+          Wazowski isn't signed with a paid Apple certificate, so on FIRST launch
+          macOS will warn - and may only offer "Move to Trash". This is expected,
+          not an actual problem with the app.
+
+          To open it:
+            1. Drag Wazowski into the Applications folder (shown here).
+            2. In Applications, RIGHT-CLICK Wazowski -> Open -> Open.
+               If macOS still refuses: open System Settings -> Privacy & Security,
+               scroll to the message about Wazowski, and click "Open Anyway".
+
+          You only need to do this once. An update may prompt the same way.
+          READ
           hdiutil create -volname "Wazowski" -srcfolder dmgroot -ov -format UDZO \
             "dist/wazowski-${GITHUB_REF_NAME}-macos-aarch64.dmg"
 
