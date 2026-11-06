@@ -19,7 +19,7 @@ How the update is applied depends on how you installed Wazowski:
 | **Linux AppImage** | **Yes** — replaces the `.AppImage` in place. |
 | **Raw binary** (downloaded exe/binary) | **Yes**, if the file is writable. |
 | **Linux RPM (`dnf`)** | **No** — it's owned by your package manager. The dialog tells you to run `dnf upgrade` instead. |
-| **macOS** | **Yes** — replaces the app (you may get an "unidentified developer" prompt, since builds are unsigned). |
+| **macOS** | **Yes** — replaces the app in place. Builds are **unsigned/un-notarized**, so macOS Gatekeeper may re-show its "can't be opened" warning after an update; see [Troubleshooting](troubleshooting.md#macos-malware--cant-be-opened-on-first-launch-only-option-is-trash). |
 
 After **Download & install**, choose **Restart now** to relaunch into the new
 version (or **Later** to restart yourself).

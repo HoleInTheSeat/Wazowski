@@ -79,6 +79,12 @@ chmod +x Wazowski-*-x86_64.AppImage
 ./Wazowski-*-x86_64.AppImage
 ```
 
+**macOS (Apple Silicon):** download the `.dmg`, open it, and drag **Wazowski** into
+**Applications**. Builds are **unsigned/un-notarized**, so on first launch macOS
+Gatekeeper warns — **right-click the app → Open**, or allow it under **System
+Settings → Privacy & Security → Open Anyway**. If the dialog only offers "Move to
+Trash", see [Troubleshooting](docs/troubleshooting.md).
+
 If you run the raw Linux binary, the GUI needs these runtime libraries:
 
 - Fedora: `sudo dnf install libxkbcommon wayland-libs libX11 libXcursor libXrandr libXi mesa-libGL`

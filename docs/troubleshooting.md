@@ -39,6 +39,28 @@ fetch and falls back to its (possibly empty) local cache.
 - The exact failure is recorded in the log file (see below) — a missing binary
   reads as *"git is not installed or not on PATH"*.
 
+## macOS: "malware" / "can't be opened" on first launch (only option is Trash)
+
+Wazowski's macOS build is **ad-hoc signed but not notarized** (notarization needs a
+paid Apple Developer ID). On first launch of a downloaded, un-notarized app,
+**Gatekeeper** blocks it — on recent macOS the dialog may only offer **Move to
+Trash**. This is expected; it's not an actual infection. `chmod +x` alone won't
+help, because the file carries a `com.apple.quarantine` flag from the download.
+
+Open it anyway (a one-time step per download):
+
+- **From the `.dmg`:** drag **Wazowski.app** into **Applications**, then
+  **right-click it → Open**. If macOS still refuses, go to **System Settings →
+  Privacy & Security**, scroll to the Wazowski message, and click **Open Anyway**.
+- **A raw binary:** strip the quarantine flag, then run it:
+  ```sh
+  xattr -d com.apple.quarantine ~/Downloads/wazowski-*-macos-aarch64
+  chmod +x ~/Downloads/wazowski-*-macos-aarch64
+  ~/Downloads/wazowski-*-macos-aarch64
+  ```
+  (If `xattr -d` says "No such xattr", use `xattr -c <file>` to clear all
+  attributes.)
+
 ## Where is the log file?
 
 Wazowski writes a rolling log (connections, SSH handshakes, and shared-source

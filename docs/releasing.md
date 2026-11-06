@@ -62,22 +62,30 @@ It never needs a stored secret: every run gets an automatic `GITHUB_TOKEN`, and
 
 | Job | Runner | Produces |
 |---|---|---|
-| **build** (matrix) | ubuntu / macos / windows | the raw binary for each platform |
+| **build** (matrix) | ubuntu / windows | the raw Linux & Windows binaries |
 | **package-linux** | ubuntu | Fedora **RPM** + portable **AppImage** |
 | **package-windows** | windows | Inno Setup **installer** (`…-setup.exe`) |
+| **package-macos** | macos | a **`.app` bundle in a `.dmg`** + the raw macOS binary |
 | **release** | ubuntu | gathers all artifacts → publishes the GitHub Release |
 
-**The matrix** writes the build once and runs it on three OSes:
+**The matrix** writes the Linux/Windows build once and runs it on both OSes:
 
 ```yaml
 strategy:
   matrix:
     include:
       - { os: ubuntu-latest,  platform: linux-x86_64,   bin: wazowski }
-      - { os: macos-latest,   platform: macos-aarch64,  bin: wazowski }
       - { os: windows-latest, platform: windows-x86_64, bin: wazowski.exe }
 runs-on: ${{ matrix.os }}
 ```
+
+macOS is its own `package-macos` job (it needs extra steps — bundle, icon, sign,
+`.dmg` — that don't fit the matrix). It emits **both** the raw `…-macos-aarch64`
+binary (what the in-app updater matches on) **and** a `Wazowski.app` inside a
+`.dmg` for people to download and drag to Applications. The `.dmg` is **ad-hoc
+signed only, not notarized**, so first launch still trips Gatekeeper — see
+[Troubleshooting](troubleshooting.md). Removing that warning entirely would
+require a paid Apple **Developer ID** certificate and **notarization**.
 
 **Files move between jobs via the artifact store** — each job runs on its own
 fresh VM, so build jobs `actions/upload-artifact` and the publish job
@@ -104,7 +112,7 @@ can fail to even *acquire* one. Two guards keep that from blocking a release:
 - The publish job runs `if: ${{ !cancelled() && needs.package-linux.result == 'success' }}`.
 
 So **Linux + Windows still publish even if macOS never ran** — but the overall
-run shows red, and the macOS asset is missing. That red is infrastructure, not
+run shows red, and the macOS assets are missing. That red is infrastructure, not
 your code. To backfill macOS once capacity frees up:
 
 ```sh
@@ -113,13 +121,13 @@ gh run list --workflow release.yml --limit 5
 gh run rerun <run-id> --failed
 ```
 
-When the macOS build succeeds, download its artifact and attach it to the
-release (or re-run the whole workflow for the tag so the publish job re-collects
-everything):
+When `package-macos` succeeds, download its artifact bundle and attach everything
+to the release (or re-run the whole workflow for the tag so the publish job
+re-collects it):
 
 ```sh
-gh run download <run-id> -n wazowski-<tag>-macos-aarch64 -D /tmp/macos
-gh release upload <tag> /tmp/macos/* --clobber
+gh run download <run-id> -n wazowski-macos -D /tmp/macos
+gh release upload <tag> /tmp/macos/* --clobber   # the .dmg and the raw binary
 ```
 
 ### Caching
@@ -180,7 +188,8 @@ gh run list --branch main --limit 1   # last CI run should be success
    gh release view vX.Y.Z --json tagName,assets --jq '{tag:.tagName, assets:[.assets[].name]}'
    ```
    Expect Linux (binary + `.rpm` + `.AppImage`), Windows (`-setup.exe` + portable
-   `.exe`), and macOS (`-aarch64`). If macOS is missing, see the caveat above.
+   `.exe`), and macOS (`-macos-aarch64` binary + `.dmg`). If macOS is missing, see
+   the caveat above.
 
 > **Forgot the tag?** If you pushed the "Release X.Y.Z" commit but no release
 > appeared, you likely skipped the tag push — the commit only changes the version

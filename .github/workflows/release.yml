@@ -14,19 +14,12 @@ jobs:
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
-    # macOS arm64 hosted runners are frequently capacity-constrained; don't let a
-    # missing macOS runner block the Linux/Windows artifacts from publishing.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             platform: linux-x86_64
-            bin: wazowski
-            ext: ""
-          - os: macos-latest
-            platform: macos-aarch64
             bin: wazowski
             ext: ""
           - os: windows-latest
@@ -163,13 +156,91 @@ jobs:
           name: wazowski-windows-installer
           path: dist/*
 
+  package-macos:
+    name: Package macOS (.app + .dmg)
+    runs-on: macos-latest
+    # macOS arm64 hosted runners are frequently capacity-constrained; don't let a
+    # missing macOS runner block the Linux/Windows release. Re-run this job later
+    # to backfill the macOS assets (see docs/releasing.md).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p wazowski-app
+
+      - name: Assemble .app, ad-hoc sign, and build .dmg
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          app="Wazowski.app"
+
+          # icon.png -> wazowski.icns (all the sizes macOS wants)
+          mkdir -p Wazowski.iconset
+          for pair in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" \
+                      "128 128x128" "256 128x128@2x" "256 256x256" \
+                      "512 256x256@2x" "512 512x512" "1024 512x512@2x"; do
+            set -- $pair
+            sips -z "$1" "$1" icon.png --out "Wazowski.iconset/icon_$2.png" >/dev/null
+          done
+          iconutil -c icns Wazowski.iconset -o wazowski.icns
+
+          # bundle layout
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/wazowski "$app/Contents/MacOS/wazowski"
+          chmod +x "$app/Contents/MacOS/wazowski"
+          cp wazowski.icns "$app/Contents/Resources/wazowski.icns"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          <key>CFBundleName</key><string>Wazowski</string>
+          <key>CFBundleDisplayName</key><string>Wazowski</string>
+          <key>CFBundleIdentifier</key><string>org.wazowski.wazowski</string>
+          <key>CFBundleExecutable</key><string>wazowski</string>
+          <key>CFBundleIconFile</key><string>wazowski</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleShortVersionString</key><string>${version}</string>
+          <key>CFBundleVersion</key><string>${version}</string>
+          <key>LSMinimumSystemVersion</key><string>11.0</string>
+          <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          # Ad-hoc sign: arm64 binaries must carry at least an ad-hoc signature to
+          # run. This does NOT remove the Gatekeeper warning (that needs a paid
+          # Developer ID + notarization) — it just lets the app launch once allowed.
+          codesign --force --sign - "$app/Contents/MacOS/wazowski"
+          codesign --force --sign - "$app"
+
+          mkdir -p dist
+          # Raw binary (what the in-app updater matches on: *-macos-aarch64).
+          cp target/release/wazowski "dist/wazowski-${GITHUB_REF_NAME}-macos-aarch64"
+
+          # .dmg with an Applications shortcut for drag-to-install.
+          mkdir -p dmgroot
+          cp -R "$app" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "Wazowski" -srcfolder dmgroot -ov -format UDZO \
+            "dist/wazowski-${GITHUB_REF_NAME}-macos-aarch64.dmg"
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: wazowski-macos
+          path: dist/*
+
   release:
     name: Publish release
-    needs: [build, package-linux, package-windows]
-    # Publish as long as the Linux packaging succeeded, even if the `build` job
-    # is marked failed because the macOS runner never got allocated (a frequent
-    # capacity issue that otherwise blocks the Linux/Windows artifacts). The
-    # Windows/Linux binaries still publish; macOS is included if it managed to run.
+    needs: [build, package-linux, package-windows, package-macos]
+    # Publish as long as the Linux packaging succeeded, even if `package-macos`
+    # never got a runner (a frequent macOS arm64 capacity issue). The Linux and
+    # Windows artifacts still publish; the macOS .app/.dmg + binary are included
+    # if that job managed to run, and can be backfilled by re-running it later.
     if: ${{ !cancelled() && needs.package-linux.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
