@@ -17,4 +17,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 # pin that otherwise conflicts with russh.
 ironrdp = { version = "0.17", default-features = false, features = ["connector", "session", "graphics", "input", "svc", "dvc", "pdu", "core"] }
 ironrdp-tokio = "0.10"
-ironrdp-tls = { version = "0.3", features = ["rustls-ring"] }
+# native-tls (system TLS) rather than rustls for RDP: rustls only negotiates
+# ECDHE+AEAD cipher suites, which older Windows/SChannel RDP hosts (e.g. Server
+# 2012-era, ECDHE-CBC + RSA-GCM only) don't offer — so rustls can't connect while
+# FreeRDP/OpenSSL clients (Remmina) can. native-tls uses Security.framework on
+# macOS and SChannel on Windows (no extra dep); on Linux it links system OpenSSL
+# (build needs openssl headers + pkg-config; runtime needs libssl, both ubiquitous).
+ironrdp-tls = { version = "0.3", features = ["native-tls"] }

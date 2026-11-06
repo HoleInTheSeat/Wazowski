@@ -25,6 +25,11 @@ assets = [
     { source = "packaging/linux/icons/hicolor/256x256/apps/wazowski.png", dest = "/usr/share/icons/hicolor/256x256/apps/wazowski.png", mode = "0644" },
 ]
 
+# Runtime library deps (auto-req is disabled in CI, so declare them explicitly).
+# native-tls for RDP links OpenSSL on Linux.
+[package.metadata.generate-rpm.requires]
+openssl-libs = "*"
+
 # Optional helper tools Wazowski shells out to (weak deps: not required to install).
 [package.metadata.generate-rpm.recommends]
 samba-client = "*"

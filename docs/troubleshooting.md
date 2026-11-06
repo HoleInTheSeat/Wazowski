@@ -106,6 +106,15 @@ confirms before pushing) or push/discard from the **quit** prompt. A failed push
 keeps your local commits — they're offered again next launch. Details in
 [Shared sessions](shared-sessions.md).
 
+## RDP: "TLS: Connection reset by peer" to an older server
+
+Some older Windows/RDP hosts (Server 2012-era SChannel) only offer legacy TLS
+cipher suites (ECDHE with CBC, or AES-GCM only with RSA/DHE key exchange).
+Wazowski's RDP now uses the system TLS stack (OpenSSL / SChannel / macOS
+Security.framework), which negotiates those — so if you hit this on an older
+build, update Wazowski. The real long-term fix is to enable a modern ECDHE-GCM
+cipher suite on the server (which also lets it drop RC4/3DES/TLS 1.0).
+
 ## SSH won't connect to old equipment
 
 Turn on **legacy mode** for that session to allow SHA-1 key exchange, CBC
