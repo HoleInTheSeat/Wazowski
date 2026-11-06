@@ -298,8 +298,12 @@ pub struct LocalPort {
     pub process: String,
 }
 
-/// Lists the host's listening TCP/UDP sockets via `ss` (Linux) or `netstat`.
+/// Lists the host's listening TCP/UDP sockets. macOS/BSD `netstat` doesn't take
+/// the Linux `-tulnp` flags, so use `lsof` there; Linux uses `ss`/`netstat`.
 pub fn local_listening_ports() -> Result<Vec<LocalPort>, String> {
+    if cfg!(target_os = "macos") {
+        return macos_listening_ports();
+    }
     let mut ss = Command::new("ss");
     ss.args(["-tulnpH"]);
     hide_window(&mut ss);
@@ -336,6 +340,44 @@ pub fn local_listening_ports() -> Result<Vec<LocalPort>, String> {
         ports.push(LocalPort { proto, address, process });
     }
     ports.sort_by(|a, b| a.address.cmp(&b.address));
+    Ok(ports)
+}
+
+/// macOS/BSD listing via `lsof`: listening TCP plus all UDP sockets, with the
+/// owning process. `lsof` ships with macOS and reports process names without sudo
+/// for the current user's sockets.
+fn macos_listening_ports() -> Result<Vec<LocalPort>, String> {
+    let mut cmd = Command::new("lsof");
+    // -n/-P: no DNS/port-name lookups; -iTCP -sTCP:LISTEN: listening TCP; -iUDP: all UDP.
+    cmd.args(["-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP"]);
+    hide_window(&mut cmd);
+    let output =
+        cmd.output().map_err(|e| format!("could not list ports (need `lsof`): {e}"))?;
+    // lsof exits non-zero when some sockets are inaccessible, yet still prints the
+    // rest — so treat output, not the exit code, as the signal.
+    if output.stdout.is_empty() {
+        return Err("the port-listing command returned nothing".into());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut ports = Vec::new();
+    // Columns: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME [STATE]
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 9 {
+            continue;
+        }
+        let proto = cols[7].to_uppercase(); // NODE = TCP / UDP
+        if proto != "TCP" && proto != "UDP" {
+            continue;
+        }
+        ports.push(LocalPort {
+            proto,
+            address: cols[8].to_owned(), // NAME, e.g. *:8080 or 127.0.0.1:22
+            process: cols[0].to_owned(), // COMMAND
+        });
+    }
+    ports.sort_by(|a, b| a.address.cmp(&b.address));
+    ports.dedup_by(|a, b| a.address == b.address && a.proto == b.proto && a.process == b.process);
     Ok(ports)
 }
 
@@ -535,8 +577,17 @@ pub fn ip_info() -> IpInfo {
     IpInfo { interfaces, gateway: default_gateway(), dns, domain }
 }
 
-/// Parses the default gateway from `ip route show default` (Linux).
+/// The default gateway: `ip route` on Linux, `route -n get default` on macOS.
 fn default_gateway() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        macos_default_gateway()
+    } else {
+        linux_default_gateway()
+    }
+}
+
+/// Parses the default gateway from `ip route show default` (Linux).
+fn linux_default_gateway() -> Option<String> {
     let mut cmd = Command::new("ip");
     cmd.args(["route", "show", "default"]);
     hide_window(&mut cmd);
@@ -546,6 +597,25 @@ fn default_gateway() -> Option<String> {
     while let Some(tok) = tokens.next() {
         if tok == "via" {
             return tokens.next().map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// Parses the default gateway from `route -n get default` (macOS/BSD), whose
+/// output has a `   gateway: 192.168.1.1` line.
+fn macos_default_gateway() -> Option<String> {
+    let mut cmd = Command::new("route");
+    cmd.args(["-n", "get", "default"]);
+    hide_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(gw) = line.trim().strip_prefix("gateway:") {
+            let gw = gw.trim();
+            if !gw.is_empty() {
+                return Some(gw.to_owned());
+            }
         }
     }
     None

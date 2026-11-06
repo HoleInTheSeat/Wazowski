@@ -2594,6 +2594,9 @@ impl App {
                 entry.log.push("Stopped.".into());
             }
             entry.stop_at = None;
+            // Re-arm the auto-stop default for the next run (the user can uncheck
+            // it again before starting).
+            entry.auto_stop = true;
         }
     }
 
@@ -8371,6 +8374,7 @@ impl App {
             .map(|s| s.name().to_owned())
             .unwrap_or_default();
         let mut push = false;
+        let mut discard = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::unique("confirm-sync-push")).show(ctx, |ui| {
             ui.set_width(380.0);
@@ -8394,6 +8398,14 @@ impl App {
             ui.horizontal(|ui| {
                 push |= ui.button("Push").clicked();
                 cancel |= ui.button("Cancel").clicked();
+                // Destructive: throw away the local changes and pull the remote.
+                discard |= ui
+                    .button(RichText::new("Discard & pull fresh").color(Color32::LIGHT_RED))
+                    .on_hover_text(
+                        "Throw away the local changes listed above and replace them with a \
+                         fresh copy from the remote. This cannot be undone.",
+                    )
+                    .clicked();
             });
         });
         if push {
@@ -8401,6 +8413,13 @@ impl App {
                 && let Err(e) = source.push()
             {
                 self.error = Some(format!("Push failed: {e:#}"));
+            }
+            self.dialog = Dialog::None;
+        } else if discard {
+            if let Some(source) = self.shared.iter_mut().find(|s| s.id() == id)
+                && let Err(e) = source.discard()
+            {
+                self.error = Some(format!("Discard failed: {e:#}"));
             }
             self.dialog = Dialog::None;
         } else if cancel {

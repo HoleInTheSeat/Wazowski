@@ -26,7 +26,10 @@ For each server you choose:
 - **writable** and **username** where applicable.
 
 Configs **persist** between runs. Each server has a **live log** so you can watch
-requests/transfers, and an optional **auto-stop** timer ("stop after N minutes").
+requests/transfers, and an **auto-stop** timer ("stop after N minutes"). Auto-stop
+is **on by default** (a safety net so a server doesn't linger) and re-arms itself
+each time a server stops; **uncheck it** before starting if you want a server to
+run until you stop it.
 
 ## Running
 

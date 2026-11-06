@@ -109,6 +109,8 @@ pub struct ServerEntry {
     /// When to auto-stop the server, if a timer was set.
     pub stop_at: Option<std::time::Instant>,
     /// Inline "stop after N minutes" toggle and value (UI state, not persisted).
+    /// Defaults on, and is re-checked whenever the server stops, so a safety
+    /// auto-stop is the default for every run (the user can uncheck per run).
     pub auto_stop: bool,
     pub stop_minutes: String,
 }
@@ -120,7 +122,7 @@ impl ServerEntry {
             running: None,
             log: Vec::new(),
             stop_at: None,
-            auto_stop: false,
+            auto_stop: true,
             stop_minutes: "60".to_owned(),
         }
     }

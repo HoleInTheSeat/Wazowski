@@ -60,8 +60,10 @@ For **git** sources, your edits are committed **locally** and not pushed
 immediately. Pushing is a deliberate step:
 
 - **Sync now** pulls incoming changes first. If you then have **outgoing** changes
-  to push, it asks to confirm the push. A sync that's purely incoming pushes
-  nothing and doesn't prompt.
+  to push, it asks to confirm the push — with a **preview** of what would go out,
+  a **Push** button, and a **Discard & pull fresh** button that throws your local
+  changes away and replaces them with the remote copy (useful to undo a bad edit).
+  A sync that's purely incoming pushes nothing and doesn't prompt.
 - **On quit**, if any source has unpushed changes, the quit dialog offers to
   **Push & quit** or **Discard & quit**. A failed push is non-destructive — the
   local commits remain and are offered again next launch.
