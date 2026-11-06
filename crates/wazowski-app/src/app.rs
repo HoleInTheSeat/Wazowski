@@ -9616,7 +9616,7 @@ impl App {
                 ui.horizontal(|ui| {
                     for (proto, icon, tip) in [
                         (Protocol::Ssh, "🖥", "SSH terminal"),
-                        (Protocol::Rdp, "🖵", "Remote Desktop (in-window)"),
+                        (Protocol::Rdp, "🪟", "Remote Desktop (in-window)"),
                         (Protocol::Vnc, "👁", "VNC (in-window)"),
                     ] {
                         let selected = form.protocol == proto;
@@ -9859,7 +9859,7 @@ impl App {
                 ui.add_space(4.0);
                 let default_icon = match form.protocol {
                     Protocol::Ssh => "🖥",
-                    Protocol::Rdp => "🖵",
+                    Protocol::Rdp => "🪟",
                     Protocol::Vnc => "👁",
                 };
                 appearance_picker(ui, "session-appearance", &mut form.icon, &mut form.color, default_icon);
@@ -11338,7 +11338,7 @@ fn session_row(
     };
     let default_icon = match session.protocol {
         Protocol::Ssh => "🖥",
-        Protocol::Rdp => "🖵",
+        Protocol::Rdp => "🪟",
         Protocol::Vnc => "👁",
     };
     let icon = if session.icon.is_empty() { default_icon } else { session.icon.as_str() };
