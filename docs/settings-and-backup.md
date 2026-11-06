@@ -39,6 +39,9 @@ plain TOML files in your config dir (`~/.config/wazowski/` on Linux).
   (each with a one-click **Install** where a package manager is available),
   printing (CUPS), and your default browser — each with status and, where
   possible, a fix button. (RDP and VNC are built in and need no external client.)
+  Installs run non-interactively and report any error in-app. On **macOS** the
+  Install buttons use **Homebrew**; if it isn't installed, the panel links you to
+  it (macOS has no built-in package manager).
 - **Diagnostics** — open the rolling log file or its folder (see
   [Troubleshooting](troubleshooting.md)).
 

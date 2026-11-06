@@ -2613,13 +2613,33 @@ impl App {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = std::process::Command::new(&command[0])
+            // A GUI / .app launch has no controlling terminal, so the installer must
+            // never prompt: force non-interactive, feed stdin from /dev/null, and
+            // capture output so a failure is reported in-app instead of lost to a
+            // terminal that may not exist. (dnf/apt already pass an assume-yes flag.)
+            let out = std::process::Command::new(&command[0])
                 .args(&command[1..])
-                .status()
-                .map_err(|e| e.to_string())
-                .and_then(|s| {
-                    if s.success() { Ok(()) } else { Err(format!("command failed ({s})")) }
-                });
+                .stdin(std::process::Stdio::null())
+                .env("NONINTERACTIVE", "1") // Homebrew: never prompt
+                .env("HOMEBREW_NO_AUTO_UPDATE", "1") // and skip the slow auto-update
+                .env("DEBIAN_FRONTEND", "noninteractive")
+                .output();
+            let result = match out {
+                Ok(o) if o.status.success() => Ok(()),
+                Ok(o) => {
+                    // Report the tail of stderr (the useful part) instead of a bare code.
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    let lines: Vec<&str> =
+                        stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                    let detail = lines[lines.len().saturating_sub(3)..].join("; ");
+                    Err(if detail.is_empty() {
+                        format!("command failed ({})", o.status)
+                    } else {
+                        detail
+                    })
+                }
+                Err(e) => Err(e.to_string()),
+            };
             let _ = tx.send(result);
         });
         self.admin_task = Some(AdminTask { label, rx, retry_id, restart_required });
@@ -3342,6 +3362,29 @@ impl App {
         ui.label(RichText::new("Environment").strong());
         ui.label(RichText::new("Checks for optional tools and permissions Wazowski can use.").weak());
         ui.add_space(6.0);
+
+        // macOS has no built-in package manager, so the Install buttons below rely
+        // on Homebrew. If none is present, guide the user to install it.
+        if cfg!(target_os = "macos") && !wazowski_servers::has_package_manager() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("The Install buttons below use Homebrew, which isn't installed.")
+                        .color(ui.visuals().warn_fg_color),
+                );
+                if ui.button("Get Homebrew…").clicked() {
+                    let _ = open::that_detached("https://brew.sh");
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Or run this in a terminal, then re-check:  /bin/bash -c \"$(curl -fsSL \
+                     https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"",
+                )
+                .weak()
+                .monospace(),
+            );
+            ui.add_space(6.0);
+        }
 
         let status = |ui: &mut egui::Ui, label: &str, ok: bool| {
             let (mark, color) = if ok {

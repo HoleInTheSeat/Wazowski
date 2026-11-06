@@ -220,6 +220,13 @@ fn install_command(packages: &[(&str, Option<&str>)]) -> Option<Vec<String>> {
     None
 }
 
+/// Whether any supported package manager is on `PATH`
+/// (dnf / apt-get / pacman / zypper / brew). The UI uses this to detect, e.g., a
+/// macOS without Homebrew so it can point the user at installing it.
+pub fn has_package_manager() -> bool {
+    ["dnf", "apt-get", "pacman", "zypper", "brew"].iter().any(|b| on_path(b))
+}
+
 /// The command to install iperf3 using a detected package manager, if any.
 /// (The caller runs it with elevation where needed.)
 pub fn iperf_install_command() -> Option<Vec<String>> {
