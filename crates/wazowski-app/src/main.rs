@@ -38,7 +38,35 @@ fn acquire_instance_lock() -> Option<File> {
     file.try_lock_exclusive().ok().map(|()| file)
 }
 
+/// On macOS a Finder/`.app` launch inherits only a minimal PATH that omits
+/// Homebrew, so the app can't find `brew` (or brew-installed tools like iperf3,
+/// smbclient, jq, git). Prepend the standard Homebrew bin dirs that exist, so
+/// detection and spawning work the same as from a login shell. No-op elsewhere.
+fn augment_homebrew_path() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    use std::path::PathBuf;
+    let cur = std::env::var_os("PATH").unwrap_or_default();
+    let existing: Vec<PathBuf> = std::env::split_paths(&cur).collect();
+    let mut dirs: Vec<PathBuf> = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir() && !existing.contains(p))
+        .collect();
+    if dirs.is_empty() {
+        return;
+    }
+    dirs.extend(existing);
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        // Safety: called at the very top of main(), before any threads are spawned.
+        unsafe { std::env::set_var("PATH", joined) };
+    }
+}
+
 fn main() -> eframe::Result {
+    // Must run before anything spawns threads (it mutates the process environment).
+    augment_homebrew_path();
     conn_log::init();
 
     // A connection URI argument (ssh:// or telnet://), e.g. from a browser.
