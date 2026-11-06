@@ -6,6 +6,7 @@ mod conn_log;
 mod connect;
 mod git;
 mod highlights;
+mod icons;
 mod keybinds;
 mod macros;
 mod network;

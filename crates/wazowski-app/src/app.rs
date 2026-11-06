@@ -25,6 +25,7 @@ use wazowski_term::{
 use crate::connect::{Connected, PendingConnect, Progress};
 use crate::git::GitAuth;
 use crate::highlights::{HighlightStore, HighlightRule};
+use crate::icons;
 use crate::keybinds::{Action, Keymap};
 use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
 use crate::network::{self, HostHit, LocalPort, PortHit, ScanHandle};
@@ -368,8 +369,11 @@ fn changes_preview(ui: &mut egui::Ui, salt: &str, header: &str, changes: &[Strin
 /// set it grabs keyboard focus, so opening a sidebar section lands the cursor in
 /// its filter (type to filter immediately, instead of into the terminal tab).
 fn filter_box(ui: &mut egui::Ui, buf: &mut String, focus: bool) {
-    let resp =
-        ui.add(egui::TextEdit::singleline(buf).hint_text("🔍 filter").desired_width(f32::INFINITY));
+    let resp = ui.add(
+        egui::TextEdit::singleline(buf)
+            .hint_text(format!("{}  filter", crate::icons::SEARCH))
+            .desired_width(f32::INFINITY),
+    );
     if focus {
         resp.request_focus();
     }
@@ -1477,8 +1481,16 @@ fn install_fonts(ctx: &egui::Context) {
             "../assets/DejaVuSans.ttf"
         ))),
     );
+    fonts.font_data.insert(
+        "phosphor".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(crate::icons::FONT)),
+    );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push("dejavu-sans".to_owned());
+        let fam = fonts.families.entry(family).or_default();
+        fam.push("dejavu-sans".to_owned());
+        // Phosphor is icons-only (private-use codepoints), so as the last fallback
+        // it renders our icon glyphs without affecting any normal text.
+        fam.push("phosphor".to_owned());
     }
     ctx.set_fonts(fonts);
 }
@@ -2989,29 +3001,26 @@ impl App {
                 .response
                 .on_hover_text("Menu");
             } else {
-                ui.menu_button("⬢", |ui| {
+                ui.menu_button(icons::LIST, |ui| {
                     app_menu(ui, &mut about, &mut quit, &mut check_update, &update_label)
                 });
             }
             ui.label(RichText::new("Wazowski").strong());
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").on_hover_text("Close").clicked() {
+                if ui.button(icons::X).on_hover_text("Close").clicked() {
                     quit = true;
                 }
-                // Plain geometric glyphs (in the bundled DejaVu font) rather than the
-                // Windows-only 🗖/🗕 symbols, which have no glyph on macOS and render
-                // as tofu there.
-                if ui.button("□").on_hover_text("Maximize / restore").clicked() {
+                if ui.button(icons::SQUARE).on_hover_text("Maximize / restore").clicked() {
                     toggle_max = true;
                 }
-                if ui.button("—").on_hover_text("Minimize").clicked() {
+                if ui.button(icons::MINUS).on_hover_text("Minimize").clicked() {
                     minimize = true;
                 }
                 let (icon, hint) = if self.dark_mode {
-                    ("☀", "Switch to light mode")
+                    (icons::SUN, "Switch to light mode")
                 } else {
-                    ("🌙", "Switch to dark mode")
+                    (icons::MOON, "Switch to dark mode")
                 };
                 if ui.button(icon).on_hover_text(hint).clicked() {
                     toggle_theme = true;
@@ -3320,7 +3329,7 @@ impl App {
                 {
                     *hl_changed = true;
                 }
-                if ui.button("✕").on_hover_text("Delete rule").clicked() {
+                if ui.button(icons::X).on_hover_text("Delete rule").clicked() {
                     remove = Some(i);
                 }
                 if ui.color_edit_button_srgb(&mut rule.color).changed() {
@@ -3503,12 +3512,12 @@ impl App {
         match crate::conn_log::log_path() {
             Some(path) => {
                 ui.horizontal(|ui| {
-                    if ui.button("📄  Open log file").clicked()
+                    if ui.button(format!("{}  Open log file", icons::FILE)).clicked()
                         && let Err(e) = open::that_detached(path)
                     {
                         self.error = Some(format!("Could not open the log: {e:#}"));
                     }
-                    if ui.button("📂  Open log folder").clicked()
+                    if ui.button(format!("{}  Open log folder", icons::FOLDER_OPEN)).clicked()
                         && let Some(dir) = path.parent()
                         && let Err(e) = open::that_detached(dir)
                     {
@@ -3546,7 +3555,7 @@ impl App {
         );
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            if ui.button("💾  Export settings…").clicked()
+            if ui.button(format!("{}  Export settings…", icons::EXPORT)).clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .set_file_name(crate::backup::DEFAULT_FILENAME)
                     .add_filter("TOML", &["toml"])
@@ -3562,7 +3571,7 @@ impl App {
                     Err(e) => self.error = Some(format!("Export failed: {e:#}")),
                 }
             }
-            if ui.button("📥  Import settings…").clicked()
+            if ui.button(format!("{}  Import settings…", icons::IMPORT)).clicked()
                 && let Some(path) =
                     rfd::FileDialog::new().add_filter("TOML", &["toml"]).pick_file()
             {
@@ -3837,12 +3846,12 @@ impl App {
                 const SIZE: f32 = 26.0;
                 let icon = |glyph: &str, color: Color32| RichText::new(glyph).size(SIZE).color(color);
                 for (view, glyph, color, tip) in [
-                    (SidebarView::Sessions, "🖥", Color32::from_rgb(90, 170, 255), "Sessions"),
-                    (SidebarView::Macros, "📜", Color32::from_rgb(240, 170, 60), "Macros"),
-                    (SidebarView::Files, "📁", Color32::from_rgb(120, 200, 120), "Files (SFTP)"),
-                    (SidebarView::Tools, "🔧", Color32::from_rgb(200, 150, 110), "Tools (servers & network)"),
-                    (SidebarView::Vault, "🔒", Color32::from_rgb(210, 190, 90), "Vault (credentials)"),
-                    (SidebarView::Settings, "⚙", Color32::from_rgb(170, 170, 180), "Settings"),
+                    (SidebarView::Sessions, icons::DESKTOP, Color32::from_rgb(90, 170, 255), "Sessions"),
+                    (SidebarView::Macros, icons::SCROLL, Color32::from_rgb(240, 170, 60), "Macros"),
+                    (SidebarView::Files, icons::FOLDER, Color32::from_rgb(120, 200, 120), "Files (SFTP)"),
+                    (SidebarView::Tools, icons::WRENCH, Color32::from_rgb(200, 150, 110), "Tools (servers & network)"),
+                    (SidebarView::Vault, icons::LOCK_KEY, Color32::from_rgb(210, 190, 90), "Vault (credentials)"),
+                    (SidebarView::Settings, icons::GEAR, Color32::from_rgb(170, 170, 180), "Settings"),
                 ] {
                     let hint = if prev == view && self.can_collapse_sidebar() {
                         let verb = if collapsed { "show" } else { "hide" };
@@ -3990,18 +3999,18 @@ impl App {
         ui.horizontal(|ui| {
             ui.heading("Vault");
             if unlocked
-                && ui.small_button("➕").on_hover_text("New credential").clicked()
+                && ui.small_button(icons::PLUS).on_hover_text("New credential").clicked()
             {
                 new_credential = true;
             }
-            if ui.small_button("📥").on_hover_text("Import a vault file…").clicked() {
+            if ui.small_button(icons::IMPORT).on_hover_text("Import a vault file…").clicked() {
                 import = true;
             }
             if vault_exists {
-                if ui.small_button("💾").on_hover_text("Back up the vault…").clicked() {
+                if ui.small_button(icons::EXPORT).on_hover_text("Back up the vault…").clicked() {
                     backup = true;
                 }
-                if ui.small_button("🗑").on_hover_text("Delete the vault…").clicked() {
+                if ui.small_button(icons::TRASH).on_hover_text("Delete the vault…").clicked() {
                     delete = true;
                 }
             }
@@ -4042,7 +4051,7 @@ impl App {
             }
             VaultState::Locked => {
                 ui.label(RichText::new("Vault is locked.").weak());
-                if ui.button("🔒 Unlock vault…").clicked() {
+                if ui.button(format!("{} Unlock vault…", icons::LOCK_KEY)).clicked() {
                     self.dialog = Dialog::UnlockVault {
                         password: String::new(),
                         remember: false,
@@ -4083,9 +4092,9 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if passwords.is_empty() && keys.is_empty() && tokens.is_empty() {
                 let msg = if needle.is_empty() {
-                    "No credentials yet. Click ➕ to add one."
+                    format!("No credentials yet. Click {} to add one.", icons::PLUS)
                 } else {
-                    "No credentials match the filter."
+                    "No credentials match the filter.".to_owned()
                 };
                 ui.label(RichText::new(msg).weak());
             }
@@ -4296,11 +4305,11 @@ impl App {
     fn sidebar_sessions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.heading("Sessions");
-            if ui.small_button("+").on_hover_text("New session").clicked() {
+            if ui.small_button(icons::PLUS).on_hover_text("New session").clicked() {
                 self.dialog = Dialog::EditSession(SessionForm::new());
             }
             if ui
-                .small_button("🔗")
+                .small_button(icons::LINK)
                 .on_hover_text("Add shared source")
                 .clicked()
             {
@@ -4312,7 +4321,7 @@ impl App {
 
         match &self.vault {
             VaultState::Locked => {
-                if ui.button("🔒 Unlock vault").clicked() {
+                if ui.button(format!("{} Unlock vault", icons::LOCK_KEY)).clicked() {
                     self.dialog = Dialog::UnlockVault { password: String::new(), remember: false, error: None };
                 }
             }
@@ -4370,7 +4379,7 @@ impl App {
         let mut act = None;
         ui.horizontal(|ui| {
             ui.heading("Macros");
-            if ui.small_button("+").on_hover_text("New macro").clicked() {
+            if ui.small_button(icons::PLUS).on_hover_text("New macro").clicked() {
                 act = Some(Act::New);
             }
         });
@@ -5320,7 +5329,7 @@ impl App {
                                         ui.close();
                                     }
                                 });
-                                if ui.small_button("×").on_hover_text("Close tab").clicked() {
+                                if ui.small_button(icons::X).on_hover_text("Close tab").clicked() {
                                     close = Some(i);
                                 }
                                 ui.separator();
@@ -5666,7 +5675,7 @@ impl App {
                     format!("{count} match(es)")
                 };
                 ui.label(RichText::new(label).weak());
-                if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
+                if ui.button(icons::X).on_hover_text("Close (Esc)").clicked() {
                     close = true;
                 }
             });
@@ -7298,7 +7307,7 @@ impl App {
                 ui.heading("Set color / icon");
                 ui.label(RichText::new(format!("Applies to {count} selected sessions.")).weak());
                 ui.add_space(6.0);
-                ui.checkbox(set_icon, "Set icon (emoji)");
+                ui.checkbox(set_icon, "Set icon");
                 if *set_icon {
                     ui.horizontal(|ui| {
                         ui.add_space(20.0);
@@ -7719,7 +7728,7 @@ impl App {
                                 if ui.add_enabled(i > 0, egui::Button::new("↑").small()).clicked() {
                                     move_up = Some(i);
                                 }
-                                if ui.small_button("✕").clicked() {
+                                if ui.small_button(icons::X).clicked() {
                                     remove = Some(i);
                                 }
                             });
@@ -8092,7 +8101,7 @@ impl App {
                                         ui.selectable_value(&mut f.path, port.clone(), port);
                                     }
                                 });
-                            refresh |= ui.button("⟳").on_hover_text("Rescan ports").clicked();
+                            refresh |= ui.button(icons::SYNC).on_hover_text("Rescan ports").clicked();
                         });
                     }
                     ui.end_row();
@@ -9615,9 +9624,9 @@ impl App {
                 // Session-type picker: a row of icon buttons with tooltips.
                 ui.horizontal(|ui| {
                     for (proto, icon, tip) in [
-                        (Protocol::Ssh, "🖥", "SSH terminal"),
-                        (Protocol::Rdp, "🪟", "Remote Desktop (in-window)"),
-                        (Protocol::Vnc, "👁", "VNC (in-window)"),
+                        (Protocol::Ssh, icons::TERMINAL, "SSH terminal"),
+                        (Protocol::Rdp, icons::APP_WINDOW, "Remote Desktop (in-window)"),
+                        (Protocol::Vnc, icons::SCREENCAST, "VNC (in-window)"),
                     ] {
                         let selected = form.protocol == proto;
                         if ui
@@ -9858,9 +9867,9 @@ impl App {
                 }
                 ui.add_space(4.0);
                 let default_icon = match form.protocol {
-                    Protocol::Ssh => "🖥",
-                    Protocol::Rdp => "🪟",
-                    Protocol::Vnc => "👁",
+                    Protocol::Ssh => icons::TERMINAL,
+                    Protocol::Rdp => icons::APP_WINDOW,
+                    Protocol::Vnc => icons::SCREENCAST,
                 };
                 appearance_picker(ui, "session-appearance", &mut form.icon, &mut form.color, default_icon);
                 let uses_vault = form.auth == AuthChoice::Vault;
@@ -11337,9 +11346,9 @@ fn session_row(
         v
     };
     let default_icon = match session.protocol {
-        Protocol::Ssh => "🖥",
-        Protocol::Rdp => "🪟",
-        Protocol::Vnc => "👁",
+        Protocol::Ssh => icons::TERMINAL,
+        Protocol::Rdp => icons::APP_WINDOW,
+        Protocol::Vnc => icons::SCREENCAST,
     };
     let icon = if session.icon.is_empty() { default_icon } else { session.icon.as_str() };
     let text = {
@@ -11872,12 +11881,6 @@ fn count_occurrences(hay: &str, needle: &str) -> usize {
     count
 }
 
-/// Emoji icons offered for sessions and folders.
-const ICON_CHOICES: &[&str] = &[
-    "🖥", "💻", "🌐", "🔀", "🗄", "🔒", "🛡", "📡", "🖨", "☁", "⚡", "🔌", "📶", "🧱", "🐧", "🪟",
-    "🍎", "🔧", "🚦", "📦",
-];
-
 /// A compact appearance control shared by sessions, folders, shared sources and
 /// macros: a single button showing the current icon tinted with the current
 /// color. Clicking it opens a picker with an inline color selector above a grid
@@ -11941,10 +11944,14 @@ fn appearance_picker(
                     icon.clear();
                 }
                 let mut in_row = 1;
-                for choice in ICON_CHOICES {
-                    let cell = RichText::new(*choice).size(22.0).color(grid_tint);
-                    if ui.selectable_label(icon == choice, cell).clicked() {
-                        *icon = (*choice).to_owned();
+                for (glyph, label) in icons::PICKER {
+                    let cell = RichText::new(*glyph).size(22.0).color(grid_tint);
+                    if ui
+                        .selectable_label(icon.as_str() == *glyph, cell)
+                        .on_hover_text(*label)
+                        .clicked()
+                    {
+                        *icon = (*glyph).to_owned();
                     }
                     in_row += 1;
                     if in_row % 7 == 0 {
@@ -11961,7 +11968,7 @@ fn appearance_picker(
                 ui.add(
                     egui::TextEdit::singleline(icon)
                         .desired_width(70.0)
-                        .hint_text("emoji"),
+                        .hint_text("icon/emoji"),
                 );
             });
         });
