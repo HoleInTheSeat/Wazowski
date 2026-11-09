@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod tree;
+
 /// How a session authenticates to the remote host.
 ///
 /// Current variants are `Prompt` and `Vault`. The `Agent`/`Password`/`Key`
@@ -244,6 +246,24 @@ impl FolderStyle {
     }
 }
 
+/// A folder's stable identity and description, carried in its `.folder` file so
+/// they travel with a shared source. Icon/color stay in [`FolderStyle`]; this
+/// adds the UUID (so a folder keeps its identity across rename/move) and an
+/// optional description.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderMeta {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+impl FolderMeta {
+    pub fn is_empty(&self) -> bool {
+        self.id.is_empty() && self.description.is_empty()
+    }
+}
+
 /// An in-memory collection of sessions backed by a TOML file.
 #[derive(Debug, Default)]
 pub struct SessionStore {
@@ -262,6 +282,17 @@ pub struct SessionStore {
     icon: String,
     /// Optional custom header color, as sRGB `[r, g, b]` (shared, like `icon`).
     color: Option<[u8; 3]>,
+    /// Collection display name. For a shared source this is the source's name,
+    /// stored in the tree's root `.folder` so it travels to every user. Empty for
+    /// the local store (which takes its label from the UI). Only used by the tree
+    /// format; the single-file format omits it when empty.
+    name: String,
+    /// Stable id of this collection (the tree's root `.folder` UUID). Empty until
+    /// [`ensure_ids`](Self::ensure_ids) assigns one.
+    id: String,
+    /// Per-folder identity + description, keyed by folder path. Kept separate from
+    /// `folder_styles` so the existing single-file format is unchanged.
+    folder_meta: BTreeMap<String, FolderMeta>,
 }
 
 /// The serialized file shape: `[[session]]` tables plus a `folders` list.
@@ -273,12 +304,18 @@ struct StoreFile {
     icon: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     color: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    id: String,
     #[serde(default, rename = "session")]
     sessions: Vec<Session>,
     #[serde(default)]
     folders: Vec<String>,
     #[serde(default)]
     folder_styles: BTreeMap<String, FolderStyle>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    folder_meta: BTreeMap<String, FolderMeta>,
 }
 
 impl SessionStore {
@@ -305,6 +342,9 @@ impl SessionStore {
             description: file.description,
             icon: file.icon,
             color: file.color,
+            name: file.name,
+            id: file.id,
+            folder_meta: file.folder_meta,
         };
         // Migrate any legacy auth (agent / password / key) to the current model,
         // persisting best-effort so the file is upgraded for next time.
@@ -345,6 +385,59 @@ impl SessionStore {
         self.icon = icon.into();
         self.color = color;
         self.save()
+    }
+
+    /// The collection's display name (empty if none). For a shared source this is
+    /// the source's name, carried in the tree's root `.folder`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The collection's stable id (the tree's root `.folder` UUID), empty until
+    /// [`ensure_ids`](Self::ensure_ids) assigns one.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// A folder's stable identity + description, if recorded.
+    pub fn folder_meta(&self, path: &str) -> Option<&FolderMeta> {
+        self.folder_meta.get(path).filter(|m| !m.is_empty())
+    }
+
+    /// All folder paths including implied ancestors, so e.g. a session in
+    /// `a/b/c` yields `a`, `a/b`, and `a/b/c`. Sorted, so parents precede children.
+    pub fn all_folder_paths(&self) -> Vec<String> {
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for f in self.folders() {
+            let mut acc = String::new();
+            for seg in f.split('/') {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(seg);
+                set.insert(acc.clone());
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Assigns a stable UUID to the collection root and to every folder (including
+    /// implied ancestors) that lacks one. Returns whether anything was assigned.
+    /// The tree format needs these ids so identity survives rename/move.
+    pub fn ensure_ids(&mut self) -> bool {
+        let mut changed = false;
+        if self.id.is_empty() {
+            self.id = new_id();
+            changed = true;
+        }
+        for path in self.all_folder_paths() {
+            let meta = self.folder_meta.entry(path).or_default();
+            if meta.id.is_empty() {
+                meta.id = new_id();
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// The custom appearance for a folder, if any.
@@ -496,9 +589,12 @@ impl SessionStore {
             description: self.description.clone(),
             icon: self.icon.clone(),
             color: self.color,
+            name: self.name.clone(),
+            id: self.id.clone(),
             sessions: self.sessions.clone(),
             folders: self.folders.clone(),
             folder_styles: self.folder_styles.clone(),
+            folder_meta: self.folder_meta.clone(),
         };
         let text = toml::to_string_pretty(&file).context("could not serialize sessions")?;
         write_atomic(path, text.as_bytes())
