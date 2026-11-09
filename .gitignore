@@ -33,3 +33,6 @@ rustc-ice-*.txt
 /AppDir/
 /linuxdeploy-x86_64.AppImage
 /*.AppImage
+
+# Stray local scratch file (not part of the project)
+/zshrc-updater.sh
