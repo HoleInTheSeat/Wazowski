@@ -198,6 +198,22 @@ gh run list --branch main --limit 1   # last CI run should be success
 
 ---
 
+## Build the Linux artifacts locally
+
+To produce a real build without waiting on CI, `scripts/build-linux.sh` runs the
+same steps as the Linux release jobs and drops the binary, Fedora **RPM**, and
+portable **AppImage** into `dist/`:
+
+```sh
+scripts/build-linux.sh
+```
+
+One-time prerequisites (Fedora): `sudo dnf install ImageMagick openssl-devel
+pkgconf-pkg-config wget file` and `cargo install cargo-generate-rpm --locked`.
+For just running the app, `cargo run --release -p wazowski-app` is quicker.
+Windows and macOS artifacts can only be built on those platforms, so they still
+come from CI.
+
 ## Pre-releases
 
 A pre-release is just a tag whose semver has a **hyphen** suffix — `-alpha.N`,
