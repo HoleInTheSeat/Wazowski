@@ -131,6 +131,10 @@ pub struct Session {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Runtime-only: never persisted. Read from older files on load then dropped
+    /// (see [`SessionStore::strip_credentials`]); supplied at connect time by the
+    /// prompt or a vault entry. This app stores no usernames in any file.
+    #[serde(default, skip_serializing)]
     pub username: String,
     /// Optional Windows domain for RDP (ignored by other protocols).
     #[serde(default)]
@@ -347,12 +351,15 @@ impl SessionStore {
             folder_meta: file.folder_meta,
         };
         // Migrate any legacy auth (agent / password / key) to the current model,
-        // persisting best-effort so the file is upgraded for next time.
-        let mut migrated = false;
+        // and drop any inline username an older file still carries — this app
+        // persists no usernames (prompt or vault only). Persist best-effort so the
+        // file is upgraded (and the username lines removed) for next time.
+        let mut changed = false;
         for s in &mut store.sessions {
-            migrated |= s.auth.normalize();
+            changed |= s.auth.normalize();
         }
-        if migrated {
+        changed |= store.strip_credentials();
+        if changed {
             let _ = store.save();
         }
         Ok(store)
@@ -419,6 +426,20 @@ impl SessionStore {
             }
         }
         set.into_iter().collect()
+    }
+
+    /// Drops any inline username carried by a session (e.g. loaded from an older
+    /// file) — this app never persists usernames; they come from the prompt or a
+    /// vault entry at connect time. Returns whether anything was cleared.
+    pub fn strip_credentials(&mut self) -> bool {
+        let mut changed = false;
+        for s in &mut self.sessions {
+            if !s.username.is_empty() {
+                s.username.clear();
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Assigns a stable UUID to the collection root and to every folder (including
@@ -717,6 +738,19 @@ secret = "deploy-key"
         assert_eq!(reloaded.icon(), "🌐");
         assert_eq!(reloaded.color(), Some([10, 20, 30]));
         assert_eq!(reloaded.description(), "Team");
+    }
+
+    #[test]
+    fn load_drops_inline_username() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let toml = "[[session]]\nid = \"aaaaaaaaaaaaaaaa\"\nname = \"box\"\nhost = \"h\"\nusername = \"bob\"\n";
+        fs::write(&path, toml).unwrap();
+        let store = SessionStore::load(path.clone()).unwrap();
+        assert_eq!(store.get("aaaaaaaaaaaaaaaa").unwrap().username, "", "username dropped on load");
+        // The file was rewritten without the username line.
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("username"), "username line removed from file: {raw}");
     }
 
     #[test]

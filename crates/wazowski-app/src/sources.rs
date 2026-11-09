@@ -447,7 +447,43 @@ impl SharedSource {
                 self.status = Some(format!("share offline ({e}) — using local cache (read-only)"));
             }
         }
+        // One-time, idempotent upgrade of an old single-file layout to the tree.
+        self.migrate_legacy();
         self.store = tree::assemble(self.backend.work_dir()).unwrap_or_default();
+    }
+
+    /// Converts a legacy single-file store in the working clone into the exploded
+    /// tree, committing the change. A no-op once the tree exists (so it runs at
+    /// most once), or when there's no legacy file (e.g. a fresh or folder source).
+    ///
+    /// Git repos clone every file, so the old `wazowski-sessions.toml` lands in the
+    /// working clone and is found here; the migration commit is local (pending a
+    /// push), so the first user to open the repo migrates it and everyone else
+    /// pulls the tree. (Folder sources don't mirror non-tree files, so their
+    /// migration is handled with the source-editor rework.)
+    fn migrate_legacy(&mut self) {
+        let work = self.backend.work_dir().to_path_buf();
+        if tree::tree_present(&work) {
+            return; // already the tree format (or an empty source)
+        }
+        let legacy = work.join(&self.def.file);
+        if !legacy.is_file() {
+            return; // nothing to migrate
+        }
+        // `SessionStore::load` normalizes legacy auth and drops inline usernames.
+        let Ok(mut store) = SessionStore::load(legacy.clone()) else { return };
+        store.ensure_ids();
+        if tree::sync_tree(&store, &work).is_err() {
+            return;
+        }
+        // Remove the old file so `git add -A` records its deletion in the migration
+        // commit alongside the new tree.
+        let _ = fs::remove_file(&legacy);
+        if self.backend.commit("Migrate shared source to file-tree format").is_ok() {
+            self.available = true;
+            self.missing = false;
+            self.status = None;
+        }
     }
 
     /// Records a store change: writes the working tree and commits it locally. For
@@ -924,5 +960,59 @@ mod tests {
         // A fresh clone sees all three independently-edited sessions.
         let c = SharedSource::open(git_def("c", &url), &dir.path().join("c"), None);
         assert_eq!(c.store().all().len(), 3, "independent edits all merged");
+    }
+
+    // An old single-file repo is upgraded to the tree on first open: the session
+    // survives, its inline username is dropped, and the migration is a pending
+    // commit that, once pushed, gives a fresh clone the tree.
+    #[test]
+    #[ignore = "requires the git binary"]
+    fn migrates_legacy_single_file_to_tree() {
+        use std::process::Command;
+        let git = |cwd: &Path, args: &[&str]| {
+            assert!(
+                Command::new("git").arg("-C").arg(cwd).args(args).status().unwrap().success(),
+                "git {args:?}"
+            );
+        };
+        let dir = tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "-b", "main"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let url = remote.to_string_lossy().into_owned();
+
+        // Seed the remote with the OLD single-file layout (git_def uses sessions.toml).
+        let seed = dir.path().join("seed");
+        assert!(Command::new("git").arg("clone").arg(&url).arg(&seed).status().unwrap().success());
+        let old = "[[session]]\nid = \"aaaaaaaaaaaaaaaa\"\nname = \"legacy box\"\n\
+                   host = \"h.example.com\"\nusername = \"bob\"\n";
+        fs::write(seed.join("sessions.toml"), old).unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed"]);
+        git(&seed, &["push", "-u", "origin", "HEAD"]);
+
+        // Open fresh: the single file is migrated into the tree.
+        let mut s = SharedSource::open(git_def("m1", &url), &dir.path().join("cache"), None);
+        assert!(s.available(), "migrated source should be available: {:?}", s.status());
+        assert_eq!(s.store().all().len(), 1);
+        assert_eq!(s.store().all()[0].name, "legacy box");
+        assert_eq!(s.store().all()[0].username, "", "username dropped during migration");
+        assert!(s.has_pending(), "migration is a local commit pending a push");
+        s.push().unwrap();
+
+        // A fresh clone gets the tree, and the old single file is gone.
+        let c = SharedSource::open(git_def("m2", &url), &dir.path().join("cache2"), None);
+        assert_eq!(c.store().all().len(), 1);
+        assert_eq!(c.store().all()[0].name, "legacy box");
+        assert!(
+            !c.backend.work_dir().join("sessions.toml").exists(),
+            "old single file removed by the migration"
+        );
     }
 }
