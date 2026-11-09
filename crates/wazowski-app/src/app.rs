@@ -5351,15 +5351,27 @@ impl App {
         {
             return;
         }
-        let (down, up, right, left, enter) = ctx.input_mut(|i| {
+        let (down, up, right, left, enter, escape) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
             )
         });
+        // Escape leaves the tree: hand focus back to the active terminal (the
+        // counterpart to Ctrl+Shift+S). Only consumed while the tree has focus, so
+        // terminals keep their own Escape.
+        if escape {
+            if !self.tabs.is_empty() {
+                self.tree_focus = false;
+                self.focus_active_pane = true;
+                ctx.request_repaint();
+            }
+            return;
+        }
         if !(down || up || right || left || enter) {
             return;
         }
