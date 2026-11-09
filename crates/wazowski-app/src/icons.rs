@@ -43,6 +43,7 @@ pub const TRASH: &str = "\u{e4a6}";
 pub const PENCIL: &str = "\u{e3b4}";
 pub const COPY: &str = "\u{e1ca}";
 pub const DOTS: &str = "\u{e208}"; // overflow menu (dots-three-vertical)
+pub const WARNING: &str = "\u{e4e0}"; // warning triangle (offline/errored source)
 
 /// Icons offered in the session/folder appearance picker, as `(glyph, label)`.
 /// Users pick one; the chosen glyph string is stored in the session/folder, and

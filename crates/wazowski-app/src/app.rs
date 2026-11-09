@@ -4519,13 +4519,12 @@ impl App {
 
         // Each shared source as its own collapsible section.
         for source in &self.shared {
-            let badge = if source.available() { "" } else { "  (offline)" };
             // Icon/color live in the shared file (travelling to every user), with
             // the local SourceDef as a fallback for not-yet-migrated sources.
             let glyph = source.display_icon();
             let icon = if glyph.is_empty() { "🌐" } else { glyph };
             let title = {
-                let t = RichText::new(format!("{icon} {}{badge}", source.display_name()));
+                let t = RichText::new(format!("{icon} {}", source.display_name()));
                 match source.display_color() {
                     Some([r, g, b]) => t.color(Color32::from_rgb(r, g, b)),
                     None => t,
@@ -4540,14 +4539,40 @@ impl App {
             let share_sel = share_is_sel.then_some(&self.sel_ids);
             let share_fsel = share_is_sel.then_some(&self.sel_folders);
             let resp = header.show(ui, |ui| {
-                if let Some(note) = source.status() {
-                    ui.label(RichText::new(format!("⚠ {note}")).color(ui.visuals().warn_fg_color));
-                }
                 render_store(
                     ui, &store, source.store(), editable, &destinations, &mut action, &filter,
                     share_sel, share_fsel, scroll,
                 );
             });
+            // Offline/errored sources: a right-aligned warning triangle whose
+            // tooltip carries the error text, instead of a "(offline)" badge and
+            // an inline block of error text.
+            if let Some(note) = source.status() {
+                let row = resp.header_response.rect;
+                let sz = row.height();
+                // Anchor to the panel's right edge (the header rect only spans the
+                // arrow + name), so the triangle sits in the empty tail of the row
+                // and never overlaps the source name.
+                let right = ui.max_rect().right().min(ui.clip_rect().right()) - 6.0;
+                let tri = egui::Rect::from_center_size(
+                    egui::pos2(right - sz * 0.5, row.center().y),
+                    egui::vec2(sz, sz),
+                );
+                let warn = ui.visuals().warn_fg_color;
+                ui.painter().text(
+                    tri.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icons::WARNING,
+                    egui::FontId::proportional(sz * 0.85),
+                    warn,
+                );
+                ui.interact(
+                    tri,
+                    ui.make_persistent_id(("offline-warn", source.id())),
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(RichText::new(note).color(warn));
+            }
             let desc = source.description().to_owned();
             let remote = source.remote_label();
             let hint = source_hint(source.def());
