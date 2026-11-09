@@ -1,8 +1,8 @@
 # Importing from MobaXterm
 
 If you're coming from MobaXterm, the `tools/mxt2wazowski.py` script converts a
-MobaXterm sessions export (`.mxtsessions`) into a Wazowski sessions file you can
-use directly or share with a team.
+MobaXterm sessions export (`.mxtsessions`) into a Wazowski **session tree** (a
+directory of `.folder` and `.wzsession` files) you can share with a team.
 
 ## Requirements
 
@@ -11,30 +11,34 @@ use directly or share with a team.
 ## Usage
 
 ```sh
-# One file → team.toml next to it
+# One file → a "team/" directory next to it (the tree root)
 python3 tools/mxt2wazowski.py team.mxtsessions
 
-# Choose the output name
-python3 tools/mxt2wazowski.py team.mxtsessions -o sessions.toml
+# Choose the output directory
+python3 tools/mxt2wazowski.py team.mxtsessions -o my-sessions/
 
-# Several files into a folder
+# Several files, one tree each, into a parent folder
 python3 tools/mxt2wazowski.py *.mxtsessions --outdir converted/
 
-# Nest everything under one top-level folder
-python3 tools/mxt2wazowski.py *.mxtsessions --outdir converted/ --prefix Work
+# Name the tree root (becomes the source's display name)
+python3 tools/mxt2wazowski.py team.mxtsessions --prefix "Work servers"
 ```
 
-The output is a Wazowski **store file** (`folders = [...]` plus `[[session]]`
-tables) — exactly what a [shared source](shared-sessions.md) reads.
+The output is a Wazowski **session tree**: each folder is a directory with a
+`.folder` sidecar, and each session is a `<slug>.wzsession` file inside it — the
+same layout a [shared source](shared-sessions.md) reads. The tree root's
+`.folder` is named after `--prefix` (or the input's filename); that becomes the
+source's display name, which you can rename in Wazowski later.
 
 ## Using the result
 
-- **As a folder shared source**: point a new shared source (kind *Folder/file*) at
-  the generated `.toml`.
-- **As a git shared source**: commit the file into a repo and set it as the
-  source's file.
-- You can also merge the entries into your local sessions by moving them in from a
-  shared source.
+- **As a git shared source**: commit the generated directory's contents at the
+  repo root and point a new git shared source at the repo.
+- **As a folder shared source**: point a new shared source at the generated
+  directory.
+
+The converter refuses to write into a directory that already has files, so
+re-running won't silently mix old and new output — remove the directory first.
 
 ## What converts
 
@@ -46,13 +50,15 @@ tables) — exactly what a [shared source](shared-sessions.md) reads.
 | SFTP | SSH (an SSH session has an SFTP files tab) |
 | Web, FTP, Serial, Telnet | *skipped* (no direct Wazowski protocol) |
 
-Folders (MobaXterm's `SubRep` tree) are preserved. The converter prints a summary
-of what it converted and what it skipped, so nothing disappears silently.
+Folders (MobaXterm's `SubRep` tree) become the directory tree. The converter
+prints a summary of what it converted and what it skipped, so nothing disappears
+silently.
 
 ## Credentials
 
-MobaXterm never stores passwords in a `.mxtsessions` file, so **no passwords are
-imported** — every converted session uses the default (agent) auth. Sessions that
-referenced a MobaXterm credential (e.g. `[corp-ad]`) are reported by name and left
-with a blank username, so you know which ones to point at a
-[vault](vault.md) entry afterward.
+MobaXterm never stores passwords in a `.mxtsessions` file, and Wazowski stores no
+usernames in any file, so **no credentials are imported** — every converted
+session uses the default prompt auth, and you set a vault password/key (and a
+username, if you want it remembered) per session in Wazowski afterward. Sessions
+that referenced a MobaXterm credential (e.g. `[corp-ad]`) are reported by name so
+you know which ones to point at a [vault](vault.md) entry.

@@ -659,6 +659,39 @@ mod tests {
     }
 
     #[test]
+    fn assembles_minimal_handwritten_files() {
+        // Guards the format the MobaXterm converter emits: minimal `.folder` /
+        // `.wzsession` files (no auth, no username, defaults elsewhere).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".folder"), "id = \"rootid0000000000\"\nname = \"Team\"\n").unwrap();
+        std::fs::create_dir_all(root.join("switches")).unwrap();
+        std::fs::write(
+            root.join("switches/.folder"),
+            "id = \"f0000000000000aa\"\nname = \"Switches\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("switches/zone-1.wzsession"),
+            "id = \"aaaaaaaaaaaaaaaa\"\nname = \"Zone 1\"\nprotocol = \"ssh\"\n\
+             host = \"10.0.0.1\"\nport = 22\n",
+        )
+        .unwrap();
+
+        let store = assemble(root).unwrap();
+        assert_eq!(store.name(), "Team");
+        assert_eq!(store.id(), "rootid0000000000");
+        assert!(store.folders().contains(&"Switches".to_owned()));
+        let s = store.get("aaaaaaaaaaaaaaaa").expect("session present");
+        assert_eq!(s.name, "Zone 1");
+        assert_eq!(s.folder, "Switches");
+        assert_eq!(s.host, "10.0.0.1");
+        assert_eq!(s.protocol, Protocol::Ssh);
+        assert_eq!(s.auth, Auth::Prompt, "missing auth defaults to prompt");
+        assert_eq!(s.username, "", "no username in the file");
+    }
+
+    #[test]
     fn copy_tree_mirrors_then_prunes() {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();

@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""Convert MobaXterm session files (.mxtsessions) to a Wazowski shared-sessions file.
+"""Convert MobaXterm session files (.mxtsessions) to a Wazowski session tree.
 
 MobaXterm stores sessions in an INI-style file: `[Bookmarks_N]` sections each
 carry a `SubRep=` folder path (back-slash nested) and one `Name=#img#type%...`
-line per session. Wazowski reads a TOML "store file" (the same shape as
-`sessions.toml` / `wazowski-sessions.toml`) with a `folders` list and
-`[[session]]` tables.
+line per session. Wazowski reads an exploded **directory tree**: every folder is
+a directory with a `.folder` sidecar, and every session is a `<slug>.wzsession`
+file inside its folder's directory. Directory and file names are slugs; the human
+display name and a stable UUID live *inside* each file.
 
 Usage:
     mxt2wazowski.py INPUT.mxtsessions [MORE.mxtsessions ...]
-    mxt2wazowski.py INPUT.mxtsessions -o wazowski-sessions.toml
-    mxt2wazowski.py *.mxtsessions --outdir converted/ --prefix Work
+    mxt2wazowski.py INPUT.mxtsessions -o my-sessions/
+    mxt2wazowski.py *.mxtsessions --outdir converted/ --prefix "Work servers"
 
-Each input produces one output TOML (named `<input-stem>.toml` by default),
-ready to point a Wazowski shared source at (folder kind: the file path; git
-kind: commit it as the source's `file`). Passwords are never in MobaXterm
-session files, so every converted session uses the default `agent` auth and you
-set a vault password/key in Wazowski afterwards; sessions that referenced a
+Each input produces one output **directory** (the tree root; named `<input-stem>`
+by default), ready to commit to a git repo or drop on a shared folder and point a
+Wazowski shared source at. The tree root's `.folder` is named after `--prefix`
+(or the input stem) — that becomes the source's display name, which you can
+rename in Wazowski afterwards.
+
+Credentials are never exported: MobaXterm `.mxtsessions` files hold no passwords,
+and Wazowski stores no usernames in any file — every converted session uses the
+default prompt auth, and you set a vault password/key (and username, if you want
+it remembered) per session in Wazowski afterwards. Sessions that referenced a
 MobaXterm credential (e.g. `[corp-ad]`) are reported so you know which need one.
 
 Only SSH, RDP and VNC map to a Wazowski protocol (SFTP folds into SSH, since a
@@ -63,18 +69,27 @@ TYPE_NAMES = {
 
 DEFAULT_PORT = {"ssh": 22, "rdp": 3389, "vnc": 5900}
 
+# Tree-format constants (mirror wazowski-core's `session::tree`).
+SESSION_EXT = "wzsession"
+FOLDER_FILE = ".folder"
+
+
+def new_id() -> str:
+    """A 16-hex-char id, matching Wazowski's session/folder ids."""
+    return secrets.token_hex(8)
+
 
 class Converted:
     """One session ready to emit, plus notes gathered along the way."""
 
     def __init__(self, name, folder, protocol, host, port, username):
-        self.id = secrets.token_hex(8)  # 16 hex chars, matching Wazowski's ids
+        self.id = new_id()
         self.name = name
         self.folder = folder
         self.protocol = protocol
         self.host = host
         self.port = port
-        self.username = username
+        self.username = username  # parsed for reference only; never emitted
 
 
 def read_text(path: Path) -> str:
@@ -160,7 +175,7 @@ class Report:
         self.cred_refs.setdefault(ref, []).append(session_name)
 
 
-def convert_file(path: Path, prefix: str, report: Report):
+def convert_file(path: Path, report: Report):
     """Parse one MobaXterm file. Returns (sessions, folders, allowed_editors)."""
     sessions: list[Converted] = []
     folders: set[str] = set()
@@ -201,11 +216,7 @@ def convert_file(path: Path, prefix: str, report: Report):
             continue
         stype, fields = parsed
         name = key.strip()
-
         folder = current_folder
-        if prefix:
-            folder = f"{prefix}/{folder}" if folder else prefix
-            folders.update(ancestors(folder))
 
         if stype in (TYPE_SSH, TYPE_SFTP):
             protocol = "ssh"
@@ -238,6 +249,55 @@ def convert_file(path: Path, prefix: str, report: Report):
     return sessions, folders, allowed_editors
 
 
+# ---- tree output -----------------------------------------------------------
+
+
+def slugify(name: str) -> str:
+    """Lowercase ASCII-alphanumeric slug, other runs collapsed to `-`, trimmed.
+
+    Mirrors wazowski-core's `session::tree::slugify`; empty -> `item`.
+    """
+    out = []
+    last_dash = True
+    for ch in name.strip():
+        if ch.isascii() and ch.isalnum():
+            out.append(ch.lower())
+            last_dash = False
+        elif not last_dash:
+            out.append("-")
+            last_dash = True
+    slug = "".join(out).rstrip("-")
+    return slug or "item"
+
+
+def unique_slug(base: str, used: set[str]) -> str:
+    """A slug not already in `used`; appends `-2`, `-3`, … until free."""
+    if base not in used:
+        return base
+    n = 2
+    while f"{base}-{n}" in used:
+        n += 1
+    return f"{base}-{n}"
+
+
+def slug_paths(folders: set[str]) -> dict[str, str]:
+    """Map each display folder path to a slug directory path, unique among siblings.
+
+    `sorted` puts parents before children (`a` < `a/b`), so a parent's slug is
+    known when its children are assigned.
+    """
+    paths: dict[str, str] = {}
+    used: dict[str, set[str]] = {}
+    for disp in sorted(folders):
+        parent_disp, _, name = disp.rpartition("/")
+        parent = paths.get(parent_disp, "") if parent_disp else ""
+        taken = used.setdefault(parent, set())
+        slug = unique_slug(slugify(name), taken)
+        taken.add(slug)
+        paths[disp] = f"{parent}/{slug}" if parent else slug
+    return paths
+
+
 def toml_str(s: str) -> str:
     """Quote a value as a TOML basic string."""
     out = ['"']
@@ -260,38 +320,53 @@ def toml_str(s: str) -> str:
     return "".join(out)
 
 
-def render_toml(sessions: list[Converted], folders: set[str], source_name: str) -> str:
+def folder_doc(name: str, description: str = "") -> str:
+    lines = [f"id = {toml_str(new_id())}"]
+    if name:
+        lines.append(f"name = {toml_str(name)}")
+    if description:
+        lines.append(f"description = {toml_str(description)}")
+    return "\n".join(lines) + "\n"
+
+
+def session_doc(s: Converted) -> str:
+    # No username and no auth: credentials are never exported, so the session gets
+    # Wazowski's default prompt auth. Folder is implied by the directory.
     lines = [
-        f"# Wazowski sessions converted from MobaXterm ({source_name}).",
-        "# Passwords are not exported; set vault auth per session in Wazowski.",
-        "",
+        f"id = {toml_str(s.id)}",
+        f"name = {toml_str(s.name)}",
+        f"protocol = {toml_str(s.protocol)}",
+        f"host = {toml_str(s.host)}",
+        f"port = {s.port}",
     ]
-    ordered_folders = sorted(folders)
-    if ordered_folders:
-        lines.append("folders = [")
-        for f in ordered_folders:
-            lines.append(f"    {toml_str(f)},")
-        lines.append("]")
-    else:
-        lines.append("folders = []")
-    lines.append("")
+    return "\n".join(lines) + "\n"
 
+
+def render_tree(sessions, folders, root_name, source_name) -> list[tuple[str, str]]:
+    """Build the tree as (relative path, file content) pairs."""
+    files: list[tuple[str, str]] = []
+    desc = f"Converted from MobaXterm ({source_name}). Set vault auth per session in Wazowski."
+    files.append((FOLDER_FILE, folder_doc(root_name, desc)))
+
+    paths = slug_paths(folders)
+    for disp in sorted(folders):
+        name = disp.rpartition("/")[2]
+        files.append((f"{paths[disp]}/{FOLDER_FILE}", folder_doc(name)))
+
+    used: dict[str, set[str]] = {}
     for s in sessions:
-        lines.append("[[session]]")
-        lines.append(f"id = {toml_str(s.id)}")
-        lines.append(f"name = {toml_str(s.name)}")
-        lines.append(f"folder = {toml_str(s.folder)}")
-        lines.append(f"protocol = {toml_str(s.protocol)}")
-        lines.append(f"host = {toml_str(s.host)}")
-        lines.append(f"port = {s.port}")
-        lines.append(f"username = {toml_str(s.username)}")
-        lines.append("")
+        parent = paths.get(s.folder, "") if s.folder else ""
+        taken = used.setdefault(parent, set())
+        slug = unique_slug(slugify(s.name), taken)
+        taken.add(slug)
+        rel = f"{parent}/{slug}.{SESSION_EXT}" if parent else f"{slug}.{SESSION_EXT}"
+        files.append((rel, session_doc(s)))
 
-    return "\n".join(lines).rstrip() + "\n"
+    return files
 
 
 def print_report(src: Path, dst: Path, report: Report, allowed_editors: str):
-    print(f"\n{src.name} -> {dst}")
+    print(f"\n{src.name} -> {dst}/ (tree)")
     total = sum(report.converted.values())
     if total:
         detail = ", ".join(f"{n} {p.upper()}" for p, n in sorted(report.converted.items()))
@@ -311,11 +386,15 @@ def print_report(src: Path, dst: Path, report: Report, allowed_editors: str):
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Convert MobaXterm .mxtsessions to a Wazowski shared-sessions TOML.")
+    ap = argparse.ArgumentParser(
+        description="Convert MobaXterm .mxtsessions to a Wazowski session tree (a directory)."
+    )
     ap.add_argument("inputs", nargs="+", type=Path, help="one or more .mxtsessions files")
-    ap.add_argument("-o", "--output", type=Path, help="output file (only valid with a single input)")
-    ap.add_argument("--outdir", type=Path, help="directory to write <stem>.toml into (for multiple inputs)")
-    ap.add_argument("--prefix", default="", help="nest every folder under this top-level folder name")
+    ap.add_argument(
+        "-o", "--output", type=Path, help="output directory (only valid with a single input)"
+    )
+    ap.add_argument("--outdir", type=Path, help="parent directory to write <stem>/ trees into")
+    ap.add_argument("--prefix", default="", help="name the tree root (the source's display name)")
     args = ap.parse_args(argv)
 
     if args.output and len(args.inputs) > 1:
@@ -332,26 +411,41 @@ def main(argv=None) -> int:
             continue
 
         report = Report()
-        sessions, folders, allowed = convert_file(src, args.prefix.strip().strip("/"), report)
+        sessions, folders, allowed = convert_file(src, report)
 
         if args.output:
             dst = args.output
         elif args.outdir:
-            dst = args.outdir / (src.stem + ".toml")
+            dst = args.outdir / src.stem
         else:
-            dst = src.with_suffix(".toml")
+            dst = src.with_suffix("")
 
-        text = render_toml(sessions, folders, src.name)
+        root_name = args.prefix.strip().strip("/") or src.stem
+        files = render_tree(sessions, folders, root_name, src.name)
 
-        # Validate our own output parses as TOML before writing it out.
-        try:
-            tomllib.loads(text)
-        except tomllib.TOMLDecodeError as e:
-            print(f"error: generated TOML for {src.name} is invalid: {e}", file=sys.stderr)
+        # Validate every generated file parses as TOML before writing anything.
+        bad = None
+        for rel, content in files:
+            try:
+                tomllib.loads(content)
+            except tomllib.TOMLDecodeError as e:
+                bad = (rel, e)
+                break
+        if bad is not None:
+            print(f"error: generated {bad[0]} for {src.name} is invalid: {bad[1]}", file=sys.stderr)
             rc = 1
             continue
 
-        dst.write_text(text, encoding="utf-8")
+        # Refuse to scribble into a non-empty directory (avoid mixing with old data).
+        if dst.exists() and any(dst.iterdir()):
+            print(f"error: {dst} already exists and is not empty; remove it first", file=sys.stderr)
+            rc = 1
+            continue
+
+        for rel, content in files:
+            out = dst / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(content, encoding="utf-8")
         print_report(src, dst, report, allowed)
 
     return rc
