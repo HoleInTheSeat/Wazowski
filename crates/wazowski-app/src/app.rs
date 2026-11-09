@@ -9762,10 +9762,11 @@ impl App {
 
                     match form.auth {
                         AuthChoice::Prompt => {
-                            // Prompt mode shows only an optional username; the
-                            // password is asked for at connect time.
-                            ui.label("Username");
-                            line(ui, &mut form.username, false);
+                            // Nothing to configure: the username and password are
+                            // both asked for at connect time (never stored in a
+                            // session — prompt or vault only).
+                            ui.label("");
+                            ui.label(RichText::new("Username and password are asked for when you connect.").weak());
                             ui.end_row();
                         }
                         AuthChoice::Vault => {
