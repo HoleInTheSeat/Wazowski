@@ -686,10 +686,12 @@ enum Dialog {
     About,
     /// Prompt for a username/password at connect time.
     ConnectCreds(Box<ConnectCredsForm>),
-    /// Apply a color and/or icon to several selected sessions at once.
+    /// Apply a color and/or icon to several selected sessions — or folders, when
+    /// `folders` is set (then `ids` holds folder paths) — at once.
     BulkStyle {
         store: StoreId,
         ids: Vec<String>,
+        folders: bool,
         icon: String,
         color: Option<[u8; 3]>,
         set_icon: bool,
@@ -1230,10 +1232,14 @@ pub struct App {
     keybind_capturing: Option<Action>,
     /// Multi-selection in the sessions pane. Selection lives in exactly one store
     /// at a time (`sel_store`); `sel_ids` are the chosen session ids within it, and
-    /// `sel_anchor` is the pivot for Shift-range selection.
+    /// `sel_anchor` is the pivot for Shift-range selection. Folder selection
+    /// (`sel_folders`/`sel_folder_anchor`, keyed by folder path) is mutually
+    /// exclusive with session selection — you select sessions *or* folders.
     sel_store: Option<StoreId>,
     sel_ids: HashSet<String>,
     sel_anchor: Option<String>,
+    sel_folders: HashSet<String>,
+    sel_folder_anchor: Option<String>,
     /// Set when a sidebar section is opened, so its filter box grabs focus on the
     /// next frame (the cursor lands in the filter, not the active terminal tab).
     focus_filter: bool,
@@ -1625,6 +1631,8 @@ impl App {
             sel_store: None,
             sel_ids: HashSet::new(),
             sel_anchor: None,
+            sel_folders: HashSet::new(),
+            sel_folder_anchor: None,
             focus_filter: false,
             filter_sessions: String::new(),
             filter_macros: String::new(),
@@ -4493,9 +4501,12 @@ impl App {
         }
 
         // Local sessions. The selection is passed only to the store that owns it.
-        let local_sel = (self.sel_store == Some(StoreId::Local)).then_some(&self.sel_ids);
+        let local_is_sel = self.sel_store == Some(StoreId::Local);
+        let local_sel = local_is_sel.then_some(&self.sel_ids);
+        let local_fsel = local_is_sel.then_some(&self.sel_folders);
         render_store(
-            ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action, &filter, local_sel,
+            ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action, &filter,
+            local_sel, local_fsel,
         );
 
         // Each shared source as its own collapsible section.
@@ -4517,13 +4528,16 @@ impl App {
                 .default_open(true);
             let store = StoreId::Shared(source.id().to_owned());
             let editable = source.available();
-            let share_sel = (self.sel_store.as_ref() == Some(&store)).then_some(&self.sel_ids);
+            let share_is_sel = self.sel_store.as_ref() == Some(&store);
+            let share_sel = share_is_sel.then_some(&self.sel_ids);
+            let share_fsel = share_is_sel.then_some(&self.sel_folders);
             let resp = header.show(ui, |ui| {
                 if let Some(note) = source.status() {
                     ui.label(RichText::new(format!("⚠ {note}")).color(ui.visuals().warn_fg_color));
                 }
                 render_store(
-                    ui, &store, source.store(), editable, &destinations, &mut action, &filter, share_sel,
+                    ui, &store, source.store(), editable, &destinations, &mut action, &filter,
+                    share_sel, share_fsel,
                 );
             });
             let desc = source.description().to_owned();
@@ -4889,6 +4903,7 @@ impl App {
                 self.dialog = Dialog::BulkStyle {
                     store,
                     ids,
+                    folders: false,
                     icon: String::new(),
                     color: None,
                     set_icon: false,
@@ -4910,6 +4925,41 @@ impl App {
                 Ok(())
             }
             TreeAction::BulkExport(store, ids) => self.export_sessions(&store, &ids),
+            TreeAction::SelectFolder { store, path, ctrl, shift } => {
+                self.update_folder_selection(store, path, ctrl, shift);
+                Ok(())
+            }
+            TreeAction::BulkMoveFolders { from, folders, to, parent } => {
+                let mut last = Ok(());
+                for folder in top_level_folders(&folders) {
+                    if let Err(e) = self.transfer_folder(&from, &folder, &to, &parent, false) {
+                        last = Err(e);
+                    }
+                }
+                self.clear_selection();
+                last
+            }
+            TreeAction::BulkCopyFolders { from, folders, to, parent } => {
+                let mut last = Ok(());
+                for folder in top_level_folders(&folders) {
+                    if let Err(e) = self.transfer_folder(&from, &folder, &to, &parent, true) {
+                        last = Err(e);
+                    }
+                }
+                last
+            }
+            TreeAction::BulkStyleFolders(store, folders) => {
+                self.dialog = Dialog::BulkStyle {
+                    store,
+                    ids: folders,
+                    folders: true,
+                    icon: String::new(),
+                    color: None,
+                    set_icon: false,
+                    set_color: false,
+                };
+                Ok(())
+            }
         };
         if let Err(e) = result {
             self.error = Some(format!("{e:#}"));
@@ -4918,11 +4968,13 @@ impl App {
 
     // --- Session multi-selection -------------------------------------------
 
-    /// Clears the sessions-pane multi-selection.
+    /// Clears the sessions-pane multi-selection (sessions and folders).
     fn clear_selection(&mut self) {
         self.sel_store = None;
         self.sel_ids.clear();
         self.sel_anchor = None;
+        self.sel_folders.clear();
+        self.sel_folder_anchor = None;
     }
 
     /// Applies a click on `id` in `store` to the selection. `ctrl` toggles the one
@@ -4930,6 +4982,9 @@ impl App {
     /// Selection is confined to a single store, so clicking in another store first
     /// resets it.
     fn update_selection(&mut self, store: StoreId, id: String, ctrl: bool, shift: bool) {
+        // Session and folder selection are mutually exclusive.
+        self.sel_folders.clear();
+        self.sel_folder_anchor = None;
         if self.sel_store.as_ref() != Some(&store) {
             // Selection moves to the newly clicked store.
             self.sel_store = Some(store.clone());
@@ -4995,6 +5050,70 @@ impl App {
             }
         }
         walk(&root, &mut out);
+        out
+    }
+
+    /// Applies a click on folder `path` in `store` to the folder selection, mirroring
+    /// [`update_selection`] for sessions. Mutually exclusive with session selection.
+    fn update_folder_selection(&mut self, store: StoreId, path: String, ctrl: bool, shift: bool) {
+        self.sel_ids.clear();
+        self.sel_anchor = None;
+        if self.sel_store.as_ref() != Some(&store) {
+            self.sel_store = Some(store.clone());
+            self.sel_folders.clear();
+            self.sel_folder_anchor = None;
+        }
+        if shift && self.sel_folder_anchor.is_some() {
+            let anchor = self.sel_folder_anchor.clone().unwrap();
+            let order = self.folder_visible_order(&store);
+            let (ai, bi) =
+                (order.iter().position(|x| *x == anchor), order.iter().position(|x| *x == path));
+            if let (Some(mut a), Some(mut b)) = (ai, bi) {
+                if a > b {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                self.sel_folders = order[a..=b].iter().cloned().collect();
+            } else {
+                self.sel_folders.clear();
+                self.sel_folders.insert(path.clone());
+                self.sel_folder_anchor = Some(path);
+            }
+        } else if ctrl {
+            if !self.sel_folders.remove(&path) {
+                self.sel_folders.insert(path.clone());
+            }
+            self.sel_folder_anchor = Some(path);
+        } else {
+            self.sel_folders.clear();
+            self.sel_folders.insert(path.clone());
+            self.sel_folder_anchor = Some(path);
+        }
+        if self.sel_folders.is_empty() {
+            self.clear_selection();
+        }
+    }
+
+    /// Folder paths of `store` in the order the tree renders them (depth-first,
+    /// alphanumeric) — the order Shift-range folder selection walks.
+    fn folder_visible_order(&self, store: &StoreId) -> Vec<String> {
+        let Some(data) = self.store_ref(store) else { return Vec::new() };
+        let mut root = FolderNode::default();
+        for folder in data.folders() {
+            root.at(&folder);
+        }
+        let mut out = Vec::new();
+        fn walk(prefix: &str, node: &FolderNode, out: &mut Vec<String>) {
+            for (segment, child) in node.sorted_children() {
+                let full = if prefix.is_empty() {
+                    segment.clone()
+                } else {
+                    format!("{prefix}/{segment}")
+                };
+                out.push(full.clone());
+                walk(&full, child, out);
+            }
+        }
+        walk("", &root, &mut out);
         out
     }
 
@@ -7303,12 +7422,15 @@ impl App {
     fn show_bulk_style(&mut self, ctx: &egui::Context) {
         let mut apply = false;
         let mut cancel = false;
-        if let Dialog::BulkStyle { ids, icon, color, set_icon, set_color, .. } = &mut self.dialog {
+        if let Dialog::BulkStyle { ids, folders, icon, color, set_icon, set_color, .. } =
+            &mut self.dialog
+        {
             let count = ids.len();
+            let kind = if *folders { "folders" } else { "sessions" };
             egui::Modal::new(egui::Id::unique("bulk-style")).show(ctx, |ui| {
                 ui.set_width(320.0);
                 ui.heading("Set color / icon");
-                ui.label(RichText::new(format!("Applies to {count} selected sessions.")).weak());
+                ui.label(RichText::new(format!("Applies to {count} selected {kind}.")).weak());
                 ui.add_space(6.0);
                 ui.checkbox(set_icon, "Set icon");
                 if *set_icon {
@@ -7345,20 +7467,36 @@ impl App {
             return;
         }
         if apply
-            && let Dialog::BulkStyle { store, ids, icon, color, set_icon, set_color } =
+            && let Dialog::BulkStyle { store, ids, folders, icon, color, set_icon, set_color } =
                 std::mem::replace(&mut self.dialog, Dialog::None)
         {
             let mut last = Ok(());
-            for id in &ids {
-                if let Some(mut s) = self.session_in(&store, id) {
+            if folders {
+                for path in &ids {
+                    // Merge into the existing style so an unchecked field is kept.
+                    let mut style = self.store_folder_style(&store, path).unwrap_or_default();
                     if set_icon {
-                        s.icon = icon.trim().to_owned();
+                        style.icon = icon.trim().to_owned();
                     }
                     if set_color {
-                        s.color = color;
+                        style.color = color;
                     }
-                    if let Err(e) = self.store_upsert(&store, s) {
+                    if let Err(e) = self.store_set_folder_style(&store, path, style) {
                         last = Err(e);
+                    }
+                }
+            } else {
+                for id in &ids {
+                    if let Some(mut s) = self.session_in(&store, id) {
+                        if set_icon {
+                            s.icon = icon.trim().to_owned();
+                        }
+                        if set_color {
+                            s.color = color;
+                        }
+                        if let Err(e) = self.store_upsert(&store, s) {
+                            last = Err(e);
+                        }
                     }
                 }
             }
@@ -10959,6 +11097,13 @@ enum TreeAction {
     BulkCredentials(StoreId, Vec<String>),
     /// Export the selected sessions to a JSON file.
     BulkExport(StoreId, Vec<String>),
+    /// A click on a folder row that changes the folder multi-selection.
+    SelectFolder { store: StoreId, path: String, ctrl: bool, shift: bool },
+    /// Bulk move/copy several selected folders (subtrees) into a destination.
+    BulkMoveFolders { from: StoreId, folders: Vec<String>, to: StoreId, parent: String },
+    BulkCopyFolders { from: StoreId, folders: Vec<String>, to: StoreId, parent: String },
+    /// Open the dialog to apply a color/icon to all selected folders.
+    BulkStyleFolders(StoreId, Vec<String>),
 }
 
 /// Renders one store's folders and sessions, emitting a [`TreeAction`] on
@@ -11027,6 +11172,7 @@ fn render_store(
     action: &mut Option<TreeAction>,
     filter: &str,
     sel: Option<&HashSet<String>>,
+    folder_sel: Option<&HashSet<String>>,
 ) {
     // Build a nested tree; folder paths synthesize their ancestor nodes. When a
     // filter is active, only sessions whose name matches are included (and empty
@@ -11054,7 +11200,8 @@ fn render_store(
             continue;
         }
         render_folder(
-            ui, store, sessions, segment, segment, node, destinations, editable, action, filter, sel,
+            ui, store, sessions, segment, segment, node, destinations, editable, action, filter,
+            sel, folder_sel,
         );
     }
 }
@@ -11074,9 +11221,16 @@ fn render_folder<'a>(
     action: &mut Option<TreeAction>,
     filter: &str,
     sel: Option<&HashSet<String>>,
+    folder_sel: Option<&HashSet<String>>,
 ) {
     use egui::containers::collapsing_header::CollapsingState;
 
+    let selected = folder_sel.is_some_and(|s| s.contains(full));
+    let selected_folders = || -> Vec<String> {
+        let mut v: Vec<String> = folder_sel.map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        v.sort();
+        v
+    };
     let style = data.folder_style(full);
     let icon = style.map(|s| s.icon.as_str()).filter(|i| !i.is_empty()).unwrap_or("📁");
     let text = {
@@ -11086,6 +11240,9 @@ fn render_folder<'a>(
             None => t,
         }
     };
+
+    // A selected folder gets a highlighted background behind its label.
+    let fill = if selected { ui.visuals().selection.bg_fill } else { Color32::TRANSPARENT };
 
     // An empty folder (no sessions and no subfolders) has nothing to expand, so
     // it's drawn as a plain row with no collapse triangle — a visual cue that it
@@ -11097,11 +11254,16 @@ fn render_folder<'a>(
                 let indent = ui.spacing().indent;
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(indent);
-                drag_label(
-                    ui,
-                    text,
-                    DragPayload::Folder { store: store.clone(), path: full.to_owned() },
-                )
+                egui::Frame::NONE
+                    .fill(fill)
+                    .show(ui, |ui| {
+                        drag_label(
+                            ui,
+                            text,
+                            DragPayload::Folder { store: store.clone(), path: full.to_owned() },
+                        )
+                    })
+                    .inner
             })
             .inner;
         (resp.clone(), resp)
@@ -11116,11 +11278,16 @@ fn render_folder<'a>(
         // Header: a draggable folder label next to the collapse triangle.
         let (_toggle, header_inner, _body) = state
             .show_header(ui, |ui| {
-                drag_label(
-                    ui,
-                    text,
-                    DragPayload::Folder { store: store.clone(), path: full.to_owned() },
-                )
+                egui::Frame::NONE
+                    .fill(fill)
+                    .show(ui, |ui| {
+                        drag_label(
+                            ui,
+                            text,
+                            DragPayload::Folder { store: store.clone(), path: full.to_owned() },
+                        )
+                    })
+                    .inner
             })
             .body(|ui| {
                 for &session in &node.sessions {
@@ -11133,7 +11300,7 @@ fn render_folder<'a>(
                     let child_full = format!("{full}/{child_segment}");
                     render_folder(
                         ui, store, data, child_segment, &child_full, child, destinations,
-                        editable, action, filter, sel,
+                        editable, action, filter, sel, folder_sel,
                     );
                 }
             });
@@ -11152,6 +11319,17 @@ fn render_folder<'a>(
         // widget), not the whole row, so a right-click on the name opens it.
         (header_inner.response, header_inner.inner)
     };
+    // Single-click (with modifiers) changes the folder selection; double-click
+    // still toggles expand (handled above).
+    if header_label.clicked() {
+        let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+        *action = Some(TreeAction::SelectFolder {
+            store: store.clone(),
+            path: full.to_owned(),
+            ctrl,
+            shift,
+        });
+    }
     if editable
         && let Some(payload) = header_row.dnd_release_payload::<DragPayload>()
     {
@@ -11161,7 +11339,37 @@ fn render_folder<'a>(
             folder: full.to_owned(),
         });
     }
-    if editable {
+    // Right-clicking a folder that's part of a multi-selection acts on the whole
+    // selection (move/copy/restyle — bulk delete is intentionally not offered);
+    // otherwise it's the usual single-folder menu (which includes Delete).
+    let bulk = editable && selected && folder_sel.is_some_and(|s| s.len() > 1);
+    if bulk {
+        header_label.context_menu(|ui| {
+            let folders = selected_folders();
+            ui.label(RichText::new(format!("{} folders selected", folders.len())).weak());
+            ui.separator();
+            destination_menu(ui, "Copy folders to", destinations, |to, parent| {
+                *action = Some(TreeAction::BulkCopyFolders {
+                    from: store.clone(),
+                    folders: folders.clone(),
+                    to,
+                    parent,
+                });
+            });
+            destination_menu(ui, "Move folders to", destinations, |to, parent| {
+                *action = Some(TreeAction::BulkMoveFolders {
+                    from: store.clone(),
+                    folders: folders.clone(),
+                    to,
+                    parent,
+                });
+            });
+            if ui.button("Set color / icon…").clicked() {
+                *action = Some(TreeAction::BulkStyleFolders(store.clone(), folders.clone()));
+                ui.close();
+            }
+        });
+    } else if editable {
         header_label.context_menu(|ui| {
             if ui.button("New session here").clicked() {
                 *action = Some(TreeAction::NewSessionIn(store.clone(), full.to_owned()));
@@ -11214,6 +11422,17 @@ fn drag_label(
     let resp = ui.add(egui::Button::new(text).frame(false).sense(egui::Sense::click_and_drag()));
     resp.dnd_set_drag_payload(payload);
     resp
+}
+
+/// The folders in `folders` that aren't nested under another folder in the set, so
+/// a bulk move/copy acts on each subtree once (a selected ancestor carries its
+/// selected descendants).
+fn top_level_folders(folders: &[String]) -> Vec<String> {
+    folders
+        .iter()
+        .filter(|f| !folders.iter().any(|o| *f != o && f.starts_with(&format!("{o}/"))))
+        .cloned()
+        .collect()
 }
 
 /// Whether a drop is a no-op or invalid (dropping a folder into itself/subtree).
