@@ -238,10 +238,10 @@ Behaviour:
   from the Releases page.
 - Any `v*` tag builds, so you can also tag a **feature-branch** commit to get test
   binaries without touching `main`.
-- **Quirk:** the updater's version compare looks only at the numeric core
-  (`2.6.0`), ignoring the `-beta.1` suffix — so someone on `2.6.0-beta.1` is **not**
-  auto-nudged to the final `2.6.0` (same core). They update manually, or at the
-  next real bump.
+- The updater's version compare is **SemVer-aware** (`is_newer` in `update.rs`): a
+  pre-release ranks *below* its release, so someone on `2.6.0-beta.1` **is** offered
+  the final `2.6.0`. (This was fixed in 2.6.0; clients on *older* betas still
+  running the pre-fix compare won't auto-nudge and update manually.)
 
 When ready, cut the final by tagging `vX.Y.Z` with **no hyphen** → normal release,
 becomes Latest, updater offers it.

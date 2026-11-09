@@ -130,16 +130,74 @@ pub fn latest_release() -> Result<Release> {
     })
 }
 
-/// Whether `latest` is a newer version than `current`, by numeric x.y.z compare.
+/// Whether `latest` is a newer version than `current`, by SemVer precedence:
+/// the `x.y.z` core is compared numerically, and a pre-release (`-beta.1`) ranks
+/// *below* the matching release — so someone on `2.6.0-beta.1` is correctly
+/// offered the final `2.6.0`. Build metadata (`+…`) is ignored.
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    fn parts(v: &str) -> Vec<u64> {
-        // Stop at the first pre-release/build separator; compare the x.y.z core.
-        v.split(['.', '-', '+'])
-            .take(3)
-            .map(|s| s.parse().unwrap_or(0))
-            .collect()
+    version_cmp(latest, current) == std::cmp::Ordering::Greater
+}
+
+fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (core_a, pre_a) = split_pre(a);
+    let (core_b, pre_b) = split_pre(b);
+    match core_parts(core_a).cmp(&core_parts(core_b)) {
+        Ordering::Equal => {}
+        ord => return ord,
     }
-    parts(latest) > parts(current)
+    // Same core: a release (no pre-release) outranks any pre-release of it.
+    match (pre_a.is_empty(), pre_b.is_empty()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => cmp_prerelease(pre_a, pre_b),
+    }
+}
+
+/// Splits a version into its `x.y.z` core and pre-release tag, dropping any `+build`.
+fn split_pre(v: &str) -> (&str, &str) {
+    let v = v.split('+').next().unwrap_or(v);
+    match v.split_once('-') {
+        Some((core, pre)) => (core, pre),
+        None => (v, ""),
+    }
+}
+
+/// The three numeric core fields (missing ones default to 0), for ordered compare.
+fn core_parts(core: &str) -> [u64; 3] {
+    let mut out = [0u64; 3];
+    for (i, s) in core.split('.').take(3).enumerate() {
+        out[i] = s.parse().unwrap_or(0);
+    }
+    out
+}
+
+/// Compares two pre-release tags per SemVer: dot-separated identifiers, numeric
+/// compared numerically (and ranked below alphanumeric), and a shorter tag ranks
+/// below a longer one when all preceding identifiers are equal.
+fn cmp_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut ai = a.split('.');
+    let mut bi = b.split('.');
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(nx), Ok(ny)) => nx.cmp(&ny),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
 }
 
 /// The release asset name suffix wanted for the given install, per platform.
@@ -306,8 +364,19 @@ mod tests {
         assert!(is_newer("2.0.10", "2.0.9"));
         assert!(!is_newer("2.0.5", "2.0.5"));
         assert!(!is_newer("2.0.4", "2.0.5"));
-        // A prerelease core equal to current is not "newer".
+        // A prerelease core equal to current is not "newer" than the release.
         assert!(!is_newer("2.0.5-beta.1", "2.0.5"));
+        // The bug fix: the final release IS newer than its own pre-release, so a
+        // beta user is offered the release.
+        assert!(is_newer("2.6.0", "2.6.0-beta.1"));
+        assert!(is_newer("2.6.0", "2.6.0-beta.3"));
+        // Pre-release ordering among betas.
+        assert!(is_newer("2.6.0-beta.2", "2.6.0-beta.1"));
+        assert!(!is_newer("2.6.0-beta.1", "2.6.0-beta.2"));
+        // A higher core always wins regardless of pre-release tags.
+        assert!(is_newer("2.6.1", "2.6.0-beta.1"));
+        // Build metadata is ignored.
+        assert!(!is_newer("2.6.0+ci", "2.6.0"));
     }
 
     #[test]
