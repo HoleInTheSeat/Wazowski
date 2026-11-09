@@ -3590,6 +3590,41 @@ impl App {
                 self.dialog = Dialog::ImportSettings { path };
             }
         });
+
+        ui.add_space(14.0);
+        ui.label(RichText::new("Turn local sessions into a shared source").strong());
+        ui.label(
+            RichText::new(
+                "Export your local sessions as a .zip of the shared-source tree. Extract it into \
+                 a git repo or shared folder, then add that as a shared source — everyone gets \
+                 your sessions. No usernames or secrets are included.",
+            )
+            .weak(),
+        );
+        ui.add_space(6.0);
+        if ui.button(format!("{}  Export local sessions (.zip)…", icons::EXPORT)).clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Export local sessions")
+                .set_file_name("wazowski-local-sessions.zip")
+                .add_filter("Zip", &["zip"])
+                .save_file()
+        {
+            let count = self.sessions.all().len();
+            match self.export_local_zip(&path) {
+                Ok(()) => {
+                    self.dialog = Dialog::Notice {
+                        title: "Local sessions exported".into(),
+                        body: format!(
+                            "Saved {count} local session(s) as a shared-source tree to:\n{}\n\n\
+                             Extract it into a git repo or shared folder, then add that as a \
+                             shared source.",
+                            path.display()
+                        ),
+                    };
+                }
+                Err(e) => self.error = Some(format!("Export failed: {e:#}")),
+            }
+        }
     }
 
     /// Confirms importing a settings backup, then applies it and reloads.
@@ -5350,6 +5385,25 @@ impl App {
         };
         let json = serde_json::to_string_pretty(&sessions)?;
         std::fs::write(&path, json)?;
+        Ok(())
+    }
+
+    /// Writes the Local sessions as a `.zip` of the exploded shared-source tree
+    /// (`.folder` + `.wzsession` files). Extracting it into a git repo or shared
+    /// folder yields a ready-to-use shared source. No usernames/secrets travel.
+    fn export_local_zip(&self, dest: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        let files = wazowski_core::tree::explode(&self.sessions);
+        let file = std::fs::File::create(dest)?;
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (rel, bytes) in files {
+            // Zip entries use forward slashes on every platform.
+            zip.start_file(rel.to_string_lossy().replace('\\', "/"), opts)?;
+            zip.write_all(&bytes)?;
+        }
+        zip.finish()?;
         Ok(())
     }
 

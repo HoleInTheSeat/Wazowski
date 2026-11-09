@@ -59,6 +59,9 @@ png = "0.18"
 ureq = "2"
 self-replace.workspace = true
 if-addrs.workspace = true
+# Writing a .zip of the exploded session tree (Export Local sessions). Pure-Rust
+# deflate (flate2/miniz_oxide, already in the tree); no C deps.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 regex.workspace = true
 log.workspace = true
 env_logger.workspace = true
