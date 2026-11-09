@@ -5442,19 +5442,8 @@ impl App {
     /// (`.folder` + `.wzsession` files). Extracting it into a git repo or shared
     /// folder yields a ready-to-use shared source. No usernames/secrets travel.
     fn export_local_zip(&self, dest: &std::path::Path) -> anyhow::Result<()> {
-        use std::io::Write;
         let files = wazowski_core::tree::explode(&self.sessions);
-        let file = std::fs::File::create(dest)?;
-        let mut zip = zip::ZipWriter::new(file);
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        for (rel, bytes) in files {
-            // Zip entries use forward slashes on every platform.
-            zip.start_file(rel.to_string_lossy().replace('\\', "/"), opts)?;
-            zip.write_all(&bytes)?;
-        }
-        zip.finish()?;
-        Ok(())
+        write_session_zip(&files, dest)
     }
 
     // --- Store routing ------------------------------------------------------
@@ -11788,6 +11777,25 @@ fn top_level_folders(folders: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Writes exploded-tree `files` (relative path, bytes) into a deflate `.zip` at
+/// `dest`. Zip entries always use forward slashes.
+fn write_session_zip(
+    files: &[(std::path::PathBuf, Vec<u8>)],
+    dest: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let file = std::fs::File::create(dest)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (rel, bytes) in files {
+        zip.start_file(rel.to_string_lossy().replace('\\', "/"), opts)?;
+        zip.write_all(bytes)?;
+    }
+    zip.finish()?;
+    Ok(())
+}
+
 /// Whether a drop is a no-op or invalid (dropping a folder into itself/subtree).
 fn is_noop_drop(payload: &DragPayload, to: &StoreId, folder: &str) -> bool {
     match payload {
@@ -12709,6 +12717,37 @@ fn step_editor(ui: &mut egui::Ui, step: &mut Step) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_zip_roundtrips() {
+        // Writes a tree into a .zip and reads it back, exercising the zip API.
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            (std::path::PathBuf::from(".folder"), b"id = \"root\"\n".to_vec()),
+            (
+                std::path::PathBuf::from("switches/zone-1.wzsession"),
+                b"id = \"a\"\nname = \"Zone 1\"\n".to_vec(),
+            ),
+        ];
+        let dest = dir.path().join("out.zip");
+        write_session_zip(&files, &dest).unwrap();
+
+        let f = std::fs::File::open(&dest).unwrap();
+        let mut archive = zip::ZipArchive::new(f).unwrap();
+        let mut names = Vec::new();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().unwrap().to_string();
+            let mut contents = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
+            names.push((name, contents));
+        }
+        names.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(names[0].0, ".folder");
+        assert_eq!(names[0].1, b"id = \"root\"\n");
+        assert_eq!(names[1].0, "switches/zone-1.wzsession");
+        assert!(names[1].1.starts_with(b"id = \"a\""));
+    }
 
     #[test]
     fn vault_picker_in_horizontal_layout_does_not_panic() {
