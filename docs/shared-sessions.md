@@ -5,13 +5,20 @@ source appears as its own collapsible section in the Sessions pane, alongside yo
 local sessions.
 
 Sources never store secrets — shared sessions reference vault entries by name, and
-each user creates those credentials locally on first use.
+each user creates those credentials locally on first use. **No usernames are
+stored either**: a session's username comes from the connect prompt or a vault
+entry, never from a file.
+
+A source is stored as an exploded **directory tree** (see [How it's stored](#how-its-stored)):
+one repo (or one folder) is one source, laid out so that editing one session
+touches one file — which keeps a team's git history clean and conflict-free.
 
 ## Kinds of source
 
-- **Folder / file** — a sessions file on a shared or synced location (network
-  mount, NAS, Dropbox/Nextcloud folder, …).
-- **Git repo** — a repository on GitHub, GitLab, Forgejo, etc. Auth is either:
+- **Folder** — a directory holding the session tree, on a shared or synced
+  location (network mount, NAS, Dropbox/Nextcloud folder, …).
+- **Git repo** — a repository on GitHub, GitLab, Forgejo, etc.; the whole repo is
+  one source. Auth is either:
   - **None / ambient** (public repo or your existing git credentials), or
   - **Vault entry** — authenticate from a [vault](vault.md) credential. Add a
     **password** entry (its password is the HTTPS token; set the username for
@@ -35,20 +42,22 @@ when the share or remote is offline (read-only until it's reachable again).
 
 Sessions pane → right-click → **Add shared source…**, then choose the kind and
 fill in the details, including an optional **description, icon, and color**. A
-brand-new source's file is created for you so it's immediately usable.
+brand-new source's tree is created for you so it's immediately usable. Adding the
+same repo (or folder) twice is refused — one repo is one source.
 
-### Appearance & description
+### Name, appearance & description
 
-The source's **description, icon, and color** are all stored **inside the shared
-sessions file**, so they travel with the sessions — everyone who opens the source
-sees the same thing. The description appears at the top of the source's hover
-tooltip (above the connection details); the icon and color style the source's
-header in the Sessions pane. All of it shows even when you're offline (read from
-the local cache).
+The source's **name, description, icon, and color** all live **inside the tree's
+root `.folder`**, so they travel with the sessions — everyone who opens the source
+sees the same name and styling, and **renaming the source renames it for everyone**.
+If the root has no name yet, the source shows its `org/repo` (git) as a fallback.
+The description and the remote identity appear in the source's hover tooltip; the
+icon and color style its header. All of it shows even when you're offline (read
+from the local cache).
 
-> Sources created in an older version stored the icon/color locally; they still
-> display, and the appearance moves into the shared file the next time you edit
-> and save the source.
+> Sources and files created in an older (single-file) version are migrated to the
+> tree automatically the first time you open them (for a git repo, as one
+> "Migrate…" commit you then push).
 
 ## Syncing and pushing changes
 
@@ -74,14 +83,30 @@ push, the confirmation dialog has a collapsible **preview** listing exactly whic
 changes will go out — click to expand it, so nothing is pushed sight-unseen.
 
 For **folder** sources there's nothing to push: writes go straight to the shared
-file, and **Sync now** just re-reads it.
+directory, and **Sync now** just re-reads it.
+
+## How it's stored
+
+A source is a directory tree, not one file:
+
+- Each **folder** is a directory with a `.folder` sidecar carrying its name, icon,
+  color, and a stable id.
+- Each **session** is a `<slug>.wzsession` file inside its folder's directory.
+- The **root `.folder`** carries the source's own name/icon/color/description.
+
+Directory and file names are slugs; the human display name and a stable UUID live
+*inside* each file, so renaming or moving something never breaks links, and two
+items can share a display name. Crucially, **one session is one file**, so two
+people editing different sessions produce independent commits that merge cleanly —
+no more whole-file conflicts. Folders and sessions are always shown in
+alphanumeric order (sessions first, then subfolders); arrange them by naming.
 
 ## Offline behaviour
 
 If a source is unreachable, Wazowski keeps using the local cache (read-only) and
-tells you. For a folder source whose file has gone missing, you can **recreate**
-it from the cache. Edits are disabled while a source is offline, to avoid
-conflicting with it.
+tells you. For a folder source whose directory has gone missing, you can
+**recreate** it from the cache. Edits are disabled while a source is offline, to
+avoid conflicting with it.
 
 ## Moving sessions between stores
 

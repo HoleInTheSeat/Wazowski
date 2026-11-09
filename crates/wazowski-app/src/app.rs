@@ -4506,7 +4506,7 @@ impl App {
             let glyph = source.display_icon();
             let icon = if glyph.is_empty() { "🌐" } else { glyph };
             let title = {
-                let t = RichText::new(format!("{icon} {}{badge}", source.name()));
+                let t = RichText::new(format!("{icon} {}{badge}", source.display_name()));
                 match source.display_color() {
                     Some([r, g, b]) => t.color(Color32::from_rgb(r, g, b)),
                     None => t,
@@ -4527,13 +4527,16 @@ impl App {
                 );
             });
             let desc = source.description().to_owned();
+            let remote = source.remote_label();
             let hint = source_hint(source.def());
             delayed_tooltip_ui(ui, &resp.header_response, |ui| {
-                // Optional description on top, then a separator, then the details.
+                // Optional description on top, then the remote identity (so the
+                // repo is recognizable even after a rename), then the details.
                 if !desc.is_empty() {
                     ui.label(&desc);
                     ui.separator();
                 }
+                ui.label(RichText::new(&remote).strong());
                 ui.label(hint);
             });
             // Dropping onto the source header targets that store's root.
@@ -8482,11 +8485,11 @@ impl App {
 
                     match f.kind {
                         SourceKind::Folder => {
-                            ui.label("Shared file");
+                            ui.label("Shared folder");
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut f.path)
-                                        .hint_text("/path/to/team-sessions.toml")
+                                        .hint_text("/path/to/team-sessions/")
                                         .desired_width(240.0),
                                 );
                                 browse_folder |= ui.button("Browse…").clicked();
@@ -8502,9 +8505,6 @@ impl App {
                             ui.end_row();
                             ui.label("Branch");
                             ui.add(egui::TextEdit::singleline(&mut f.branch).hint_text("(default)"));
-                            ui.end_row();
-                            ui.label("File in repo");
-                            ui.text_edit_singleline(&mut f.file);
                             ui.end_row();
                             ui.label("Auth");
                             // Git sources authenticate either anonymously or from a
@@ -8573,9 +8573,7 @@ impl App {
             });
         }
         if browse_folder
-            && let Some(picked) = rfd::FileDialog::new()
-                .set_file_name("team-sessions.toml")
-                .save_file()
+            && let Some(picked) = rfd::FileDialog::new().pick_folder()
             && let Dialog::AddSource(f) = &mut self.dialog
         {
             f.path = picked.to_string_lossy().into_owned();
@@ -8648,6 +8646,19 @@ impl App {
                     return Err("Choose a vault entry, or set Auth to None.".into());
                 }
             }
+        }
+        // Refuse to attach the same source twice (dedupe on the git remote, or the
+        // folder path) — one repo is one source. Skipped when editing an existing one.
+        if f.edit_id.is_none()
+            && let Some(dup) = self.sources_config.defs.iter().find(|d| {
+                d.kind == def.kind
+                    && match def.kind {
+                        SourceKind::Git => sources::same_remote(&d.url, &def.url),
+                        SourceKind::Folder => d.path == def.path,
+                    }
+            })
+        {
+            return Err(format!("That source is already present as \u{201c}{}\u{201d}.", dup.name));
         }
         Ok((def, token))
     }
@@ -8723,6 +8734,11 @@ impl App {
         let color = def.color;
         let mut source = SharedSource::open(def.clone(), &cache, auth);
         if source.available() {
+            if source.store().name() != def.name
+                && let Err(e) = source.set_name(&def.name)
+            {
+                self.error = Some(format!("Saved, but could not update the name: {e:#}"));
+            }
             if source.description() != description
                 && let Err(e) = source.set_description(description)
             {
@@ -10971,6 +10987,26 @@ impl<'a> FolderNode<'a> {
     fn has_sessions(&self) -> bool {
         !self.sessions.is_empty() || self.children.values().any(FolderNode::has_sessions)
     }
+
+    /// Sorts this node's sessions (and, recursively, its descendants') by display
+    /// name, case-insensitively, so the tree is always in alphanumeric order.
+    fn sort_sessions(&mut self) {
+        self.sessions.sort_by(|a, b| {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.name.cmp(&b.name))
+        });
+        for child in self.children.values_mut() {
+            child.sort_sessions();
+        }
+    }
+
+    /// Child folders in case-insensitive alphanumeric order of their segment name.
+    fn sorted_children(&self) -> Vec<(&String, &FolderNode<'a>)> {
+        let mut children: Vec<_> = self.children.iter().collect();
+        children.sort_by(|(a, _), (b, _)| {
+            a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b))
+        });
+        children
+    }
 }
 
 /// A move/copy destination: a store and its folders.
@@ -11005,13 +11041,14 @@ fn render_store(
         }
         root.at(&session.folder).sessions.push(session);
     }
+    // Sessions first, then subfolders — each in alphanumeric (display-name) order.
+    root.sort_sessions();
 
     // Root-level sessions, then each top-level folder recursively.
     for &session in &root.sessions {
         session_row(ui, store, session, destinations, editable, action, sel);
     }
-    let children: Vec<_> = root.children.iter().collect();
-    for (segment, node) in children {
+    for (segment, node) in root.sorted_children() {
         if !filter.is_empty() && !node.has_sessions() {
             continue;
         }
@@ -11088,7 +11125,7 @@ fn render_folder<'a>(
                 for &session in &node.sessions {
                     session_row(ui, store, session, destinations, editable, action, sel);
                 }
-                for (child_segment, child) in &node.children {
+                for (child_segment, child) in node.sorted_children() {
                     if !filter.is_empty() && !child.has_sessions() {
                         continue;
                     }
@@ -11198,11 +11235,11 @@ fn is_noop_drop(payload: &DragPayload, to: &StoreId, folder: &str) -> bool {
 /// A brief description of a shared source, for its left-pane hover tooltip.
 fn source_hint(def: &SourceDef) -> String {
     match def.kind {
-        SourceKind::Folder => format!("Shared folder\nfile: {}", def.path.display()),
+        SourceKind::Folder => format!("Shared folder\npath: {}", def.path.display()),
         SourceKind::Git => {
             let branch = if def.branch.is_empty() { "(default)" } else { &def.branch };
             let repo = def.url.rsplit('/').next().unwrap_or(&def.url).trim_end_matches(".git");
-            format!("Git repo: {repo}\nurl: {}\nbranch: {branch}\nfile: {}", def.url, def.file)
+            format!("Git repo: {repo}\nurl: {}\nbranch: {branch}", def.url)
         }
     }
 }

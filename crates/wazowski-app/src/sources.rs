@@ -546,6 +546,18 @@ impl SharedSource {
         self.mutate("Update source appearance", |s| s.set_appearance(icon, color))
     }
 
+    /// Sets the source's display name in the shared tree's root `.folder`
+    /// (write-through), so a rename travels to every user.
+    pub fn set_name(&mut self, name: &str) -> Result<()> {
+        let old = self.store.name();
+        let message = if old.is_empty() {
+            format!("Set source name: {name}")
+        } else {
+            format!("Source renamed: {old} → {name}")
+        };
+        self.mutate(&message, |s| s.set_name(name))
+    }
+
     /// Sets the icon/color in the in-memory store only, to be persisted by the next
     /// `create()` — used when first creating a brand-new source's file.
     pub fn prime_appearance(&mut self, icon: &str, color: Option<[u8; 3]>) {
@@ -599,6 +611,10 @@ impl SharedSource {
     /// (Re)creates the shared file from the current cache contents, publishing it
     /// immediately (this is a deliberate setup action, so it pushes right away).
     pub fn create(&mut self) -> Result<()> {
+        // Seed the root `.folder` name from the chosen source name, so it travels.
+        if self.store.name().is_empty() && !self.def.name.is_empty() {
+            let _ = self.store.set_name(&self.def.name);
+        }
         self.store.ensure_ids();
         tree::sync_tree(&self.store, self.backend.work_dir())
             .context("could not prepare the shared tree")?;
@@ -628,6 +644,36 @@ impl SharedSource {
 
     pub fn name(&self) -> &str {
         &self.def.name
+    }
+
+    /// The display name shown in the tree: the name carried in the shared tree's
+    /// root `.folder` (travels to every user), else the remote's `org/repo` (git),
+    /// else the local source name.
+    pub fn display_name(&self) -> String {
+        let stored = self.store.name();
+        if !stored.is_empty() {
+            return stored.to_owned();
+        }
+        if self.def.kind == SourceKind::Git
+            && let Some(id) = repo_identity(&self.def.url)
+        {
+            return id;
+        }
+        self.def.name.clone()
+    }
+
+    /// A short identifier of where the source lives, for the tooltip: `org/repo`
+    /// plus branch for git, or the path for a folder share.
+    pub fn remote_label(&self) -> String {
+        match self.def.kind {
+            SourceKind::Git => {
+                let id = repo_identity(&self.def.url).unwrap_or_else(|| self.def.url.clone());
+                let branch =
+                    if self.def.branch.is_empty() { "default branch" } else { &self.def.branch };
+                format!("{id} ({branch})")
+            }
+            SourceKind::Folder => self.def.path.display().to_string(),
+        }
     }
 
     pub fn store(&self) -> &SessionStore {
@@ -737,6 +783,30 @@ fn git_web_url(url: &str) -> Option<String> {
         return Some(strip_git(url));
     }
     None
+}
+
+/// Whether two git remote URLs point at the same repository, ignoring the
+/// https/ssh form and a trailing `.git` — so adding the same repo twice can be
+/// refused regardless of how its URL was typed.
+pub fn same_remote(a: &str, b: &str) -> bool {
+    match (git_web_url(a), git_web_url(b)) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(&y),
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    }
+}
+
+/// `org/repo` extracted from a git remote URL, for a fallback display name and
+/// the tooltip. `None` if it can't be parsed.
+pub fn repo_identity(url: &str) -> Option<String> {
+    let web = git_web_url(url)?; // normalizes to https://host/org/repo
+    let rest = web.split_once("://").map(|(_, r)| r).unwrap_or(&web);
+    let mut segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    let repo = segs.pop()?;
+    let org = segs.pop()?;
+    if org.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{org}/{repo}"))
 }
 
 /// The local-data cache directory for shared sources.

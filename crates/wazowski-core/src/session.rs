@@ -400,6 +400,12 @@ impl SessionStore {
         &self.name
     }
 
+    /// Sets the collection's display name (travels in the tree's root `.folder`).
+    pub fn set_name(&mut self, name: impl Into<String>) -> Result<()> {
+        self.name = name.into();
+        self.save()
+    }
+
     /// The collection's stable id (the tree's root `.folder` UUID), empty until
     /// [`ensure_ids`](Self::ensure_ids) assigns one.
     pub fn id(&self) -> &str {
