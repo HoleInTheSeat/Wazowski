@@ -262,11 +262,11 @@ pub fn collect_tree_files(root: &Path) -> Result<Vec<PathBuf>> {
         for entry in rd {
             let entry = entry?;
             let path = entry.path();
-            let name = entry.file_name();
-            if name == ".git" {
-                continue;
-            }
             if entry.file_type()?.is_dir() {
+                // Skip hidden directories (`.git`, dot-dirs); `.folder` is a file.
+                if is_hidden(&entry.file_name()) {
+                    continue;
+                }
                 rec(root, &path, out)?;
             } else if is_tree_file(&path) {
                 out.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
@@ -283,6 +283,13 @@ pub fn collect_tree_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// empty/fresh repo or a missing directory).
 pub fn tree_present(root: &Path) -> bool {
     collect_tree_files(root).map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Whether a directory entry is hidden (its name starts with `.`) — `.git`, the
+/// `.folder` sidecar, `.DS_Store`, and the like. Hidden entries never render in
+/// the tree.
+fn is_hidden(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| n.starts_with('.'))
 }
 
 /// Whether a path is a `.folder` sidecar or a `.wzsession` file.
@@ -303,10 +310,11 @@ fn prune_stale(root: &Path, keep: &BTreeSet<PathBuf>) -> Result<()> {
         for entry in rd {
             let entry = entry?;
             let path = entry.path();
-            if entry.file_name() == ".git" {
-                continue;
-            }
             if entry.file_type()?.is_dir() {
+                // Never descend into hidden directories (`.git`, dot-dirs).
+                if is_hidden(&entry.file_name()) {
+                    continue;
+                }
                 rec(root, &path, keep)?;
                 // Remove the directory if pruning emptied it.
                 if fs::read_dir(&path)?.next().is_none() {
@@ -364,6 +372,11 @@ fn walk(dir: &Path, display_prefix: &str, acc: &mut Accum) -> Result<()> {
 
     for entry in entries {
         let path = entry.path();
+        // Never render hidden entries (`.git`, the `.folder` sidecar, dotfiles). The
+        // sidecar is read separately by path, so skipping it here is safe.
+        if is_hidden(&entry.file_name()) {
+            continue;
+        }
         let ftype = entry.file_type().with_context(|| format!("stat {}", path.display()))?;
         if ftype.is_dir() {
             let doc = read_folder_doc(&path.join(FOLDER_FILE))?;
@@ -656,6 +669,28 @@ mod tests {
         s2.ensure_ids();
         sync_tree(&s2, dir.path()).unwrap();
         assert!(!dir.path().join("gone").exists(), "emptied folder dir pruned");
+    }
+
+    #[test]
+    fn hidden_directories_never_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A git clone's `.git`, plus an arbitrary dot-dir — neither should appear.
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join(".git/config"), "x").unwrap();
+        std::fs::create_dir(root.join(".hidden")).unwrap();
+        std::fs::write(root.join(".folder"), "id = \"rootid0000000000\"\nname = \"Team\"\n").unwrap();
+        std::fs::write(
+            root.join("box.wzsession"),
+            "id = \"aaaaaaaaaaaaaaaa\"\nname = \"Box\"\nhost = \"h\"\n",
+        )
+        .unwrap();
+
+        let store = assemble(root).unwrap();
+        assert!(store.folders().is_empty(), "no hidden dir should render: {:?}", store.folders());
+        assert_eq!(store.all().len(), 1);
+        // And they're not counted as tree files either.
+        assert_eq!(collect_tree_files(root).unwrap().len(), 2, ".folder + box.wzsession only");
     }
 
     #[test]
