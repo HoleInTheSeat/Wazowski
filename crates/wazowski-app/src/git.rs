@@ -32,8 +32,6 @@ pub struct GitRepo {
     url: String,
     /// Branch to track; empty means the remote default.
     branch: String,
-    /// Path of the sessions file within the repo.
-    file: String,
     auth: GitAuth,
     /// A temp file holding an inline SSH key (from the vault), written for the
     /// life of this repo so `ssh -i` can read it. Deleted when the repo drops.
@@ -45,13 +43,7 @@ pub struct GitRepo {
 }
 
 impl GitRepo {
-    pub fn new(
-        work_dir: PathBuf,
-        url: String,
-        branch: String,
-        file: String,
-        auth: GitAuth,
-    ) -> Self {
+    pub fn new(work_dir: PathBuf, url: String, branch: String, auth: GitAuth) -> Self {
         // An inline SSH key is materialised to a private temp file, and the auth
         // rewritten to point `ssh -i` at it. On Unix the temp file is created
         // 0600 by `tempfile`; the handle is closed (TempPath) so ssh can read it.
@@ -70,41 +62,37 @@ impl GitRepo {
             work_dir,
             url,
             branch,
-            file,
             auth,
             _ssh_key_file: ssh_key_file,
             github_cache: OnceLock::new(),
         }
     }
 
-    /// Fetches the latest and returns the sessions-file bytes (`None` if absent).
-    /// Errors if the remote is unreachable or gone, so callers can go offline.
-    pub fn fetch(&self) -> Result<Option<Vec<u8>>> {
+    /// The local working clone directory — the shared tree lives at its root.
+    pub fn work_dir(&self) -> &std::path::Path {
+        &self.work_dir
+    }
+
+    /// Fetches the latest into the working clone and reports whether the repo
+    /// holds a session tree (`false` for a fresh/empty repo). Errors if the remote
+    /// is unreachable or gone, so callers can go offline.
+    pub fn fetch(&self) -> Result<bool> {
         self.ensure_clone()?;
         // `fetch` reaching the remote is the online signal (a deleted repo or a
         // dropped network fails here). Then fast-forward the working tree.
         self.git(&["fetch", "--prune"]).context("could not reach the git remote")?;
         let _ = self.git(&["merge", "--ff-only"]);
-        let path = self.work_dir.join(&self.file);
-        match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).context("reading the sessions file in the clone"),
-        }
+        Ok(wazowski_core::tree::tree_present(&self.work_dir))
     }
 
-    /// Writes the sessions file and commits it locally, without pushing. The
-    /// commit becomes an "unpushed change" until [`push`](Self::push) runs.
-    /// `message` is the commit subject describing the change (e.g. "Session
-    /// deleted: work > prod > db").
-    pub fn commit(&self, message: &str, bytes: &[u8]) -> Result<()> {
+    /// Stages the whole working tree and commits it locally, without pushing. The
+    /// caller writes the tree files first (see `tree::sync_tree`); `git add -A`
+    /// then captures exactly the adds/modifications/deletions. The commit becomes
+    /// an "unpushed change" until [`push`](Self::push) runs. `message` is the
+    /// commit subject describing the change (e.g. "Session deleted: …").
+    pub fn commit(&self, message: &str) -> Result<()> {
         self.ensure_clone()?;
-        let path = self.work_dir.join(&self.file);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(&path, bytes).context("writing the sessions file")?;
-        self.git(&["add", "--", &self.file]).context("git add failed")?;
+        self.git(&["add", "-A"]).context("git add failed")?;
         // Attribute the commit to the user, not "Wazowski": use their own git
         // identity when configured, else a derived one (GitHub login / OS user).
         let mut args: Vec<String> = self.identity_args();
@@ -174,10 +162,10 @@ impl GitRepo {
     /// Pushes committed changes to the remote (setting upstream on first push).
     ///
     /// First fetches and rebases local commits onto the updated upstream, so a
-    /// sibling source that shares the same repo (a different file in it) doesn't
-    /// get rejected as non-fast-forward after the other one pushes. A real
-    /// conflict (the same file changed on both sides) aborts the rebase and lets
-    /// the push surface the rejection.
+    /// push from another clone of the same repo doesn't get rejected as
+    /// non-fast-forward after the other one pushes. Edits to different files
+    /// (different sessions) rebase cleanly; a real conflict (the same file changed
+    /// on both sides) aborts the rebase and lets the push surface the rejection.
     pub fn push(&self) -> Result<()> {
         self.ensure_clone()?;
         // Bring in anything pushed to the same branch since our last fetch.
@@ -197,9 +185,9 @@ impl GitRepo {
             .unwrap_or(false)
     }
 
-    /// Writes the sessions file, commits, and pushes in one step.
-    pub fn publish(&self, message: &str, bytes: &[u8]) -> Result<()> {
-        self.commit(message, bytes)?;
+    /// Stages the working tree, commits, and pushes in one step.
+    pub fn publish(&self, message: &str) -> Result<()> {
+        self.commit(message)?;
         self.push()
     }
 

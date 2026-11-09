@@ -575,6 +575,12 @@ impl SessionStore {
     }
 
     fn save(&self) -> Result<()> {
+        // A tree-backed (assembled) store has no single-file path; its persistence
+        // is driven externally via `tree::sync_tree`, so in-memory mutations here
+        // must not try to write a lone TOML file.
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
         self.save_as(&self.path)
     }
 

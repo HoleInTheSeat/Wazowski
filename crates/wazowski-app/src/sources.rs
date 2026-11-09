@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use wazowski_core::{Session, SessionStore};
+use wazowski_core::{Session, SessionStore, tree};
 
 use crate::git::{GitAuth, GitRepo};
 
@@ -118,55 +118,83 @@ pub fn delete_git_token(id: &str) {
     }
 }
 
-/// How a source reaches its shared sessions file.
+/// Outcome of refreshing the local working tree from the remote.
+enum FetchOutcome {
+    /// A session tree is present (and now mirrored locally).
+    Present,
+    /// The remote is reachable but holds no tree yet (fresh repo / missing dir).
+    Missing,
+}
+
+/// How a source reaches its shared session tree. The shared store is laid out as
+/// a directory tree (see [`wazowski_core::tree`]); each backend keeps a local
+/// working copy of it under the cache, which is what the store is assembled from.
 enum Backend {
-    /// A file on a shared/synced path.
-    Folder(PathBuf),
-    /// A git working clone (boxed: much larger than the folder variant).
+    /// A tree directory on a shared/synced path (`share`), mirrored locally
+    /// (`work`) so it stays available offline.
+    Folder { share: PathBuf, work: PathBuf },
+    /// A git working clone (boxed: much larger than the folder variant). The tree
+    /// lives at the clone's root.
     Git(Box<GitRepo>),
 }
 
 impl Backend {
-    /// Reads the current shared bytes (`None` if the file doesn't exist there).
-    fn fetch(&self) -> Result<Option<Vec<u8>>> {
+    /// The local working-tree directory the store is assembled from.
+    fn work_dir(&self) -> &Path {
         match self {
-            Backend::Folder(path) => match fs::read(path) {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e.into()),
-            },
-            Backend::Git(repo) => repo.fetch(),
+            Backend::Folder { work, .. } => work,
+            Backend::Git(repo) => repo.work_dir(),
         }
     }
 
-    /// Records bytes locally without publishing to the remote. For a folder share
-    /// this writes the file directly (there is nothing to push); for git it
-    /// commits locally, leaving the commit to be pushed later via [`push`].
-    /// `message` is the commit subject (git only; a folder share has no history).
-    fn commit(&self, message: &str, bytes: &[u8]) -> Result<()> {
+    /// Refreshes the local working tree from the remote. `Err` means the remote
+    /// was unreachable (go offline, keep the cached tree).
+    fn fetch(&self) -> Result<FetchOutcome> {
         match self {
-            Backend::Folder(path) => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
+            Backend::Folder { share, work } => match fs::metadata(share) {
+                Ok(_) => {
+                    tree::copy_tree(share, work).context("mirroring the shared location")?;
+                    Ok(if tree::tree_present(work) {
+                        FetchOutcome::Present
+                    } else {
+                        FetchOutcome::Missing
+                    })
                 }
-                fs::write(path, bytes).map_err(Into::into)
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FetchOutcome::Missing),
+                Err(e) => Err(e).context("reading the shared location"),
+            },
+            Backend::Git(repo) => {
+                Ok(if repo.fetch()? { FetchOutcome::Present } else { FetchOutcome::Missing })
             }
-            Backend::Git(repo) => repo.commit(message, bytes),
         }
     }
 
-    /// Publishes bytes to the share immediately (folder write / git commit+push).
-    fn publish(&self, message: &str, bytes: &[u8]) -> Result<()> {
+    /// Records the (already-written) working tree locally without publishing to
+    /// the remote. For a folder share this mirrors the tree onto the share (there
+    /// is nothing to push); for git it commits locally, to be pushed later via
+    /// [`push`]. `message` is the commit subject (git only).
+    fn commit(&self, message: &str) -> Result<()> {
         match self {
-            Backend::Folder(_) => self.commit(message, bytes),
-            Backend::Git(repo) => repo.publish(message, bytes),
+            Backend::Folder { share, work } => {
+                tree::copy_tree(work, share).context("could not write to the shared location")
+            }
+            Backend::Git(repo) => repo.commit(message),
+        }
+    }
+
+    /// Publishes the working tree to the share immediately (folder mirror / git
+    /// commit+push).
+    fn publish(&self, message: &str) -> Result<()> {
+        match self {
+            Backend::Folder { .. } => self.commit(message),
+            Backend::Git(repo) => repo.publish(message),
         }
     }
 
     /// Pushes locally-committed changes. A folder share has nothing to push.
     fn push(&self) -> Result<()> {
         match self {
-            Backend::Folder(_) => Ok(()),
+            Backend::Folder { .. } => Ok(()),
             Backend::Git(repo) => repo.push(),
         }
     }
@@ -174,7 +202,7 @@ impl Backend {
     /// Whether there are local changes not yet on the remote (git only).
     fn has_pending(&self) -> bool {
         match self {
-            Backend::Folder(_) => false,
+            Backend::Folder { .. } => false,
             Backend::Git(repo) => repo.has_unpushed().unwrap_or(false),
         }
     }
@@ -182,15 +210,17 @@ impl Backend {
     /// Subjects of the commits a push would send (git only; empty for a folder).
     fn pending_commits(&self) -> Vec<String> {
         match self {
-            Backend::Folder(_) => Vec::new(),
+            Backend::Folder { .. } => Vec::new(),
             Backend::Git(repo) => repo.pending_commits(),
         }
     }
 
-    /// Discards local changes, matching the remote (git only).
+    /// Discards local changes, matching the remote (git reset / folder re-mirror).
     fn discard(&self) -> Result<()> {
         match self {
-            Backend::Folder(_) => Ok(()),
+            Backend::Folder { share, work } => {
+                tree::copy_tree(share, work).context("could not refresh from the shared location")
+            }
             Backend::Git(repo) => repo.discard(),
         }
     }
@@ -200,8 +230,10 @@ impl Backend {
 /// from the vault by the caller (only used when the source's auth is
 /// `GitAuthKind::Vault`); it's `None` when the vault is locked or unavailable.
 fn backend_for(def: &SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -> Backend {
+    // One working-tree directory per source (the git clone, or the folder mirror).
+    let work_dir = cache_dir.join(&def.id);
     match def.kind {
-        SourceKind::Folder => Backend::Folder(def.path.clone()),
+        SourceKind::Folder => Backend::Folder { share: def.path.clone(), work: work_dir },
         SourceKind::Git => {
             let auth = match def.auth {
                 GitAuthKind::None => GitAuth::None,
@@ -218,12 +250,10 @@ fn backend_for(def: &SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -
                 // it's unlocked and the source re-opened.
                 GitAuthKind::Vault => vault_auth.unwrap_or(GitAuth::None),
             };
-            let work_dir = cache_dir.join("git").join(&def.id);
             Backend::Git(Box::new(GitRepo::new(
                 work_dir,
                 def.url.clone(),
                 def.branch.clone(),
-                def.file.clone(),
                 auth,
             )))
         }
@@ -295,30 +325,29 @@ impl SourcesConfig {
 /// local cache, kept in sync with the shared file when it is reachable.
 pub struct SharedSource {
     def: SourceDef,
-    cache_path: PathBuf,
     /// Shared (`Arc`) so a background refresh thread can run `fetch()` without
     /// blocking the UI, while the main thread keeps using it for commit/push.
     backend: Arc<Backend>,
     store: SessionStore,
     /// Whether the share was reachable at the last load/sync.
     available: bool,
-    /// Whether the last failure was specifically "file not found".
+    /// Whether the last failure was specifically "tree not found".
     missing: bool,
     /// A note about the last sync problem, for display.
     status: Option<String>,
     /// An in-flight background fetch, if any (its result applied by `poll_reload`).
-    refresh: Option<Receiver<Result<Option<Vec<u8>>, String>>>,
+    refresh: Option<Receiver<Result<FetchOutcome, String>>>,
 }
 
 impl SharedSource {
-    /// Builds a source without touching the network/share. Loads the store from
-    /// the local cache so sessions are available immediately (and offline).
+    /// Builds a source without touching the network/share. Assembles the store
+    /// from the local working tree so sessions are available immediately (offline).
     fn from_cache(def: SourceDef, cache_dir: &Path, vault_auth: Option<GitAuth>) -> Self {
-        let cache_path = cache_dir.join(format!("{}.toml", def.id));
         let backend = Arc::new(backend_for(&def, cache_dir, vault_auth));
-        let available = cache_path.is_file();
-        let store = SessionStore::load(cache_path.clone()).unwrap_or_default();
-        Self { def, cache_path, backend, store, available, missing: false, status: None, refresh: None }
+        let work = backend.work_dir();
+        let available = tree::tree_present(work);
+        let store = tree::assemble(work).unwrap_or_default();
+        Self { def, backend, store, available, missing: false, status: None, refresh: None }
     }
 
     /// Opens a source synchronously: refresh the cache from the share (blocking),
@@ -339,12 +368,10 @@ impl SharedSource {
         source
     }
 
-    /// Re-reads the share (refreshing the cache) and reloads the store. Blocking:
-    /// a git source performs network I/O here. Prefer [`begin_reload`] on the UI.
+    /// Re-reads the share (refreshing the local working tree) and reloads the
+    /// store. Blocking: a git source performs network I/O here. Prefer
+    /// [`begin_reload`] on the UI.
     pub fn reload(&mut self) {
-        if let Some(parent) = self.cache_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         let result = self.backend.fetch().map_err(|e| format!("{e:#}"));
         self.apply_fetch(result);
     }
@@ -355,9 +382,6 @@ impl SharedSource {
     pub fn begin_reload(&mut self) {
         if self.refresh.is_some() {
             return;
-        }
-        if let Some(parent) = self.cache_path.parent() {
-            let _ = fs::create_dir_all(parent);
         }
         let backend = Arc::clone(&self.backend);
         let (tx, rx) = mpsc::channel();
@@ -395,22 +419,19 @@ impl SharedSource {
     }
 
     /// Applies a fetch result (from a blocking or background fetch): updates the
-    /// cache file + availability state, then reloads the store from the cache.
-    fn apply_fetch(&mut self, result: Result<Option<Vec<u8>>, String>) {
+    /// availability state, then re-assembles the store from the local working tree.
+    fn apply_fetch(&mut self, result: Result<FetchOutcome, String>) {
         match result {
-            Ok(Some(bytes)) => {
-                if let Err(e) = fs::write(&self.cache_path, &bytes) {
-                    self.status = Some(format!("could not update cache: {e}"));
-                }
+            Ok(FetchOutcome::Present) => {
                 self.available = true;
                 self.missing = false;
                 self.status = None;
             }
-            Ok(None) => {
-                // Reachable, but the sessions file doesn't exist yet.
+            Ok(FetchOutcome::Missing) => {
+                // Reachable, but the shared tree doesn't exist yet.
                 self.available = false;
                 self.missing = true;
-                self.status = Some("shared file not found — using local cache (read-only)".into());
+                self.status = Some("shared tree not found — using local cache (read-only)".into());
             }
             Err(e) => {
                 self.available = false;
@@ -426,24 +447,18 @@ impl SharedSource {
                 self.status = Some(format!("share offline ({e}) — using local cache (read-only)"));
             }
         }
-        self.store = SessionStore::load(self.cache_path.clone()).unwrap_or_default();
+        self.store = tree::assemble(self.backend.work_dir()).unwrap_or_default();
     }
 
-    /// Saves the store to the cache and returns its bytes.
-    fn cache_bytes(&self) -> Result<Vec<u8>> {
-        self.store
-            .save_as(&self.cache_path)
-            .context("could not update the local cache")?;
-        fs::read(&self.cache_path).context("reading cache")
-    }
-
-    /// Records a store change: writes the cache and commits it locally. For git
-    /// this does not push — the change becomes "pending" until [`push`] or a sync
-    /// sends it. For a folder share, committing writes the file directly.
-    /// `message` becomes the git commit subject describing the change.
+    /// Records a store change: writes the working tree and commits it locally. For
+    /// git this does not push — the change becomes "pending" until [`push`] or a
+    /// sync sends it. For a folder share, committing mirrors the tree onto the
+    /// share. `message` becomes the git commit subject describing the change.
     fn write_through(&mut self, message: &str) -> Result<()> {
-        let bytes = self.cache_bytes()?;
-        self.backend.commit(message, &bytes)?;
+        self.store.ensure_ids();
+        tree::sync_tree(&self.store, self.backend.work_dir())
+            .context("could not update the local cache")?;
+        self.backend.commit(message)?;
         self.available = true;
         self.missing = false;
         self.status = None;
@@ -548,8 +563,10 @@ impl SharedSource {
     /// (Re)creates the shared file from the current cache contents, publishing it
     /// immediately (this is a deliberate setup action, so it pushes right away).
     pub fn create(&mut self) -> Result<()> {
-        let bytes = self.cache_bytes()?;
-        self.backend.publish("Create sessions file", &bytes)?;
+        self.store.ensure_ids();
+        tree::sync_tree(&self.store, self.backend.work_dir())
+            .context("could not prepare the shared tree")?;
+        self.backend.publish("Create shared source")?;
         self.available = true;
         self.missing = false;
         self.status = None;
@@ -564,7 +581,7 @@ impl SharedSource {
     /// Whether the missing share can be recreated from the local cache. True only
     /// for a folder source whose file is gone (a deleted git repo can't be remade).
     pub fn can_recreate(&self) -> bool {
-        self.missing && matches!(*self.backend, Backend::Folder(_))
+        self.missing && matches!(*self.backend, Backend::Folder { .. })
     }
 
     // --- Accessors -------------------------------------------------------
@@ -701,8 +718,8 @@ mod tests {
     #[test]
     fn write_through_and_cache_fallback() {
         let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("share")).unwrap();
-        let share = dir.path().join("share/team.toml");
+        // A folder share is now a *directory* holding the exploded tree.
+        let share = dir.path().join("share");
         let cache = dir.path().join("cache");
         let def = SourceDef {
             id: "t1".into(),
@@ -720,7 +737,7 @@ mod tests {
             color: None,
         };
 
-        // A brand-new source has no file yet; create() writes an empty one.
+        // A brand-new source has no tree yet; create() lays one down.
         let mut source = SharedSource::open(def.clone(), &cache, None);
         assert!(!source.available());
         source.create().unwrap();
@@ -728,19 +745,22 @@ mod tests {
         source.upsert(Session::new("web", "example.com", "root")).unwrap();
         source.set_description("Team servers").unwrap();
         source.set_appearance("🌐", Some([1, 2, 3])).unwrap();
-        assert!(share.exists(), "share file should be written");
+        assert!(share.join(".folder").exists(), "share tree should be written");
         assert_eq!(source.store().all().len(), 1);
 
-        // Reopen from the share: description and appearance are stored in the file,
-        // so they travel with the sessions (every user sees the same icon/color).
+        // Reopen from the share: description and appearance live in the root
+        // `.folder`, so they travel with the sessions (every user sees them).
         let reopened = SharedSource::open(def.clone(), &cache, None);
-        assert_eq!(reopened.description(), "Team servers", "description persists in the file");
-        assert_eq!(reopened.stored_icon(), "🌐", "icon travels in the file");
-        assert_eq!(reopened.stored_color(), Some([1, 2, 3]), "color travels in the file");
+        assert_eq!(reopened.description(), "Team servers", "description travels in the tree");
+        assert_eq!(reopened.stored_icon(), "🌐", "icon travels in the tree");
+        assert_eq!(reopened.stored_color(), Some([1, 2, 3]), "color travels in the tree");
         assert_eq!(reopened.store().all().len(), 1);
+        // The username was not persisted to the shared tree (prompt or vault only);
+        // it only ever lives in memory for the current connection.
+        assert_eq!(reopened.store().all()[0].username, "", "username is never persisted");
 
         // Reopen from cache with the share removed: session still present, offline.
-        fs::remove_dir_all(dir.path().join("share")).unwrap();
+        fs::remove_dir_all(&share).unwrap();
         let offline = SharedSource::open(def, &cache, None);
         assert!(!offline.available());
         assert_eq!(offline.store().all().len(), 1, "cache keeps sessions when offline");
@@ -864,13 +884,12 @@ mod tests {
         assert_eq!(b.store().all().len(), 1, "pushed session should sync via git");
     }
 
-    // Two sources sharing one repo (different files) must both be able to push:
-    // the second push integrates the first (rebase) instead of being rejected as
-    // non-fast-forward. Regression test for the "second source fails to push
-    // until relaunch" bug.
+    // The payoff of the tree format: independent edits from two clones of one repo
+    // (different session files) merge cleanly. A push that's behind the shared
+    // branch rebases and integrates instead of being rejected as non-fast-forward.
     #[test]
     #[ignore = "requires the git binary"]
-    fn two_sources_same_repo_can_both_push() {
+    fn independent_edits_from_two_clones_merge() {
         use std::process::Command;
         let dir = tempdir().unwrap();
         let remote = dir.path().join("remote.git");
@@ -883,32 +902,27 @@ mod tests {
                 .success()
         );
         let url = remote.to_string_lossy().into_owned();
-        let def_file = |id: &str, file: &str| {
-            let mut d = git_def(id, &url);
-            d.file = file.into();
-            d
-        };
 
-        // Source A seeds a.toml; source B seeds b.toml in the same repo.
-        let mut a = SharedSource::open(def_file("a", "a.toml"), &dir.path().join("a"), None);
+        // User A seeds the shared tree with a session and pushes.
+        let mut a = SharedSource::open(git_def("a", &url), &dir.path().join("a"), None);
         a.create().unwrap();
-        let mut b = SharedSource::open(def_file("b", "b.toml"), &dir.path().join("b"), None);
-        b.create().unwrap();
-
-        // A pushes a change; now B's clone is behind the shared branch.
         a.upsert(Session::new("hostA", "a.example.com", "root")).unwrap();
         a.push().unwrap();
 
-        // B edits its own file and pushes — must succeed by integrating A's commit,
-        // not fail as non-fast-forward.
+        // User B clones the same repo (sees A's session) and edits a different one.
+        let mut b = SharedSource::open(git_def("b", &url), &dir.path().join("b"), None);
+        assert_eq!(b.store().all().len(), 1, "B sees A's session");
         b.upsert(Session::new("hostB", "b.example.com", "root")).unwrap();
+
+        // Meanwhile A pushes another change, so B is behind. B's push must rebase
+        // and integrate (different files → clean merge), not be rejected.
+        a.upsert(Session::new("hostA2", "a2.example.com", "root")).unwrap();
+        a.push().unwrap();
         b.push().unwrap();
         assert!(!b.has_pending(), "B's push should clear its pending state");
 
-        // A fresh clone of each file sees the expected sessions.
-        let ca = SharedSource::open(def_file("ca", "a.toml"), &dir.path().join("ca"), None);
-        let cb = SharedSource::open(def_file("cb", "b.toml"), &dir.path().join("cb"), None);
-        assert_eq!(ca.store().all().len(), 1, "A's session survived B's push");
-        assert_eq!(cb.store().all().len(), 1, "B's session was pushed");
+        // A fresh clone sees all three independently-edited sessions.
+        let c = SharedSource::open(git_def("c", &url), &dir.path().join("c"), None);
+        assert_eq!(c.store().all().len(), 3, "independent edits all merged");
     }
 }

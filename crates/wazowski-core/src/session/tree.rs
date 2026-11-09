@@ -192,7 +192,7 @@ pub fn explode(store: &SessionStore) -> Vec<(PathBuf, Vec<u8>)> {
 
 /// Writes [`explode`]'s output under `root`, creating directories as needed.
 /// A full write into a clean directory; it does not remove files already there
-/// (incremental, stale-file-aware writing belongs to the backend layer).
+/// (use [`sync_tree`] for an incremental, stale-file-aware write).
 pub fn write_tree(store: &SessionStore, root: &Path) -> Result<()> {
     for (rel, bytes) in explode(store) {
         let path = root.join(&rel);
@@ -203,6 +203,125 @@ pub fn write_tree(store: &SessionStore, root: &Path) -> Result<()> {
         fs::write(&path, &bytes).with_context(|| format!("could not write {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Reconciles the tree under `root` to match `store`: writes each current file
+/// (only when its bytes changed, to avoid needless churn), then removes any
+/// `.folder`/`.wzsession` left over from a previous state and prunes the empty
+/// directories that leaves behind. `.git` and any non-tree files are untouched.
+/// This is what a backend calls on each mutation, so git sees exactly the files
+/// that actually changed and independent edits merge cleanly.
+pub fn sync_tree(store: &SessionStore, root: &Path) -> Result<()> {
+    let files = explode(store);
+    let keep: BTreeSet<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+    for (rel, bytes) in &files {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        if fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
+            fs::write(&path, bytes).with_context(|| format!("could not write {}", path.display()))?;
+        }
+    }
+    prune_stale(root, &keep)?;
+    Ok(())
+}
+
+/// Mirrors the tree files under `src` into `dst` (changed files only), then
+/// prunes from `dst` anything no longer in `src`. Used for a folder share, whose
+/// local mirror and shared directory are kept in step without going through git.
+pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    let files = collect_tree_files(src)?;
+    let keep: BTreeSet<PathBuf> = files.iter().cloned().collect();
+    for rel in &files {
+        let from = src.join(rel);
+        let to = dst.join(rel);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        let bytes = fs::read(&from).with_context(|| format!("could not read {}", from.display()))?;
+        if fs::read(&to).ok().as_deref() != Some(bytes.as_slice()) {
+            fs::write(&to, &bytes).with_context(|| format!("could not write {}", to.display()))?;
+        }
+    }
+    prune_stale(dst, &keep)?;
+    Ok(())
+}
+
+/// Relative paths of every `.folder`/`.wzsession` under `root` (recursively,
+/// skipping `.git`). An absent `root` yields an empty list.
+pub fn collect_tree_files(root: &Path) -> Result<Vec<PathBuf>> {
+    fn rec(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        let rd = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("could not read {}", dir.display())),
+        };
+        for entry in rd {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                rec(root, &path, out)?;
+            } else if is_tree_file(&path) {
+                out.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    rec(root, root, &mut out)?;
+    Ok(out)
+}
+
+/// Whether `root` holds any tree files at all (so a store exists there, vs an
+/// empty/fresh repo or a missing directory).
+pub fn tree_present(root: &Path) -> bool {
+    collect_tree_files(root).map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Whether a path is a `.folder` sidecar or a `.wzsession` file.
+fn is_tree_file(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some(FOLDER_FILE)
+        || path.extension().and_then(|e| e.to_str()) == Some(SESSION_EXT)
+}
+
+/// Deletes tree files under `root` whose relative path is not in `keep`, then
+/// removes the directories that empties (never `.git`).
+fn prune_stale(root: &Path, keep: &BTreeSet<PathBuf>) -> Result<()> {
+    fn rec(root: &Path, dir: &Path, keep: &BTreeSet<PathBuf>) -> Result<()> {
+        let rd = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("could not read {}", dir.display())),
+        };
+        for entry in rd {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                rec(root, &path, keep)?;
+                // Remove the directory if pruning emptied it.
+                if fs::read_dir(&path)?.next().is_none() {
+                    let _ = fs::remove_dir(&path);
+                }
+            } else if is_tree_file(&path) {
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                if !keep.contains(&rel) {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        Ok(())
+    }
+    rec(root, root, keep)
 }
 
 // ---- assemble --------------------------------------------------------------
@@ -494,5 +613,72 @@ mod tests {
         std::fs::create_dir(dir.path().join("Loose")).unwrap();
         let back = assemble(dir.path()).unwrap();
         assert!(back.folders().contains(&"Loose".to_owned()));
+    }
+
+    #[test]
+    fn sync_tree_prunes_removed_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store();
+        s.sessions.push(sess("x1", "Alpha", "h", "Group"));
+        s.sessions.push(sess("x2", "Beta", "h", "Group"));
+        s.folders.push("Group".into());
+        s.ensure_ids();
+        sync_tree(&s, dir.path()).unwrap();
+        // root .folder + Group/.folder + two sessions.
+        assert_eq!(collect_tree_files(dir.path()).unwrap().len(), 4);
+
+        // Same store minus Beta: re-syncing must delete Beta's file (and nothing else).
+        let mut s2 = store();
+        s2.id = s.id().to_owned();
+        s2.sessions.push(sess("x1", "Alpha", "h", "Group"));
+        s2.folders.push("Group".into());
+        s2.ensure_ids();
+        sync_tree(&s2, dir.path()).unwrap();
+
+        let back = assemble(dir.path()).unwrap();
+        assert!(back.get("x1").is_some());
+        assert!(back.get("x2").is_none(), "Beta's file should be pruned");
+        assert_eq!(collect_tree_files(dir.path()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn sync_tree_prunes_emptied_folder_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store();
+        s.folders.push("Gone".into());
+        s.ensure_ids();
+        sync_tree(&s, dir.path()).unwrap();
+        assert!(dir.path().join("gone").is_dir());
+
+        // Drop the folder: its directory should be removed, not left dangling.
+        let mut s2 = store();
+        s2.id = s.id().to_owned();
+        s2.ensure_ids();
+        sync_tree(&s2, dir.path()).unwrap();
+        assert!(!dir.path().join("gone").exists(), "emptied folder dir pruned");
+    }
+
+    #[test]
+    fn copy_tree_mirrors_then_prunes() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let mut s = store();
+        s.sessions.push(sess("m1", "One", "h", ""));
+        s.sessions.push(sess("m2", "Two", "h", ""));
+        s.ensure_ids();
+        sync_tree(&s, a.path()).unwrap();
+        copy_tree(a.path(), b.path()).unwrap();
+        assert_eq!(assemble(b.path()).unwrap().all().len(), 2);
+
+        // Shrink the source, re-mirror: the mirror drops the removed file too.
+        let mut s2 = store();
+        s2.id = s.id().to_owned();
+        s2.sessions.push(sess("m1", "One", "h", ""));
+        s2.ensure_ids();
+        sync_tree(&s2, a.path()).unwrap();
+        copy_tree(a.path(), b.path()).unwrap();
+        let back = assemble(b.path()).unwrap();
+        assert!(back.get("m1").is_some());
+        assert!(back.get("m2").is_none(), "mirror should prune the removed session");
     }
 }
