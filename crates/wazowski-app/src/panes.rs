@@ -438,12 +438,14 @@ impl Panes {
         font_size: f32,
         highlights: &[(Regex, egui::Color32)],
         action: &mut Option<PaneAction>,
-    ) -> Option<(u64, Vec<u8>)> {
+        focus_request: bool,
+    ) -> ShowResult {
         let area = ui.available_rect_before_wrap();
         let multi = self.count() > 1;
         let focused = self.focused;
         let mut new_focus = self.focused;
         let mut source = None;
+        let mut clicked = false;
         if let Some(root) = &mut self.root {
             show_pane(
                 Ctx {
@@ -459,6 +461,8 @@ impl Panes {
                     new_focus: &mut new_focus,
                     source: &mut source,
                     action,
+                    focus_request,
+                    clicked: &mut clicked,
                 },
                 ui,
                 root,
@@ -466,8 +470,16 @@ impl Panes {
             );
         }
         self.focused = new_focus;
-        source
+        ShowResult { broadcast: source, clicked }
     }
+}
+
+/// What [`Panes::show`] reports back for a frame.
+pub struct ShowResult {
+    /// Input typed into the focused pane this frame, for broadcast (`None` if not).
+    pub broadcast: Option<(u64, Vec<u8>)>,
+    /// Whether the user clicked/dragged into a terminal this frame.
+    pub clicked: bool,
 }
 
 /// Shared state threaded through the recursive render.
@@ -485,6 +497,12 @@ struct Ctx<'a> {
     new_focus: &'a mut u64,
     source: &'a mut Option<(u64, Vec<u8>)>,
     action: &'a mut Option<PaneAction>,
+    /// When true, the currently-focused pane requests keyboard focus this frame
+    /// (used to hand focus to a session launched from the keyboard).
+    focus_request: bool,
+    /// Set when the user clicks/drags into a terminal this frame (so the app can
+    /// take keyboard focus away from the sessions tree).
+    clicked: &'a mut bool,
 }
 
 impl Ctx<'_> {
@@ -502,6 +520,8 @@ impl Ctx<'_> {
             new_focus: self.new_focus,
             source: self.source,
             action: self.action,
+            focus_request: self.focus_request,
+            clicked: self.clicked,
         }
     }
 }
@@ -537,7 +557,16 @@ fn show_pane(mut cx: Ctx, ui: &mut Ui, pane: &mut Pane, area: Rect) {
             if !typed.is_empty() {
                 *cx.source = Some((id, typed));
             }
-            if response.has_focus() || response.clicked() || response.drag_started() {
+            // Hand keyboard focus to the focused pane when asked (e.g. a session
+            // launched from the keyboard should receive input immediately).
+            if cx.focus_request && id == cx.focused {
+                response.request_focus();
+            }
+            let user_clicked = response.clicked() || response.drag_started();
+            if user_clicked {
+                *cx.clicked = true;
+            }
+            if response.has_focus() || user_clicked {
                 *cx.new_focus = id;
             }
 

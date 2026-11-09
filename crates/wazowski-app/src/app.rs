@@ -1243,6 +1243,13 @@ pub struct App {
     /// Set when keyboard navigation moves the cursor, so the newly selected row
     /// scrolls into view on the next render (then cleared).
     scroll_to_selected: bool,
+    /// Whether the sessions tree owns the keyboard (arrow nav active). Cleared when
+    /// a session is launched or a terminal is clicked; set by clicking a row or the
+    /// "Focus the sessions pane" shortcut.
+    tree_focus: bool,
+    /// One-shot: hand keyboard focus to the active pane on the next render (e.g.
+    /// after launching a session from the keyboard).
+    focus_active_pane: bool,
     /// Set when a sidebar section is opened, so its filter box grabs focus on the
     /// next frame (the cursor lands in the filter, not the active terminal tab).
     focus_filter: bool,
@@ -1638,6 +1645,8 @@ impl App {
             sel_folders: HashSet::new(),
             sel_folder_anchor: None,
             scroll_to_selected: false,
+            tree_focus: true,
+            focus_active_pane: false,
             focus_filter: false,
             filter_sessions: String::new(),
             filter_macros: String::new(),
@@ -2013,6 +2022,11 @@ impl App {
     /// Connects a saved session according to its protocol: SSH opens a terminal
     /// tab, RDP/VNC open a native in-window session tab.
     fn connect_session(&mut self, session: &Session, ctx: &egui::Context) {
+        // Launching a session hands the keyboard to it (like clicking into its tab):
+        // tree arrow-nav pauses and the opened terminal grabs focus once it renders.
+        // Ctrl+Shift+S (Focus the sessions pane) brings focus back to the tree.
+        self.tree_focus = false;
+        self.focus_active_pane = true;
         // Prompt-everytime (or a vault session with no entry chosen) asks for
         // credentials before connecting. SSH handles this itself inside
         // `start_connect`; RDP/VNC need the prompt raised here.
@@ -2763,6 +2777,12 @@ impl App {
         }
         if triggered(Action::ViewFiles, ctx, &self.keymap) {
             self.sidebar_view = SidebarView::Files;
+        }
+        if triggered(Action::FocusSessions, ctx, &self.keymap) {
+            // Bring keyboard focus back to the sessions tree for arrow nav.
+            self.sidebar_view = SidebarView::Sessions;
+            self.sidebar_collapsed = false;
+            self.focus_tree(ctx);
         }
         // F11 toggles window fullscreen (read the current state and flip it).
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F11)) {
@@ -4903,6 +4923,7 @@ impl App {
             }
             TreeAction::Select { store, id, ctrl, shift } => {
                 self.update_selection(store, id, ctrl, shift);
+                self.focus_tree(ctx);
                 Ok(())
             }
             TreeAction::BulkConnect(store, ids) => {
@@ -4997,6 +5018,7 @@ impl App {
             TreeAction::BulkExport(store, ids) => self.export_sessions(&store, &ids),
             TreeAction::SelectFolder { store, path, ctrl, shift } => {
                 self.update_folder_selection(store, path, ctrl, shift);
+                self.focus_tree(ctx);
                 Ok(())
             }
             TreeAction::BulkMoveFolders { from, folders, to, parent } => {
@@ -5187,6 +5209,18 @@ impl App {
         out
     }
 
+    /// Gives keyboard focus to the sessions tree: re-enables arrow nav and releases
+    /// any widget (e.g. a terminal) that currently holds egui focus, so it stops
+    /// receiving input.
+    fn focus_tree(&mut self, ctx: &egui::Context) {
+        self.tree_focus = true;
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+    }
+
     /// The flattened list of keyboard-navigable items in `store`, in render order
     /// (sessions first, then subfolders; a collapsed folder hides its descendants),
     /// honouring the active filter. The order Up/Down arrows walk.
@@ -5310,7 +5344,8 @@ impl App {
     /// folder. A no-op while a text field (the filter box) has focus. Called before
     /// the tree renders, and consumes the keys so row widgets don't also react.
     fn handle_tree_keys(&mut self, ctx: &egui::Context) {
-        if self.sidebar_view != SidebarView::Sessions
+        if !self.tree_focus
+            || self.sidebar_view != SidebarView::Sessions
             || !matches!(self.dialog, Dialog::None)
             || ctx.text_edit_focused()
         {
@@ -5362,6 +5397,7 @@ impl App {
                     if enter
                         && let Some(session) = self.session_in(&store, id)
                     {
+                        // connect_session hands keyboard focus to the opened session.
                         self.connect_session(&session, ctx);
                     }
                 }
@@ -5945,11 +5981,18 @@ impl App {
         let font_size =
             self.tabs.get(active).map(|t| t.font_size).unwrap_or(self.settings.terminal_font_size);
         let highlights = self.highlights.compiled();
+        // Read the focus request before borrowing self.tabs; record whether a
+        // terminal actually rendered (so the request survives a "Connecting" tab)
+        // and whether one was clicked. Applied after the match (avoids a double
+        // borrow of self).
+        let focus_request = self.focus_active_pane;
+        let mut focus_used = false;
+        let mut clicked_terminal = false;
         match self.tabs.get_mut(active) {
             Some(tab) => match &mut tab.content {
                 TabContent::Terminal(panes) => {
                     let origin = tab.origin_term;
-                    broadcast_src = panes.show(
+                    let result = panes.show(
                         ui,
                         interactive,
                         broadcast,
@@ -5959,7 +6002,11 @@ impl App {
                         font_size,
                         highlights,
                         &mut pane_action,
+                        focus_request,
                     );
+                    broadcast_src = result.broadcast;
+                    clicked_terminal = result.clicked;
+                    focus_used = true;
                 }
                 TabContent::Connecting(c) => {
                     if let Some(action) = connecting_view(ui, c, tab.id) {
@@ -5991,6 +6038,15 @@ impl App {
                     }
                 });
             }
+        }
+        // The focus request is consumed once a terminal has actually rendered (so a
+        // session that opens via a "Connecting" tab still grabs focus when ready).
+        if focus_used {
+            self.focus_active_pane = false;
+        }
+        // Clicking into a terminal hands keyboard focus to it (tree nav pauses).
+        if clicked_terminal {
+            self.tree_focus = false;
         }
         if let Some((store, id)) = connect_recent
             && let Some(session) = self.session_in(&store, &id)
@@ -6197,7 +6253,7 @@ impl App {
             && let TabContent::Terminal(panes) = &mut tab.content
         {
             let fs = tab.font_size;
-            panes.show(ui, false, false, None, &[], None, fs, &[], &mut None);
+            let _ = panes.show(ui, false, false, None, &[], None, fs, &[], &mut None, false);
         }
         match act {
             Some(EndAct::Restart) => {

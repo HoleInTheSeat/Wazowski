@@ -31,13 +31,14 @@ pub enum Action {
     ViewSessions,
     ViewMacros,
     ViewFiles,
+    FocusSessions,
     FontSizeUp,
     FontSizeDown,
     FontSizeReset,
 }
 
 impl Action {
-    pub const ALL: [Action; 18] = [
+    pub const ALL: [Action; 19] = [
         Action::NewShell,
         Action::CloseTab,
         Action::NextTab,
@@ -53,6 +54,7 @@ impl Action {
         Action::ViewSessions,
         Action::ViewMacros,
         Action::ViewFiles,
+        Action::FocusSessions,
         Action::FontSizeUp,
         Action::FontSizeDown,
         Action::FontSizeReset,
@@ -76,6 +78,7 @@ impl Action {
             Action::ViewSessions => "Left pane: Sessions",
             Action::ViewMacros => "Left pane: Macros",
             Action::ViewFiles => "Left pane: Files",
+            Action::FocusSessions => "Focus the sessions pane (keyboard nav)",
             Action::FontSizeUp => "Terminal: larger font",
             Action::FontSizeDown => "Terminal: smaller font",
             Action::FontSizeReset => "Terminal: reset font size",
@@ -103,6 +106,7 @@ impl Action {
             Action::ViewSessions => KeyboardShortcut::new(ctrl_shift, Key::Num1),
             Action::ViewMacros => KeyboardShortcut::new(ctrl_shift, Key::Num2),
             Action::ViewFiles => KeyboardShortcut::new(ctrl_shift, Key::Num3),
+            Action::FocusSessions => KeyboardShortcut::new(ctrl_shift, Key::S),
             Action::FontSizeUp => KeyboardShortcut::new(ctrl, Key::Equals),
             Action::FontSizeDown => KeyboardShortcut::new(ctrl, Key::Minus),
             Action::FontSizeReset => KeyboardShortcut::new(ctrl, Key::Num0),
