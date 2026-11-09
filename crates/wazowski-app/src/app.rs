@@ -1240,6 +1240,9 @@ pub struct App {
     sel_anchor: Option<String>,
     sel_folders: HashSet<String>,
     sel_folder_anchor: Option<String>,
+    /// Set when keyboard navigation moves the cursor, so the newly selected row
+    /// scrolls into view on the next render (then cleared).
+    scroll_to_selected: bool,
     /// Set when a sidebar section is opened, so its filter box grabs focus on the
     /// next frame (the cursor lands in the filter, not the active terminal tab).
     focus_filter: bool,
@@ -1633,6 +1636,7 @@ impl App {
             sel_anchor: None,
             sel_folders: HashSet::new(),
             sel_folder_anchor: None,
+            scroll_to_selected: false,
             focus_filter: false,
             filter_sessions: String::new(),
             filter_macros: String::new(),
@@ -4481,6 +4485,10 @@ impl App {
     }
 
     fn session_tree(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Handle arrow/Enter navigation before rendering, so the selection and
+        // collapse changes show this frame and the keys don't reach row widgets.
+        self.handle_tree_keys(ctx);
+        let scroll = std::mem::take(&mut self.scroll_to_selected);
         let mut action: Option<TreeAction> = None;
         let filter = self.filter_sessions.to_lowercase();
 
@@ -4506,7 +4514,7 @@ impl App {
         let local_fsel = local_is_sel.then_some(&self.sel_folders);
         render_store(
             ui, &StoreId::Local, &self.sessions, true, &destinations, &mut action, &filter,
-            local_sel, local_fsel,
+            local_sel, local_fsel, scroll,
         );
 
         // Each shared source as its own collapsible section.
@@ -4537,7 +4545,7 @@ impl App {
                 }
                 render_store(
                     ui, &store, source.store(), editable, &destinations, &mut action, &filter,
-                    share_sel, share_fsel,
+                    share_sel, share_fsel, scroll,
                 );
             });
             let desc = source.description().to_owned();
@@ -5115,6 +5123,189 @@ impl App {
         }
         walk("", &root, &mut out);
         out
+    }
+
+    /// The flattened list of keyboard-navigable items in `store`, in render order
+    /// (sessions first, then subfolders; a collapsed folder hides its descendants),
+    /// honouring the active filter. The order Up/Down arrows walk.
+    fn nav_items(&self, ctx: &egui::Context, store: &StoreId) -> Vec<NavItem> {
+        let Some(data) = self.store_ref(store) else { return Vec::new() };
+        let filter = self.filter_sessions.to_lowercase();
+        let mut root = FolderNode::default();
+        for folder in data.folders() {
+            root.at(&folder);
+        }
+        for session in data.all() {
+            if !filter.is_empty() && !session.name.to_lowercase().contains(&filter) {
+                continue;
+            }
+            root.at(&session.folder).sessions.push(session);
+        }
+        root.sort_sessions();
+
+        let mut out = Vec::new();
+        for s in &root.sessions {
+            out.push(NavItem::Session(s.id.clone()));
+        }
+        self.nav_walk(ctx, store, "", &root, &filter, &mut out);
+        out
+    }
+
+    fn nav_walk(
+        &self,
+        ctx: &egui::Context,
+        store: &StoreId,
+        prefix: &str,
+        node: &FolderNode,
+        filter: &str,
+        out: &mut Vec<NavItem>,
+    ) {
+        for (segment, child) in node.sorted_children() {
+            if !filter.is_empty() && !child.has_sessions() {
+                continue;
+            }
+            let full =
+                if prefix.is_empty() { segment.clone() } else { format!("{prefix}/{segment}") };
+            out.push(NavItem::Folder(full.clone()));
+            let has_content = !child.sessions.is_empty() || !child.children.is_empty();
+            // Filtering forces folders open; otherwise honour the stored state.
+            let open =
+                has_content && (!filter.is_empty() || self.folder_is_open(ctx, store, &full));
+            if open {
+                for s in &child.sessions {
+                    out.push(NavItem::Session(s.id.clone()));
+                }
+                self.nav_walk(ctx, store, &full, child, filter, out);
+            }
+        }
+    }
+
+    /// The first store with any navigable items — Local, then shared sources in
+    /// order; Local if none has any. The starting point for arrow nav.
+    fn first_nav_store(&self, ctx: &egui::Context) -> StoreId {
+        if !self.nav_items(ctx, &StoreId::Local).is_empty() {
+            return StoreId::Local;
+        }
+        self.shared
+            .iter()
+            .map(|s| StoreId::Shared(s.id().to_owned()))
+            .find(|st| !self.nav_items(ctx, st).is_empty())
+            .unwrap_or(StoreId::Local)
+    }
+
+    /// Whether a folder is currently expanded (reads egui's stored collapse state).
+    fn folder_is_open(&self, ctx: &egui::Context, store: &StoreId, full: &str) -> bool {
+        use egui::containers::collapsing_header::CollapsingState;
+        let id = egui::Id::unique((store_salt(store), "folder", full));
+        CollapsingState::load(ctx, id).map(|s| s.is_open()).unwrap_or(false)
+    }
+
+    /// Expands or collapses a folder (writes egui's stored collapse state).
+    fn set_folder_open(&self, ctx: &egui::Context, store: &StoreId, full: &str, open: bool) {
+        use egui::containers::collapsing_header::CollapsingState;
+        let id = egui::Id::unique((store_salt(store), "folder", full));
+        let mut state = CollapsingState::load_with_default_open(ctx, id, false);
+        state.set_open(open);
+        state.store(ctx);
+    }
+
+    /// The index of the current single-selection cursor within `items`, if any.
+    fn cursor_index(&self, store: &StoreId, items: &[NavItem]) -> Option<usize> {
+        if self.sel_store.as_ref() != Some(store) {
+            return None;
+        }
+        if self.sel_folders.len() == 1 {
+            let path = self.sel_folders.iter().next().unwrap();
+            return items.iter().position(|it| matches!(it, NavItem::Folder(f) if f == path));
+        }
+        if self.sel_ids.len() == 1 {
+            let id = self.sel_ids.iter().next().unwrap();
+            return items.iter().position(|it| matches!(it, NavItem::Session(s) if s == id));
+        }
+        None
+    }
+
+    /// Moves the keyboard cursor to a single item (replacing any selection) and
+    /// asks for it to be scrolled into view.
+    fn set_cursor(&mut self, store: &StoreId, item: &NavItem) {
+        self.clear_selection();
+        self.sel_store = Some(store.clone());
+        match item {
+            NavItem::Session(id) => {
+                self.sel_ids.insert(id.clone());
+                self.sel_anchor = Some(id.clone());
+            }
+            NavItem::Folder(path) => {
+                self.sel_folders.insert(path.clone());
+                self.sel_folder_anchor = Some(path.clone());
+            }
+        }
+        self.scroll_to_selected = true;
+    }
+
+    /// Handles arrow/Enter keys for the sessions tree: Up/Down move the cursor,
+    /// Right/Left expand/collapse a folder, Enter connects a session or toggles a
+    /// folder. A no-op while a text field (the filter box) has focus. Called before
+    /// the tree renders, and consumes the keys so row widgets don't also react.
+    fn handle_tree_keys(&mut self, ctx: &egui::Context) {
+        if self.sidebar_view != SidebarView::Sessions
+            || !matches!(self.dialog, Dialog::None)
+            || ctx.text_edit_focused()
+        {
+            return;
+        }
+        let (down, up, right, left, enter) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            )
+        });
+        if !(down || up || right || left || enter) {
+            return;
+        }
+        // Navigate within the store that holds the selection; with none, start in
+        // the first store that has any items (Local, then shared sources in order).
+        let store = self.sel_store.clone().unwrap_or_else(|| self.first_nav_store(ctx));
+        let items = self.nav_items(ctx, &store);
+        if items.is_empty() {
+            return;
+        }
+        let cursor = self.cursor_index(&store, &items);
+        if down {
+            let next = cursor.map(|i| (i + 1).min(items.len() - 1)).unwrap_or(0);
+            let item = items[next].clone();
+            self.set_cursor(&store, &item);
+        } else if up {
+            let prev = cursor.map(|i| i.saturating_sub(1)).unwrap_or(items.len() - 1);
+            let item = items[prev].clone();
+            self.set_cursor(&store, &item);
+        } else if let Some(i) = cursor {
+            match &items[i] {
+                NavItem::Folder(path) => {
+                    let path = path.clone();
+                    if right {
+                        self.set_folder_open(ctx, &store, &path, true);
+                    } else if left {
+                        self.set_folder_open(ctx, &store, &path, false);
+                    } else if enter {
+                        let open = self.folder_is_open(ctx, &store, &path);
+                        self.set_folder_open(ctx, &store, &path, !open);
+                    }
+                    self.scroll_to_selected = true;
+                }
+                NavItem::Session(id) => {
+                    if enter
+                        && let Some(session) = self.session_in(&store, id)
+                    {
+                        self.connect_session(&session, ctx);
+                    }
+                }
+            }
+        }
+        ctx.request_repaint();
     }
 
     /// Exports the given sessions to a JSON file the user picks.
@@ -11059,6 +11250,13 @@ fn initial_vault_state(path: &std::path::Path) -> VaultState {
 }
 
 /// An action chosen from the session tree, applied after rendering.
+/// An item the sessions-tree keyboard cursor can land on.
+#[derive(Clone)]
+enum NavItem {
+    Session(String),
+    Folder(String),
+}
+
 #[derive(Clone)]
 enum TreeAction {
     Connect(StoreId, String),
@@ -11173,6 +11371,7 @@ fn render_store(
     filter: &str,
     sel: Option<&HashSet<String>>,
     folder_sel: Option<&HashSet<String>>,
+    scroll_to: bool,
 ) {
     // Build a nested tree; folder paths synthesize their ancestor nodes. When a
     // filter is active, only sessions whose name matches are included (and empty
@@ -11193,7 +11392,7 @@ fn render_store(
 
     // Root-level sessions, then each top-level folder recursively.
     for &session in &root.sessions {
-        session_row(ui, store, session, destinations, editable, action, sel);
+        session_row(ui, store, session, destinations, editable, action, sel, scroll_to);
     }
     for (segment, node) in root.sorted_children() {
         if !filter.is_empty() && !node.has_sessions() {
@@ -11201,7 +11400,7 @@ fn render_store(
         }
         render_folder(
             ui, store, sessions, segment, segment, node, destinations, editable, action, filter,
-            sel, folder_sel,
+            sel, folder_sel, scroll_to,
         );
     }
 }
@@ -11222,6 +11421,7 @@ fn render_folder<'a>(
     filter: &str,
     sel: Option<&HashSet<String>>,
     folder_sel: Option<&HashSet<String>>,
+    scroll_to: bool,
 ) {
     use egui::containers::collapsing_header::CollapsingState;
 
@@ -11291,7 +11491,7 @@ fn render_folder<'a>(
             })
             .body(|ui| {
                 for &session in &node.sessions {
-                    session_row(ui, store, session, destinations, editable, action, sel);
+                    session_row(ui, store, session, destinations, editable, action, sel, scroll_to);
                 }
                 for (child_segment, child) in node.sorted_children() {
                     if !filter.is_empty() && !child.has_sessions() {
@@ -11300,7 +11500,7 @@ fn render_folder<'a>(
                     let child_full = format!("{full}/{child_segment}");
                     render_folder(
                         ui, store, data, child_segment, &child_full, child, destinations,
-                        editable, action, filter, sel, folder_sel,
+                        editable, action, filter, sel, folder_sel, scroll_to,
                     );
                 }
             });
@@ -11319,6 +11519,10 @@ fn render_folder<'a>(
         // widget), not the whole row, so a right-click on the name opens it.
         (header_inner.response, header_inner.inner)
     };
+    // Scroll the keyboard-selected folder into view after arrow navigation.
+    if selected && scroll_to {
+        header_row.scroll_to_me(Some(egui::Align::Center));
+    }
     // Single-click (with modifiers) changes the folder selection; double-click
     // still toggles expand (handled above).
     if header_label.clicked() {
@@ -11592,6 +11796,7 @@ fn session_row(
     editable: bool,
     action: &mut Option<TreeAction>,
     sel: Option<&HashSet<String>>,
+    scroll_to: bool,
 ) {
     let (id, name) = (session.id.as_str(), session.name.as_str());
     let selected = sel.is_some_and(|s| s.contains(id));
@@ -11642,6 +11847,10 @@ fn session_row(
             .inner
         })
         .inner;
+    // Scroll the keyboard-selected row into view after arrow navigation.
+    if selected && scroll_to {
+        resp.scroll_to_me(Some(egui::Align::Center));
+    }
     // Compute the tooltip text only when it's actually about to show (hovered,
     // past the delay) — not for every row every frame.
     delayed_tooltip_lazy(ui, &resp, || session_hint(session));
