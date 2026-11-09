@@ -93,9 +93,15 @@ jobs:
       - name: Build RPM
         run: |
           cargo install cargo-generate-rpm --locked
+          # RPM versions can't contain '-' (it separates version from release), so a
+          # SemVer pre-release like 2.6.0-beta.2 uses '~' in the RPM version — which
+          # also sorts *before* the final 2.6.0, exactly as a pre-release should.
+          rpmver="${GITHUB_REF_NAME#v}"
+          tilde='~'  # a variable so bash doesn't tilde-expand the replacement
+          rpmver="${rpmver//-/$tilde}"
           # Run from the workspace root so the asset source paths resolve;
           # disable auto-req (host is Ubuntu, target is Fedora — sonames differ).
-          cargo generate-rpm -p crates/wazowski-app --auto-req disabled
+          cargo generate-rpm -p crates/wazowski-app --auto-req disabled -s "version = \"$rpmver\""
           mkdir -p dist
           rpm=$(ls target/generate-rpm/*.rpm | head -1)
           cp "$rpm" "dist/wazowski-${GITHUB_REF_NAME}-linux-x86_64.rpm"

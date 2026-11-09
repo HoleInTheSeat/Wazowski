@@ -36,7 +36,10 @@ cp target/release/wazowski "dist/wazowski-${tag}-linux-x86_64"
 echo "-- RPM"
 # --auto-req disabled: the host is Fedora but we declare deps explicitly in the
 # crate's [package.metadata.generate-rpm] (soname auto-detection is unreliable).
-cargo generate-rpm -p crates/wazowski-app --auto-req disabled
+# RPM versions can't contain '-', so a pre-release (2.6.0-beta.2) uses '~'.
+tilde='~'  # a variable so bash doesn't tilde-expand the replacement
+rpmver="${ver//-/$tilde}"
+cargo generate-rpm -p crates/wazowski-app --auto-req disabled -s "version = \"$rpmver\""
 cp "$(ls -t target/generate-rpm/*.rpm | head -1)" "dist/wazowski-${tag}-linux-x86_64.rpm"
 
 echo "-- AppImage"
