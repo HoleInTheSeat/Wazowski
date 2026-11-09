@@ -1540,8 +1540,9 @@ impl App {
             });
         }
         install_fonts(ctx);
-        let sessions_path = SessionStore::default_path().unwrap_or_else(|_| "sessions.toml".into());
-        let sessions = SessionStore::load(sessions_path).unwrap_or_default();
+        let tree_dir = SessionStore::default_tree_dir().unwrap_or_else(|_| "sessions".into());
+        let legacy = SessionStore::default_path().unwrap_or_else(|_| "sessions.toml".into());
+        let sessions = SessionStore::open_local(tree_dir, legacy);
         let vault_path = Vault::default_path().unwrap_or_else(|_| "vault.enc".into());
         let vault = initial_vault_state(&vault_path);
 
@@ -3814,9 +3815,10 @@ impl App {
     /// Reloads every on-disk config into the running app (after a settings
     /// import). Running quick-servers keep their handles so they aren't orphaned.
     fn reload_all_config(&mut self) {
-        self.sessions = SessionStore::default_path()
-            .and_then(SessionStore::load)
-            .unwrap_or_default();
+        self.sessions = SessionStore::open_local(
+            SessionStore::default_tree_dir().unwrap_or_else(|_| "sessions".into()),
+            SessionStore::default_path().unwrap_or_else(|_| "sessions.toml".into()),
+        );
         self.settings = Settings::load_or_default();
         self.highlights = HighlightStore::load_or_default();
         self.keymap = Keymap::default_path().and_then(Keymap::load).unwrap_or_else(|_| Keymap::defaults());

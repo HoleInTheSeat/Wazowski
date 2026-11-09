@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use wazowski_core::SessionStore;
 
 /// The config files included in a backup, relative to the config dir. These are
 /// also the only names accepted on import (so a crafted bundle can't write
@@ -62,6 +63,10 @@ pub fn export_to(dest: &Path) -> Result<()> {
     let dir = config_dir()?;
     let mut files = BTreeMap::new();
     for name in CONFIG_FILES {
+        // Local sessions are handled below (they live in the exploded tree now).
+        if *name == "sessions.toml" {
+            continue;
+        }
         let path = dir.join(name);
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -74,6 +79,24 @@ pub fn export_to(dest: &Path) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+    // Local sessions: serialized from the exploded tree (the on-disk form) if
+    // present, else the legacy single file. Stored under the stable "sessions.toml"
+    // name so the bundle format is unchanged and older backups still import.
+    let sessions_toml = SessionStore::default_tree_dir()
+        .ok()
+        .filter(|d| wazowski_core::tree::tree_present(d))
+        .and_then(|d| SessionStore::load_tree(d).to_toml_string().ok());
+    if let Some(toml) = sessions_toml {
+        files.insert(
+            "sessions.toml".to_owned(),
+            base64::engine::general_purpose::STANDARD.encode(toml.as_bytes()),
+        );
+    } else if let Ok(bytes) = std::fs::read(dir.join("sessions.toml")) {
+        files.insert(
+            "sessions.toml".to_owned(),
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        );
     }
     let bundle = Bundle {
         kind: BUNDLE_KIND.to_owned(),
@@ -111,6 +134,13 @@ pub fn import_from(src: &Path) -> Result<Vec<String>> {
         let path = dir.join(name);
         std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
         restored.push(name.clone());
+    }
+    // If the (single-file) sessions were restored, drop any existing exploded tree
+    // so the imported sessions take effect — they re-migrate to the tree on load.
+    if restored.iter().any(|n| n == "sessions.toml")
+        && let Ok(tree_dir) = SessionStore::default_tree_dir()
+    {
+        let _ = std::fs::remove_dir_all(&tree_dir);
     }
     Ok(restored)
 }

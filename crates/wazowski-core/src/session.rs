@@ -297,6 +297,10 @@ pub struct SessionStore {
     /// Per-folder identity + description, keyed by folder path. Kept separate from
     /// `folder_styles` so the existing single-file format is unchanged.
     folder_meta: BTreeMap<String, FolderMeta>,
+    /// When true, `path` is an exploded-tree *directory* and `save` writes the tree
+    /// (`tree::sync_tree`); when false, `path` is a single TOML file. An empty
+    /// `path` means detached (assembled; persistence driven externally).
+    tree: bool,
 }
 
 /// The serialized file shape: `[[session]]` tables plus a `folders` list.
@@ -349,6 +353,7 @@ impl SessionStore {
             name: file.name,
             id: file.id,
             folder_meta: file.folder_meta,
+            tree: false,
         };
         // Migrate any legacy auth (agent / password / key) to the current model,
         // and drop any inline username an older file still carries — this app
@@ -602,22 +607,59 @@ impl SessionStore {
     }
 
     fn save(&self) -> Result<()> {
-        // A tree-backed (assembled) store has no single-file path; its persistence
-        // is driven externally via `tree::sync_tree`, so in-memory mutations here
-        // must not try to write a lone TOML file.
+        // An empty path means detached (an assembled shared-cache store); its
+        // persistence is driven externally via `tree::sync_tree`, so in-memory
+        // mutations here must not write anything.
         if self.path.as_os_str().is_empty() {
             return Ok(());
+        }
+        if self.tree {
+            // Tree-backed (e.g. the local store): write the exploded tree.
+            return tree::sync_tree(self, &self.path);
         }
         self.save_as(&self.path)
     }
 
-    /// Writes the store to an arbitrary path (used to mirror a shared store to
-    /// both its cache and the shared file).
-    pub fn save_as(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("could not create {}", parent.display()))?;
+    /// Opens a tree-backed store from a directory (empty if the directory has no
+    /// tree yet). Mutations persist as the exploded tree under `dir`.
+    pub fn load_tree(dir: PathBuf) -> Self {
+        let mut store =
+            if tree::tree_present(&dir) { tree::assemble(&dir).unwrap_or_default() } else {
+                Self::default()
+            };
+        store.path = dir;
+        store.tree = true;
+        store
+    }
+
+    /// Opens the local store as a tree, migrating a legacy single `sessions.toml`
+    /// into the tree on first run (keeping the old file as a `.toml.bak` safety
+    /// net). Usernames are dropped in the process (as everywhere).
+    pub fn open_local(tree_dir: PathBuf, legacy_file: PathBuf) -> Self {
+        if tree::tree_present(&tree_dir) {
+            return Self::load_tree(tree_dir);
         }
+        // No tree yet: migrate the legacy single file (if any) into one.
+        let mut store = Self::load(legacy_file.clone()).unwrap_or_default();
+        store.path = tree_dir;
+        store.tree = true;
+        store.ensure_ids();
+        let _ = store.save();
+        if legacy_file.exists() {
+            let _ = fs::rename(&legacy_file, legacy_file.with_extension("toml.bak"));
+        }
+        store
+    }
+
+    /// The default local tree directory (`…/config/wazowski/sessions/`).
+    pub fn default_tree_dir() -> Result<PathBuf> {
+        let dirs = directories::ProjectDirs::from("org", "wazowski", "wazowski")
+            .context("could not determine a config directory")?;
+        Ok(dirs.config_dir().join("sessions"))
+    }
+
+    /// The store serialized to the single-file TOML form (used for backups).
+    pub fn to_toml_string(&self) -> Result<String> {
         let file = StoreFile {
             description: self.description.clone(),
             icon: self.icon.clone(),
@@ -629,7 +671,17 @@ impl SessionStore {
             folder_styles: self.folder_styles.clone(),
             folder_meta: self.folder_meta.clone(),
         };
-        let text = toml::to_string_pretty(&file).context("could not serialize sessions")?;
+        toml::to_string_pretty(&file).context("could not serialize sessions")
+    }
+
+    /// Writes the store to an arbitrary path (used to mirror a shared store to
+    /// both its cache and the shared file).
+    pub fn save_as(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        let text = self.to_toml_string()?;
         write_atomic(path, text.as_bytes())
             .with_context(|| format!("could not write {}", path.display()))
     }
@@ -757,6 +809,45 @@ secret = "deploy-key"
         // The file was rewritten without the username line.
         let raw = fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("username"), "username line removed from file: {raw}");
+    }
+
+    #[test]
+    fn open_local_migrates_legacy_file_to_tree() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("sessions.toml");
+        let tree_dir = dir.path().join("sessions");
+        fs::write(
+            &legacy,
+            "[[session]]\nid = \"aaaaaaaaaaaaaaaa\"\nname = \"Box\"\nhost = \"h\"\nusername = \"bob\"\n",
+        )
+        .unwrap();
+
+        let store = SessionStore::open_local(tree_dir.clone(), legacy.clone());
+        assert_eq!(store.all().len(), 1);
+        assert_eq!(store.get("aaaaaaaaaaaaaaaa").unwrap().username, "", "username dropped");
+        assert!(tree_dir.join(".folder").exists(), "tree written to disk");
+        assert!(!legacy.exists(), "legacy file renamed away");
+        assert!(legacy.with_extension("toml.bak").exists(), "legacy kept as .bak");
+
+        // Reopening uses the tree (no re-migration), preserving the session.
+        let again = SessionStore::open_local(tree_dir, legacy);
+        assert_eq!(again.all().len(), 1);
+        assert_eq!(again.get("aaaaaaaaaaaaaaaa").unwrap().name, "Box");
+    }
+
+    #[test]
+    fn tree_backed_store_persists_mutations() {
+        let dir = tempdir().unwrap();
+        let tree_dir = dir.path().join("s");
+        let mut store = SessionStore::load_tree(tree_dir.clone());
+        store.upsert(Session::new("web", "example.com", "root")).unwrap();
+        store.add_folder("Prod").unwrap();
+
+        let reopened = SessionStore::load_tree(tree_dir);
+        assert_eq!(reopened.all().len(), 1);
+        assert_eq!(reopened.all()[0].name, "web");
+        assert_eq!(reopened.all()[0].username, "", "username never persisted");
+        assert!(reopened.folders().contains(&"Prod".to_owned()));
     }
 
     #[test]

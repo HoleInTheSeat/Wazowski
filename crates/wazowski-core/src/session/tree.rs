@@ -352,6 +352,7 @@ pub fn assemble(root: &Path) -> Result<SessionStore> {
         name: root_doc.name,
         id: root_doc.id,
         folder_meta: acc.folder_meta,
+        tree: false,
     })
 }
 
