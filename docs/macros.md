@@ -24,10 +24,20 @@ menu to choose a target:
 - **Run on this tab's panes** — every pane in the current tab.
 - **Run on all terminals** — every open terminal.
 
-Running always shows a **confirmation** first, listing the steps and where they'll
-go, so a macro can't fire somewhere unexpected.
+Running from the menu always shows a **confirmation** first, listing the steps and
+where they'll go, so a macro can't fire somewhere unexpected.
 
-`Ctrl+Shift+M` jumps to the Macros view to run one.
+Jump to the Macros pane with `Ctrl+Shift+3` (rebindable in
+[Settings → Keybindings](keybindings.md)).
+
+## Macro shortcuts
+
+A macro can have its own keyboard shortcut, set in the macro editor (**Keyboard
+shortcut → click, then press the keys**; **Clear** to unbind). The shortcut runs
+the macro on the **active terminal**, without a confirmation, and only fires while
+a terminal tab has keyboard focus — so it never clashes with typing in the
+sidebar, a filter box, or a dialog. Pick a combination that doesn't collide with a
+built-in shortcut (those win).
 
 ## Tips
 

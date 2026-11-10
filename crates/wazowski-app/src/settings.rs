@@ -104,6 +104,11 @@ pub struct Settings {
     /// Scheme used by the session "Open web GUI" action.
     #[serde(default)]
     pub web_scheme: WebScheme,
+    /// When on, a terminal tab's right-click menu offers "Paste password…",
+    /// which asks for the master password and types a chosen vault password into
+    /// the session. Off by default.
+    #[serde(default)]
+    pub paste_password_enabled: bool,
     /// Saved URLs for the JSON/jq puller (most-recent first).
     #[serde(default)]
     pub json_urls: Vec<String>,
@@ -146,6 +151,7 @@ impl Default for Settings {
             terminal_font_size: default_font_size(),
             ui_scale: default_ui_scale(),
             web_scheme: WebScheme::default(),
+            paste_password_enabled: false,
             json_urls: Vec::new(),
             jq_filters: Vec::new(),
             api_urls: Vec::new(),

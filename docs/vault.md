@@ -68,6 +68,16 @@ Every session (and shared source) chooses between two auth modes:
 Because sessions reference entries by **id**, you can rename an entry freely and
 every session stays linked.
 
+## Paste a password into a session
+
+Off by default, this can be turned on in **Settings → Vault → Paste password**.
+Once enabled, a connected terminal tab's right-click menu gains **Paste
+password…**. It asks for the **master password**, then lets you pick a password
+entry and types its value into the session's focused pane (with no trailing
+Enter, so you can review before submitting). The master password is required
+every time — unless you tick **Remember for this session**, which skips the
+prompt for subsequent pastes until Wazowski is closed.
+
 ## Tokens in the API tools
 
 The **API Tool** and **JSON / jq Puller** can authenticate from a vault token.

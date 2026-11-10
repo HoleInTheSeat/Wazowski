@@ -26,7 +26,7 @@ use crate::connect::{Connected, PendingConnect, Progress};
 use crate::git::GitAuth;
 use crate::highlights::{HighlightStore, HighlightRule};
 use crate::icons;
-use crate::keybinds::{Action, Keymap};
+use crate::keybinds::{Action, Keymap, format_shortcut, parse_shortcut};
 use crate::macros::{Macro, MacroStore, Step, chord_to_bytes};
 use crate::network::{self, HostHit, LocalPort, PortHit, ScanHandle};
 use crate::panes::{Home, PaneAction, Panes, SplitDir, SwapTarget};
@@ -226,6 +226,7 @@ enum TabAct {
     CloseOthers(usize),
     SaveOutput(usize),
     PrintOutput(usize),
+    PastePassword(usize),
 }
 
 /// An Extras-settings action, applied after the settings page is drawn.
@@ -276,6 +277,7 @@ fn settings_category_terms(cat: SettingsCategory) -> &'static [&'static str] {
             "backup folder",
             "import",
             "delete",
+            "paste password",
         ],
         SettingsCategory::Terminal => {
             &["font size", "highlights", "highlight", "regex", "colors", "color rules", "patterns"]
@@ -713,6 +715,29 @@ enum Dialog {
     },
     /// Apply one auth choice (and optional username) to several selected sessions.
     BulkCredentials(Box<BulkCredsForm>),
+    /// Type a vault password into a terminal tab: first confirm the master
+    /// password, then pick the entry.
+    PastePassword(Box<PastePasswordState>),
+}
+
+/// State for the "Paste password" dialog (tab right-click menu).
+struct PastePasswordState {
+    /// The terminal tab to type into (by stable id).
+    tab_id: u64,
+    phase: PastePhase,
+    /// Filter text for the entry picker.
+    filter: String,
+    /// "Remember for this session" — when the master password checks out, don't
+    /// ask again for the rest of the session.
+    remember: bool,
+}
+
+/// The two steps of the "Paste password" dialog.
+enum PastePhase {
+    /// Confirm the master password before anything is revealed.
+    Unlock { password: String, error: Option<String> },
+    /// Master password confirmed; pick which password to type.
+    Pick { vault: Box<Vault>, error: Option<String> },
 }
 
 /// Fields for the bulk "Set credentials" dialog.
@@ -737,6 +762,10 @@ struct MacroForm {
     steps: Vec<Step>,
     icon: String,
     color: Option<[u8; 3]>,
+    /// Optional keyboard shortcut string (e.g. `Ctrl+Shift+P`); `None` = unbound.
+    shortcut: Option<String>,
+    /// True while the editor is waiting for a key press to set the shortcut.
+    capturing_shortcut: bool,
     error: Option<String>,
 }
 
@@ -1259,7 +1288,7 @@ pub struct App {
     scroll_to_selected: bool,
     /// Whether the sessions tree owns the keyboard (arrow nav active). Cleared when
     /// a session is launched or a terminal is clicked; set by clicking a row or the
-    /// "Focus the sessions pane" shortcut.
+    /// "Sessions pane" shortcut.
     tree_focus: bool,
     /// One-shot: hand keyboard focus to the active pane on the next render (e.g.
     /// after launching a session from the keyboard).
@@ -1274,6 +1303,11 @@ pub struct App {
     filter_tools: String,
     filter_vault: String,
     filter_settings: String,
+    /// Filter text for the Settings ▸ Keybindings list.
+    filter_keybinds: String,
+    /// Master password remembered for "Paste password" this session (when the
+    /// user ticked "Remember for this session"). Not persisted; cleared on quit.
+    paste_pw_master: Option<String>,
 }
 
 /// Natural (numeric-aware) comparison of two serial device names, so `ttyUSB2`
@@ -1668,6 +1702,8 @@ impl App {
             filter_tools: String::new(),
             filter_vault: String::new(),
             filter_settings: String::new(),
+            filter_keybinds: String::new(),
+            paste_pw_master: None,
         };
         app.migrate_servers_one_per_kind();
         apply_visuals(ctx, app.dark_mode);
@@ -2040,7 +2076,7 @@ impl App {
     fn connect_session(&mut self, session: &Session, ctx: &egui::Context) {
         // Launching a session hands the keyboard to it (like clicking into its tab):
         // tree arrow-nav pauses and the opened terminal grabs focus once it renders.
-        // Ctrl+Shift+S (Focus the sessions pane) brings focus back to the tree.
+        // The "Sessions pane" shortcut (Ctrl+Shift+1) brings focus back to the tree.
         self.tree_focus = false;
         self.focus_active_pane = true;
         // Prompt-everytime (or a vault session with no entry chosen) asks for
@@ -2743,8 +2779,7 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let triggered = |action: Action, ctx: &egui::Context, map: &Keymap| {
-            let sc = map.get(action);
-            ctx.input_mut(|i| i.consume_shortcut(&sc))
+            consume_shortcut_physical(ctx, &map.get(action))
         };
         if triggered(Action::NewShell, ctx, &self.keymap) {
             self.open_local_shell(ctx);
@@ -2786,19 +2821,25 @@ impl App {
             self.adjust_baud(-1);
         }
         if triggered(Action::ViewSessions, ctx, &self.keymap) {
-            self.sidebar_view = SidebarView::Sessions;
-        }
-        if triggered(Action::ViewMacros, ctx, &self.keymap) {
-            self.sidebar_view = SidebarView::Macros;
+            self.switch_pane(SidebarView::Sessions, ctx);
         }
         if triggered(Action::ViewFiles, ctx, &self.keymap) {
-            self.sidebar_view = SidebarView::Files;
+            self.switch_pane(SidebarView::Files, ctx);
         }
-        if triggered(Action::FocusSessions, ctx, &self.keymap) {
-            // Bring keyboard focus back to the sessions tree for arrow nav.
-            self.sidebar_view = SidebarView::Sessions;
-            self.sidebar_collapsed = false;
-            self.focus_tree(ctx);
+        if triggered(Action::ViewMacros, ctx, &self.keymap) {
+            self.switch_pane(SidebarView::Macros, ctx);
+        }
+        if triggered(Action::ViewTools, ctx, &self.keymap) {
+            self.switch_pane(SidebarView::Tools, ctx);
+        }
+        if triggered(Action::ViewVault, ctx, &self.keymap) {
+            self.switch_pane(SidebarView::Vault, ctx);
+        }
+        if triggered(Action::ViewSettings, ctx, &self.keymap) {
+            self.switch_pane(SidebarView::Settings, ctx);
+        }
+        if triggered(Action::SaveTab, ctx, &self.keymap) {
+            self.save_active_tab();
         }
         // F11 toggles window fullscreen (read the current state and flip it).
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F11)) {
@@ -2814,15 +2855,79 @@ impl App {
         if triggered(Action::FontSizeReset, ctx, &self.keymap) {
             self.set_active_font_size(self.settings.terminal_font_size);
         }
-        // Action::RunMacro is handled (and consumed) by the macros feature.
-        self.macro_shortcut(ctx);
+        // Macro shortcuts fire only while a terminal tab owns the keyboard.
+        self.handle_macro_keybinds(ctx);
     }
 
-    /// Switches the left pane to the Macros view when the Run-macro shortcut fires.
-    fn macro_shortcut(&mut self, ctx: &egui::Context) {
-        let sc = self.keymap.get(Action::RunMacro);
-        if ctx.input_mut(|i| i.consume_shortcut(&sc)) {
-            self.sidebar_view = SidebarView::Macros;
+    /// Switches the left pane to `view` and focuses its input: the sessions tree
+    /// (for arrow-key navigation) for Sessions, or the pane's filter box for the
+    /// others. Expands the pane if it was collapsed.
+    fn switch_pane(&mut self, view: SidebarView, ctx: &egui::Context) {
+        self.sidebar_view = view;
+        self.sidebar_collapsed = false;
+        if view == SidebarView::Sessions {
+            self.focus_tree(ctx);
+            self.ensure_tree_cursor(ctx);
+        } else {
+            self.focus_filter = true;
+        }
+    }
+
+    /// Saves the active tab: a terminal's scrollback output, or an RDP/VNC tab's
+    /// current frame as a screenshot. Both prompt for a destination. A no-op for
+    /// any other tab (or none).
+    fn save_active_tab(&mut self) {
+        match self.tabs.get(self.active).map(|t| &t.content) {
+            Some(TabContent::Terminal(_)) => self.save_tab_output(self.active),
+            Some(TabContent::Remote(_)) => self.remote_screenshot(),
+            _ => {}
+        }
+    }
+
+    /// Ensures the sessions tree shows a keyboard cursor when nothing is selected,
+    /// so focusing the pane highlights where arrow-key navigation will start.
+    /// Leaves any existing (possibly multi-item) selection alone.
+    fn ensure_tree_cursor(&mut self, ctx: &egui::Context) {
+        // Keep an existing selection but scroll it into view (visible feedback);
+        // otherwise select the first item so focusing the pane always shows where
+        // arrow navigation will start.
+        if self.sel_store.is_some() && (!self.sel_ids.is_empty() || !self.sel_folders.is_empty()) {
+            self.scroll_to_selected = true;
+            return;
+        }
+        let store = self.first_nav_store(ctx);
+        if let Some(first) = self.nav_items(ctx, &store).first().cloned() {
+            self.set_cursor(&store, &first);
+        }
+    }
+
+    /// Runs a macro whose shortcut is pressed — but only while keyboard focus is
+    /// in a terminal tab (no dialog open, not typing in a filter/field, and the
+    /// sessions tree doesn't hold focus), so a macro bind never clashes with
+    /// typing elsewhere in the app.
+    fn handle_macro_keybinds(&mut self, ctx: &egui::Context) {
+        if !matches!(self.dialog, Dialog::None) {
+            return;
+        }
+        let in_terminal = !self.tree_focus
+            && !ctx.text_edit_focused()
+            && matches!(
+                self.tabs.get(self.active).map(|t| &t.content),
+                Some(TabContent::Terminal(_))
+            );
+        if !in_terminal {
+            return;
+        }
+        let mut fire: Option<usize> = None;
+        for (i, m) in self.macros.macros.iter().enumerate() {
+            let Some(sc) = m.shortcut.as_deref().and_then(parse_shortcut) else { continue };
+            if consume_shortcut_physical(ctx, &sc) {
+                fire = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = fire {
+            self.start_macro(i, MacroTarget::ActivePane);
         }
     }
 
@@ -3312,6 +3417,25 @@ impl App {
 
     fn settings_vault(&mut self, ui: &mut egui::Ui, changed: &mut bool, backup_now: &mut bool) {
         let vault_exists = Vault::exists(&self.vault_path);
+
+        ui.label(RichText::new("Paste password").strong());
+        if ui
+            .checkbox(
+                &mut self.settings.paste_password_enabled,
+                "Enable \"Paste password\" in a tab's right-click menu",
+            )
+            .changed()
+        {
+            *changed = true;
+        }
+        ui.label(
+            RichText::new(
+                "Lets you type a vault password into a connected session from its tab menu. \
+                 Always asks for the master password first.",
+            )
+            .weak(),
+        );
+        ui.add_space(10.0);
 
         // Create/unlock/import/back up/delete live in the Vault left-rail pane.
         // Keep the advanced secrets manager (SSH key generation) here.
@@ -3963,14 +4087,10 @@ impl App {
             ui.vertical(|ui| {
                 const SIZE: f32 = 26.0;
                 let icon = |glyph: &str, color: Color32| RichText::new(glyph).size(SIZE).color(color);
-                for (view, glyph, color, tip) in [
-                    (SidebarView::Sessions, icons::DESKTOP, Color32::from_rgb(90, 170, 255), "Sessions"),
-                    (SidebarView::Macros, icons::SCROLL, Color32::from_rgb(240, 170, 60), "Macros"),
-                    (SidebarView::Files, icons::FOLDER, Color32::from_rgb(120, 200, 120), "Files (SFTP)"),
-                    (SidebarView::Tools, icons::WRENCH, Color32::from_rgb(200, 150, 110), "Tools (servers & network)"),
-                    (SidebarView::Vault, icons::LOCK_KEY, Color32::from_rgb(210, 190, 90), "Vault (credentials)"),
-                    (SidebarView::Settings, icons::GEAR, Color32::from_rgb(170, 170, 180), "Settings"),
-                ] {
+                // Fill the full column height so Settings can pin to the bottom.
+                let full_height = ui.available_height();
+                ui.set_min_height(full_height);
+                let mut rail_button = |ui: &mut egui::Ui, view, glyph, color, tip: &str| {
                     let hint = if prev == view && self.can_collapse_sidebar() {
                         let verb = if collapsed { "show" } else { "hide" };
                         format!("{tip} — click to {verb} the pane")
@@ -3980,7 +4100,30 @@ impl App {
                     if ui.selectable_label(prev == view, icon(glyph, color)).on_hover_text(hint).clicked() {
                         clicked = Some(view);
                     }
+                };
+                // Top group; new buttons are added just after Vault, above the gap.
+                for (view, glyph, color, tip) in [
+                    (SidebarView::Sessions, icons::DESKTOP, Color32::from_rgb(90, 170, 255), "Sessions"),
+                    (SidebarView::Files, icons::FOLDER, Color32::from_rgb(120, 200, 120), "Files (SFTP)"),
+                    (SidebarView::Macros, icons::SCROLL, Color32::from_rgb(240, 170, 60), "Macros"),
+                    (SidebarView::Tools, icons::WRENCH, Color32::from_rgb(200, 150, 110), "Tools (servers & network)"),
+                    (SidebarView::Vault, icons::LOCK_KEY, Color32::from_rgb(210, 190, 90), "Vault (credentials)"),
+                ] {
+                    rail_button(ui, view, glyph, color, tip);
                 }
+                // Settings stays pinned to the bottom of the window.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    // Bottom-up: this space sits below the button, lifting it off
+                    // the window edge.
+                    ui.add_space(10.0);
+                    rail_button(
+                        ui,
+                        SidebarView::Settings,
+                        icons::GEAR,
+                        Color32::from_rgb(170, 170, 180),
+                        "Settings",
+                    );
+                });
             });
             // Hide the content pane when collapsed; the rail stays.
             if !collapsed {
@@ -4563,6 +4706,8 @@ impl App {
                     steps: m.steps.clone(),
                     icon: m.icon.clone(),
                     color: m.color,
+                    shortcut: m.shortcut.clone(),
+                    capturing_shortcut: false,
                     error: None,
                 });
             }
@@ -4583,6 +4728,8 @@ impl App {
                     steps: Vec::new(),
                     icon: String::new(),
                     color: None,
+                    shortcut: None,
+                    capturing_shortcut: false,
                     error: None,
                 });
             }
@@ -5414,8 +5561,8 @@ impl App {
             )
         });
         // Escape leaves the tree: hand focus back to the active terminal (the
-        // counterpart to Ctrl+Shift+S). Only consumed while the tree has focus, so
-        // terminals keep their own Escape.
+        // counterpart to the Sessions-pane shortcut). Only consumed while the tree
+        // has focus, so terminals keep their own Escape.
         if escape {
             if !self.tabs.is_empty() {
                 self.tree_focus = false;
@@ -5751,6 +5898,12 @@ impl App {
             .iter()
             .map(|t| matches!(&t.content, TabContent::Terminal(p) if p.count() > 0))
             .collect();
+        // "Paste password" is offered on terminal tabs when the feature is on and
+        // a vault exists to read from.
+        let paste_pw_enabled =
+            self.settings.paste_password_enabled && Vault::exists(&self.vault_path);
+        let is_terminal: Vec<bool> =
+            self.tabs.iter().map(|t| matches!(t.content, TabContent::Terminal(_))).collect();
         let labels: Vec<String> = self
             .tabs
             .iter()
@@ -5823,6 +5976,19 @@ impl App {
                                             tab_action = Some(TabAct::PrintOutput(i));
                                             ui.close();
                                         }
+                                    }
+                                    if paste_pw_enabled
+                                        && is_terminal[i]
+                                        && ui
+                                            .button("Paste password…")
+                                            .on_hover_text(
+                                                "Type a vault password into this session \
+                                                 (asks for the master password)",
+                                            )
+                                            .clicked()
+                                    {
+                                        tab_action = Some(TabAct::PastePassword(i));
+                                        ui.close();
                                     }
                                     ui.separator();
                                     // Generic actions, in alphanumeric order.
@@ -5949,6 +6115,12 @@ impl App {
             }
             Some(TabAct::SaveOutput(i)) => self.save_tab_output(i),
             Some(TabAct::PrintOutput(i)) => self.print_tab_output(i),
+            Some(TabAct::PastePassword(i)) => {
+                if let Some(tab) = self.tabs.get(i) {
+                    let tab_id = tab.id;
+                    self.open_paste_password(tab_id);
+                }
+            }
             Some(TabAct::CloseOthers(i)) => {
                 let keep_id = self.tabs[i].id;
                 let mut j = 0;
@@ -7787,6 +7959,7 @@ impl App {
             Dialog::UnlockVault { .. } => self.show_unlock_vault(ctx),
             Dialog::CreateVault { .. } => self.show_create_vault(ctx),
             Dialog::RevealSecret { .. } => self.show_reveal_secret(ctx),
+            Dialog::PastePassword(_) => self.show_paste_password(ctx),
             Dialog::EditSession(_) => self.show_edit_session(ctx),
             Dialog::QuickConnect(_) => self.show_quick_connect(ctx),
             Dialog::VaultManager(_) => self.show_vault_manager(ctx),
@@ -8183,16 +8356,7 @@ impl App {
 
         // If an action is awaiting a key, grab the first non-modifier key press.
         if let Some(action) = capturing {
-            let captured = ui.input_mut(|i| {
-                i.events.iter().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, modifiers, .. }
-                        if !is_modifier_key(*key) =>
-                    {
-                        Some(KeyboardShortcut::new(*modifiers, *key))
-                    }
-                    _ => None,
-                })
-            });
+            let captured = captured_shortcut(ui.ctx());
             if let Some(shortcut) = captured {
                 self.keymap.set(action, shortcut);
                 capturing = None;
@@ -8208,8 +8372,14 @@ impl App {
         let mut save = false;
         ui.label("Click a shortcut, then press the keys to rebind it.");
         ui.add_space(6.0);
+        filter_box(ui, &mut self.filter_keybinds, false);
+        ui.add_space(6.0);
+        let needle = self.filter_keybinds.to_lowercase();
         egui::Grid::new("keybinds-grid").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
             for action in Action::ALL {
+                if !needle.is_empty() && !action.label().to_lowercase().contains(&needle) {
+                    continue;
+                }
                 ui.label(action.label());
                 let label = if capturing == Some(action) {
                     "press keys…".to_owned()
@@ -8303,6 +8473,38 @@ impl App {
                 ui.separator();
                 appearance_picker(ui, "macro-appearance", &mut form.icon, &mut form.color, "⚙");
                 ui.add_space(4.0);
+                // Optional keyboard shortcut: click to capture, Clear to unbind.
+                ui.horizontal(|ui| {
+                    ui.label("Keyboard shortcut:");
+                    let label = if form.capturing_shortcut {
+                        "press keys…".to_owned()
+                    } else {
+                        form.shortcut.clone().unwrap_or_else(|| "None".to_owned())
+                    };
+                    if ui.selectable_label(form.capturing_shortcut, label).clicked() {
+                        form.capturing_shortcut = !form.capturing_shortcut;
+                    }
+                    if ui.small_button("Clear").clicked() {
+                        form.shortcut = None;
+                        form.capturing_shortcut = false;
+                    }
+                });
+                if form.capturing_shortcut {
+                    let captured = captured_shortcut(ui.ctx());
+                    if let Some(sc) = captured {
+                        form.shortcut = Some(format_shortcut(&sc));
+                        form.capturing_shortcut = false;
+                    } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                        form.capturing_shortcut = false;
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Runs on the active terminal while a tab is focused. Esc to cancel.",
+                        )
+                        .weak(),
+                    );
+                }
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         save = true;
@@ -8319,11 +8521,17 @@ impl App {
                 form.error = Some("Give the macro a name.".to_owned());
                 return;
             }
+            let shortcut = form
+                .shortcut
+                .as_ref()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
             let m = Macro {
                 name: form.name.trim().to_owned(),
                 steps: form.steps.clone(),
                 icon: form.icon.clone(),
                 color: form.color,
+                shortcut,
             };
             match form.index {
                 Some(i) if i < self.macros.macros.len() => self.macros.macros[i] = m,
@@ -9990,6 +10198,186 @@ impl App {
             Err(VaultError::BadPassword) => *error = Some("Incorrect master password.".into()),
             Err(e) => *error = Some(format!("{e}")),
         }
+    }
+
+    /// Opens the "Paste password" dialog for `tab_id`. If the master password is
+    /// remembered for this session (and still valid), it skips straight to the
+    /// entry picker; otherwise it asks for the master password first.
+    fn open_paste_password(&mut self, tab_id: u64) {
+        if let Some(master) = self.paste_pw_master.clone() {
+            match Vault::open(self.vault_path.clone(), &master) {
+                Ok(vault) => {
+                    self.dialog = Dialog::PastePassword(Box::new(PastePasswordState {
+                        tab_id,
+                        phase: PastePhase::Pick { vault: Box::new(vault), error: None },
+                        filter: String::new(),
+                        remember: true,
+                    }));
+                    return;
+                }
+                // The remembered password no longer works (e.g. it was changed);
+                // forget it and fall back to asking.
+                Err(_) => self.paste_pw_master = None,
+            }
+        }
+        self.dialog = Dialog::PastePassword(Box::new(PastePasswordState {
+            tab_id,
+            phase: PastePhase::Unlock { password: String::new(), error: None },
+            filter: String::new(),
+            remember: false,
+        }));
+    }
+
+    /// The "Paste password" dialog: confirm the master password, then pick a
+    /// vault password to type into the terminal tab.
+    fn show_paste_password(&mut self, ctx: &egui::Context) {
+        let mut unlock = false;
+        let mut cancel = false;
+        let mut pick: Option<String> = None;
+        if let Dialog::PastePassword(state) = &mut self.dialog {
+            let PastePasswordState { tab_id: _, phase, filter, remember } = &mut **state;
+            egui::Modal::new(egui::Id::unique("paste-password")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading("Paste password");
+                match phase {
+                    PastePhase::Unlock { password, error } => {
+                        ui.label(
+                            RichText::new("Confirm the master password to choose a credential.")
+                                .weak(),
+                        );
+                        ui.add_space(6.0);
+                        let field = ui.add(
+                            egui::TextEdit::singleline(password)
+                                .password(true)
+                                .hint_text("Master password"),
+                        );
+                        autofocus(ui, &field);
+                        unlock |= entered(ui, &field);
+                        ui.add_space(4.0);
+                        ui.checkbox(remember, "Remember for this session")
+                            .on_hover_text("Don't ask for the master password again until Wazowski is closed");
+                        if let Some(error) = error {
+                            ui.colored_label(Color32::LIGHT_RED, error.as_str());
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            unlock |= ui.button("Continue").clicked();
+                            cancel |= ui.button("Cancel").clicked();
+                        });
+                    }
+                    PastePhase::Pick { vault, error } => {
+                        ui.label(
+                            RichText::new("Select a password to type into the session.").weak(),
+                        );
+                        ui.add_space(4.0);
+                        filter_box(ui, filter, false);
+                        ui.separator();
+                        let needle = filter.to_lowercase();
+                        egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, false]).show(
+                            ui,
+                            |ui| {
+                                let mut any = false;
+                                for info in vault.entries() {
+                                    if info.category != SecretCategory::Password {
+                                        continue;
+                                    }
+                                    if !needle.is_empty() && !info.name.to_lowercase().contains(&needle)
+                                    {
+                                        continue;
+                                    }
+                                    any = true;
+                                    if ui.selectable_label(false, format!("🔑 {}", info.name)).clicked()
+                                    {
+                                        pick = Some(info.id.clone());
+                                    }
+                                }
+                                if !any {
+                                    ui.label(RichText::new("No matching password entries.").weak());
+                                }
+                            },
+                        );
+                        if let Some(error) = error {
+                            ui.colored_label(Color32::LIGHT_RED, error.as_str());
+                        }
+                        ui.add_space(6.0);
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    }
+                }
+            });
+        }
+        if unlock {
+            self.try_paste_password_unlock();
+        }
+        if let Some(id) = pick {
+            self.paste_password_pick(&id);
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// Verifies the master password and advances the paste-password dialog to the
+    /// entry picker. Re-opens the vault from disk so it works even when the
+    /// in-session vault is locked.
+    fn try_paste_password_unlock(&mut self) {
+        let mut remembered: Option<String> = None;
+        {
+            let Dialog::PastePassword(state) = &mut self.dialog else { return };
+            let remember = state.remember;
+            let PastePhase::Unlock { password, error } = &mut state.phase else { return };
+            match Vault::open(self.vault_path.clone(), password) {
+                Ok(vault) => {
+                    if remember {
+                        remembered = Some(password.clone());
+                    }
+                    state.phase = PastePhase::Pick { vault: Box::new(vault), error: None };
+                }
+                Err(VaultError::BadPassword) => *error = Some("Incorrect master password.".into()),
+                Err(e) => *error = Some(format!("{e}")),
+            }
+        }
+        if let Some(master) = remembered {
+            self.paste_pw_master = Some(master);
+        }
+    }
+
+    /// Types the chosen entry's password into the target tab (no trailing Enter,
+    /// so the user can review before submitting), then closes the dialog.
+    fn paste_password_pick(&mut self, id: &str) {
+        let Some((tab_id, password)) = ({
+            let Dialog::PastePassword(state) = &self.dialog else { return };
+            let PastePhase::Pick { vault, .. } = &state.phase else { return };
+            match vault.get(id) {
+                Some(Secret::Password { password, .. }) => Some((state.tab_id, password.clone())),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        if !self.paste_into_tab(tab_id, password.as_bytes()) {
+            self.error = Some("That tab is no longer an open terminal.".into());
+        }
+        self.dialog = Dialog::None;
+    }
+
+    /// Types `bytes` into the focused pane of the terminal tab with `id`. Returns
+    /// false if no such terminal tab exists.
+    fn paste_into_tab(&mut self, id: u64, bytes: &[u8]) -> bool {
+        for tab in &mut self.tabs {
+            if tab.id == id {
+                if let TabContent::Terminal(panes) = &mut tab.content {
+                    let focused = panes.focused_id();
+                    if let Some(term) = panes.get_mut(focused) {
+                        term.write(bytes);
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+        false
     }
 
     fn try_unlock_vault(&mut self) {
@@ -12587,7 +12975,63 @@ fn entered(ui: &egui::Ui, resp: &egui::Response) -> bool {
 /// `Modifiers` rather than as `Key`s, so only Escape needs excluding here (it
 /// cancels capture instead of becoming a binding).
 fn is_modifier_key(key: Key) -> bool {
-    matches!(key, Key::Escape)
+    matches!(
+        key,
+        Key::Escape
+            | Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::AltLeft
+            | Key::AltRight
+            | Key::SuperLeft
+            | Key::SuperRight
+    )
+}
+
+/// Like `InputState::consume_shortcut`, but also matches by *physical* key so a
+/// binding to a number key still fires when Shift turns it into a symbol: egui
+/// reports Ctrl+Shift+1 with the logical key `!` (`Exclamationmark`), not `Num1`.
+/// Tries the normal logical match first, then the physical fallback.
+fn consume_shortcut_physical(ctx: &egui::Context, sc: &KeyboardShortcut) -> bool {
+    ctx.input_mut(|i| {
+        if i.consume_shortcut(sc) {
+            return true;
+        }
+        let mut found = false;
+        i.events.retain(|e| {
+            let is_match = matches!(
+                e,
+                egui::Event::Key { physical_key: Some(pk), modifiers, pressed: true, .. }
+                    if *pk == sc.logical_key && modifiers.matches_logically(sc.modifiers)
+            );
+            found |= is_match;
+            !is_match
+        });
+        found
+    })
+}
+
+/// Reads a rebind key press from the current input: the first non-modifier key,
+/// captured by its *physical* position (so Shift+1 binds `Num1`, not `!`), with
+/// `command` folded into `ctrl` so a plain Ctrl shortcut isn't stored as
+/// "Ctrl+Cmd". Returns `None` if no bindable key was pressed this frame.
+fn captured_shortcut(ctx: &egui::Context) -> Option<KeyboardShortcut> {
+    ctx.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Key { key, physical_key, pressed: true, modifiers, .. }
+                if !is_modifier_key(*key) =>
+            {
+                let k = (*physical_key).filter(|pk| !is_modifier_key(*pk)).unwrap_or(*key);
+                let mut m = *modifiers;
+                if m.ctrl {
+                    m.command = false;
+                }
+                Some(KeyboardShortcut::new(m, k))
+            }
+            _ => None,
+        })
+    })
 }
 
 /// Counts non-overlapping occurrences of `needle` in `hay`.
@@ -12817,6 +13261,56 @@ fn step_editor(ui: &mut egui::Ui, step: &mut Step) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_key_fallback_matches_shifted_number() {
+        // Reproduces the real event egui delivers for Ctrl+Shift+1: the logical
+        // key is `!` (Exclamationmark), but the physical key is Num1, and on Linux
+        // `command` mirrors `ctrl`. A binding to Num1 must still fire.
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: Key::Exclamationmark,
+            physical_key: Some(Key::Num1),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                command: true,
+                ..Default::default()
+            },
+        });
+        let sc = KeyboardShortcut::new(egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), Key::Num1);
+        ctx.begin_pass(input);
+        let matched = consume_shortcut_physical(&ctx, &sc);
+        assert!(matched, "Ctrl+Shift+1 should match a Num1 binding via physical key");
+    }
+
+    #[test]
+    fn capture_prefers_physical_and_drops_command() {
+        // Capturing Ctrl+Shift+1 should store Num1 (not `!`) and not include the
+        // mirrored `command` modifier, so it reads back as a clean "Ctrl+Shift+1".
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: Key::Exclamationmark,
+            physical_key: Some(Key::Num1),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                command: true,
+                ..Default::default()
+            },
+        });
+        ctx.begin_pass(input);
+        let captured = captured_shortcut(&ctx);
+        let sc = captured.expect("a key was pressed");
+        assert_eq!(sc.logical_key, Key::Num1);
+        assert_eq!(crate::keybinds::format_shortcut(&sc), "Ctrl+Shift+1");
+    }
 
     #[test]
     fn session_zip_roundtrips() {

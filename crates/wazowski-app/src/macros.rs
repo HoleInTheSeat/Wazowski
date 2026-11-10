@@ -77,6 +77,11 @@ pub struct Macro {
     /// Custom RGB tint; `None` means the theme's default text color.
     #[serde(default)]
     pub color: Option<[u8; 3]>,
+    /// Optional keyboard shortcut (e.g. `Ctrl+Shift+P`) that runs this macro on
+    /// the active terminal — only while a terminal tab has keyboard focus.
+    /// `None`/empty means unbound.
+    #[serde(default)]
+    pub shortcut: Option<String>,
 }
 
 /// Persisted list of macros (`macros.toml`).
@@ -220,6 +225,7 @@ mod tests {
             ],
             icon: String::new(),
             color: None,
+            shortcut: None,
         };
         let file = MacrosFile { macros: vec![m] };
         let text = toml::to_string_pretty(&file).unwrap();

@@ -13,22 +13,42 @@ defaults are below.
 | Split pane down | `Ctrl+Shift+O` |
 | Close focused pane | `Ctrl+Shift+X` |
 | Toggle broadcast | `Ctrl+Shift+B` |
-| Run macro… | `Ctrl+Shift+M` |
+| Save output / screenshot | `Ctrl+S` |
 | Find in terminals | `Ctrl+Shift+F` |
 | Serial: raise baud | `Ctrl+Shift+↑` |
 | Serial: lower baud | `Ctrl+Shift+↓` |
-| Left pane: Sessions | `Ctrl+Shift+1` |
-| Left pane: Macros | `Ctrl+Shift+2` |
-| Left pane: Files | `Ctrl+Shift+3` |
+| Sessions pane | `Ctrl+Shift+1` |
+| Files pane | `Ctrl+Shift+2` |
+| Macros pane | `Ctrl+Shift+3` |
+| Tools pane | `Ctrl+Shift+4` |
+| Vault pane | `Ctrl+Shift+5` |
+| Settings pane | `Ctrl+Shift+S` |
 | Terminal: larger font | `Ctrl+=` |
 | Terminal: smaller font | `Ctrl+-` |
 | Terminal: reset font size | `Ctrl+0` |
 
+Each pane shortcut switches to that pane **and** moves the keyboard there — into
+the sessions tree (for arrow-key navigation) for the Sessions pane, or into the
+pane's filter box for the others.
+
+**Save output / screenshot** (`Ctrl+S`) acts on the active tab: a terminal tab's
+scrollback is saved to a text file, and an RDP/VNC tab's current frame is saved
+as a PNG — both ask where to save. Note this overrides the terminal's `Ctrl+S`
+flow-control (XOFF); rebind it if you need XOFF.
+
 ## Rebinding
 
 In **Settings → Keybindings**, click a shortcut and press the new combination to
-rebind it. Changes are saved to `keybindings.toml` in your config dir and are
-included in a [settings backup](settings-and-backup.md).
+rebind it. Use the filter box at the top to find an action quickly. Changes are
+saved to `keybindings.toml` in your config dir and are included in a
+[settings backup](settings-and-backup.md).
+
+## Macro shortcuts
+
+A macro can have its own shortcut (set in the macro editor). It runs the macro on
+the active terminal, and only fires while a terminal tab has keyboard focus — so
+it never clashes with typing in the sidebar, a filter box, or a dialog. See
+[Macros](macros.md).
 
 ## Font zoom with the mouse
 
