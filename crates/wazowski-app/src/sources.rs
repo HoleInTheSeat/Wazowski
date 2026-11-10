@@ -741,6 +741,11 @@ impl SharedSource {
         let message = format!("Folder restyled: {}", folder_breadcrumb(folder));
         self.mutate(&message, |s| s.set_folder_style(folder, style))
     }
+
+    pub fn set_folder_description(&mut self, folder: &str, description: &str) -> Result<()> {
+        let message = format!("Folder described: {}", folder_breadcrumb(folder));
+        self.mutate(&message, |s| s.set_folder_description(folder, description))
+    }
 }
 
 /// Opens a source's location: the folder containing its file (folder kind) or

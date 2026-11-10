@@ -487,6 +487,23 @@ impl SessionStore {
         self.save()
     }
 
+    /// A folder's free-text description (empty if none). Stored in its `.folder`.
+    pub fn folder_description(&self, path: &str) -> &str {
+        self.folder_meta.get(path).map(|m| m.description.as_str()).unwrap_or("")
+    }
+
+    /// Sets a folder's description (kept with its id in `folder_meta`), and saves.
+    pub fn set_folder_description(&mut self, path: &str, description: &str) -> Result<()> {
+        let description = description.trim();
+        let entry = self.folder_meta.entry(path.to_owned()).or_default();
+        entry.description = description.to_owned();
+        // Drop the entry entirely if it now holds nothing (no id, no description).
+        if entry.is_empty() {
+            self.folder_meta.remove(path);
+        }
+        self.save()
+    }
+
     /// All sessions, in stored order.
     pub fn all(&self) -> &[Session] {
         &self.sessions
@@ -554,6 +571,7 @@ impl SessionStore {
         let prefix = format!("{name}/");
         self.folders.retain(|f| f != name && !f.starts_with(&prefix));
         self.folder_styles.retain(|f, _| f != name && !f.starts_with(&prefix));
+        self.folder_meta.retain(|f, _| f != name && !f.starts_with(&prefix));
         for session in &mut self.sessions {
             if session.folder == name || session.folder.starts_with(&prefix) {
                 session.folder.clear();
@@ -594,6 +612,9 @@ impl SessionStore {
             .into_iter()
             .map(|(path, style)| (repath(&path).unwrap_or(path), style))
             .collect();
+        let meta = std::mem::take(&mut self.folder_meta);
+        self.folder_meta =
+            meta.into_iter().map(|(path, m)| (repath(&path).unwrap_or(path), m)).collect();
         self.save()
     }
 
@@ -848,6 +869,28 @@ secret = "deploy-key"
         assert_eq!(reopened.all()[0].name, "web");
         assert_eq!(reopened.all()[0].username, "", "username never persisted");
         assert!(reopened.folders().contains(&"Prod".to_owned()));
+    }
+
+    #[test]
+    fn folder_description_set_rename_remove_roundtrip() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::load_tree(dir.path().to_path_buf());
+        store.add_folder("Prod").unwrap();
+        store.set_folder_description("Prod", "Production gear").unwrap();
+        assert_eq!(store.folder_description("Prod"), "Production gear");
+
+        // Rename carries the description to the new path (not orphaned).
+        store.rename_folder("Prod", "Production").unwrap();
+        assert_eq!(store.folder_description("Prod"), "");
+        assert_eq!(store.folder_description("Production"), "Production gear");
+
+        // It travels in the .folder: reopening the tree still has it.
+        let mut reopened = SessionStore::load_tree(dir.path().to_path_buf());
+        assert_eq!(reopened.folder_description("Production"), "Production gear");
+
+        // Removing the folder drops its description.
+        reopened.remove_folder("Production").unwrap();
+        assert_eq!(reopened.folder_description("Production"), "");
     }
 
     #[test]

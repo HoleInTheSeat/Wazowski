@@ -90,7 +90,8 @@ directory, and **Sync now** just re-reads it.
 A source is a directory tree, not one file:
 
 - Each **folder** is a directory with a `.folder` sidecar carrying its name, icon,
-  color, and a stable id.
+  color, an optional **description** (set in the folder's Edit dialog; shown on
+  hover), and a stable id.
 - Each **session** is a `<slug>.wzsession` file inside its folder's directory.
 - The **root `.folder`** carries the source's own name/icon/color/description.
 

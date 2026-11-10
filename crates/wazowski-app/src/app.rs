@@ -644,9 +644,23 @@ enum Dialog {
     QuickConnect(ConnectAuthForm),
     VaultManager(VaultManagerState),
     CreateCredential(CredentialPrompt),
-    NewFolder { target: StoreId, parent: String, name: String, icon: String, color: Option<[u8; 3]> },
-    /// Edit a folder: rename it and/or change its icon/color, in one dialog.
-    EditFolder { target: StoreId, old: String, name: String, icon: String, color: Option<[u8; 3]> },
+    NewFolder {
+        target: StoreId,
+        parent: String,
+        name: String,
+        icon: String,
+        color: Option<[u8; 3]>,
+        description: String,
+    },
+    /// Edit a folder: rename it and/or change its icon/color/description, in one dialog.
+    EditFolder {
+        target: StoreId,
+        old: String,
+        name: String,
+        icon: String,
+        color: Option<[u8; 3]>,
+        description: String,
+    },
     ConfirmDeleteVault,
     ConfirmQuit,
     /// Confirm typing multi-line clipboard text into a remote session (the
@@ -4859,17 +4873,20 @@ impl App {
                     name: String::new(),
                     icon: String::new(),
                     color: None,
+                    description: String::new(),
                 };
                 Ok(())
             }
             TreeAction::EditFolder(store, folder) => {
                 let style = self.store_folder_style(&store, &folder);
+                let description = self.store_folder_description(&store, &folder);
                 self.dialog = Dialog::EditFolder {
                     target: store,
                     old: folder.clone(),
                     name: folder,
                     icon: style.as_ref().map(|s| s.icon.clone()).unwrap_or_default(),
                     color: style.and_then(|s| s.color),
+                    description,
                 };
                 Ok(())
             }
@@ -5641,6 +5658,25 @@ impl App {
         match store {
             StoreId::Local => self.sessions.set_folder_style(folder, style),
             StoreId::Shared(sid) => self.offline_guard(sid)?.set_folder_style(folder, style),
+        }
+    }
+
+    /// A folder's description in the given store (empty if none).
+    fn store_folder_description(&self, store: &StoreId, folder: &str) -> String {
+        self.store_ref(store).map(|s| s.folder_description(folder).to_owned()).unwrap_or_default()
+    }
+
+    fn store_set_folder_description(
+        &mut self,
+        store: &StoreId,
+        folder: &str,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        match store {
+            StoreId::Local => self.sessions.set_folder_description(folder, description),
+            StoreId::Shared(sid) => {
+                self.offline_guard(sid)?.set_folder_description(folder, description)
+            }
         }
     }
 
@@ -9546,7 +9582,7 @@ impl App {
     fn show_new_folder(&mut self, ctx: &egui::Context) {
         let mut submit = false;
         let mut cancel = false;
-        if let Dialog::NewFolder { parent, name, icon, color, .. } = &mut self.dialog {
+        if let Dialog::NewFolder { parent, name, icon, color, description, .. } = &mut self.dialog {
             let heading =
                 if parent.is_empty() { "New folder".to_owned() } else { format!("New folder in {parent}") };
             egui::Modal::new(egui::Id::unique("new-folder")).show(ctx, |ui| {
@@ -9555,6 +9591,13 @@ impl App {
                 let field = ui.add(egui::TextEdit::singleline(name).hint_text("Folder name"));
                 autofocus(ui, &field);
                 submit |= entered(ui, &field);
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::multiline(description)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Optional description (shown on hover; travels in the .folder)"),
+                );
                 ui.add_space(6.0);
                 appearance_picker(ui, "new-folder-appearance", icon, color, "📁");
                 ui.add_space(6.0);
@@ -9565,18 +9608,24 @@ impl App {
             });
         }
         if submit
-            && let Dialog::NewFolder { target, parent, name, icon, color } = &self.dialog
+            && let Dialog::NewFolder { target, parent, name, icon, color, description } = &self.dialog
         {
             let name = name.trim().trim_matches('/');
             // Nest under the parent folder when creating a subfolder.
             let full = if parent.is_empty() { name.to_owned() } else { format!("{parent}/{name}") };
             let target = target.clone();
             let style = FolderStyle { icon: icon.clone(), color: *color };
+            let description = description.trim().to_owned();
             if !name.is_empty() {
                 if let Err(e) = self.store_add_folder(&target, &full) {
                     self.error = Some(format!("{e:#}"));
-                } else if !style.icon.is_empty() || style.color.is_some() {
-                    let _ = self.store_set_folder_style(&target, &full, style);
+                } else {
+                    if !style.icon.is_empty() || style.color.is_some() {
+                        let _ = self.store_set_folder_style(&target, &full, style);
+                    }
+                    if !description.is_empty() {
+                        let _ = self.store_set_folder_description(&target, &full, &description);
+                    }
                 }
             }
             self.dialog = Dialog::None;
@@ -9590,7 +9639,7 @@ impl App {
     fn show_edit_folder(&mut self, ctx: &egui::Context) {
         let mut save = false;
         let mut cancel = false;
-        if let Dialog::EditFolder { name, icon, color, .. } = &mut self.dialog {
+        if let Dialog::EditFolder { name, icon, color, description, .. } = &mut self.dialog {
             egui::Modal::new(egui::Id::unique("edit-folder")).show(ctx, |ui| {
                 ui.set_width(340.0);
                 ui.heading("Edit folder");
@@ -9601,6 +9650,13 @@ impl App {
                     save |= entered(ui, &field);
                 });
                 ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::multiline(description)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Optional description (shown on hover; travels in the .folder)"),
+                );
+                ui.add_space(6.0);
                 appearance_picker(ui, "folder-appearance", icon, color, "📁");
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -9610,11 +9666,12 @@ impl App {
             });
         }
         if save
-            && let Dialog::EditFolder { target, old, name, icon, color } = &self.dialog
+            && let Dialog::EditFolder { target, old, name, icon, color, description } = &self.dialog
         {
             let (target, old, name) = (target.clone(), old.clone(), name.clone());
             let style = FolderStyle { icon: icon.clone(), color: *color };
-            // Rename first (if changed); apply the style to the final path.
+            let description = description.trim().to_owned();
+            // Rename first (if changed); apply the style/description to the final path.
             if name != old
                 && let Err(e) = self.store_rename_folder(&target, &old, &name)
             {
@@ -9623,6 +9680,9 @@ impl App {
                 return;
             }
             if let Err(e) = self.store_set_folder_style(&target, &name, style) {
+                self.error = Some(format!("{e:#}"));
+            }
+            if let Err(e) = self.store_set_folder_description(&target, &name, &description) {
                 self.error = Some(format!("{e:#}"));
             }
             self.dialog = Dialog::None;
@@ -11660,6 +11720,11 @@ fn render_folder<'a>(
     // Scroll the keyboard-selected folder into view after arrow navigation.
     if selected && scroll_to {
         header_row.scroll_to_me(Some(egui::Align::Center));
+    }
+    // Hover tooltip: the folder's description (travels in its `.folder`).
+    let desc = data.folder_description(full);
+    if !desc.is_empty() {
+        delayed_tooltip_lazy(ui, &header_label, || desc.to_owned());
     }
     // Single-click (with modifiers) changes the folder selection; double-click
     // still toggles expand (handled above).
