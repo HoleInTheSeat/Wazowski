@@ -7245,7 +7245,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-app"
-version = "2.7.0-beta.1"
+version = "2.7.0-beta.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7277,7 +7277,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-core"
-version = "2.7.0-beta.1"
+version = "2.7.0-beta.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7296,7 +7296,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-remote"
-version = "2.7.0-beta.1"
+version = "2.7.0-beta.2"
 dependencies = [
  "anyhow",
  "ironrdp",
@@ -7310,7 +7310,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-servers"
-version = "2.7.0-beta.1"
+version = "2.7.0-beta.2"
 dependencies = [
  "anyhow",
  "async-tftp",
@@ -7331,7 +7331,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-ssh"
-version = "2.7.0-beta.1"
+version = "2.7.0-beta.2"
 dependencies = [
  "anyhow",
  "dirs",
@@ -7350,7 +7350,7 @@ dependencies = [
 
 [[package]]
 name = "wazowski-term"
-version = "2.7.0-beta.1"
+version = "2.7.0-beta.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
