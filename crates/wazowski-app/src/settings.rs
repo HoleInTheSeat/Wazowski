@@ -97,6 +97,10 @@ pub struct Settings {
     /// Terminal font size in points.
     #[serde(default = "default_font_size")]
     pub terminal_font_size: f32,
+    /// Global interface scale (egui zoom factor); 1.0 = 100%. Scales the whole UI
+    /// — text, widgets and spacing — on top of the OS display scaling.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
     /// Scheme used by the session "Open web GUI" action.
     #[serde(default)]
     pub web_scheme: WebScheme,
@@ -117,6 +121,15 @@ fn default_font_size() -> f32 {
     14.0
 }
 
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
+/// Clamps an interface scale to a sane range (50%–300%).
+pub fn clamp_ui_scale(scale: f32) -> f32 {
+    scale.clamp(0.5, 3.0)
+}
+
 fn default_dark_mode() -> bool {
     true
 }
@@ -131,6 +144,7 @@ impl Default for Settings {
             vault_backup: VaultBackup::default(),
             recent: Vec::new(),
             terminal_font_size: default_font_size(),
+            ui_scale: default_ui_scale(),
             web_scheme: WebScheme::default(),
             json_urls: Vec::new(),
             jq_filters: Vec::new(),

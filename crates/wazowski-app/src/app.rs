@@ -1671,6 +1671,8 @@ impl App {
         };
         app.migrate_servers_one_per_kind();
         apply_visuals(ctx, app.dark_mode);
+        // Restore the saved interface scale (egui resets zoom to 1.0 each launch).
+        ctx.set_zoom_factor(crate::settings::clamp_ui_scale(app.settings.ui_scale));
         app.open_startup_tab(ctx);
         app
     }
@@ -3259,6 +3261,28 @@ impl App {
         })
         .response
         .on_hover_text("Scheme used by a session's right-click \"Open web GUI\" action");
+
+        ui.horizontal(|ui| {
+            ui.label("Interface scale:");
+            let pct = (self.settings.ui_scale * 100.0).round() as i32;
+            egui::ComboBox::from_id_salt("ui-scale")
+                .selected_text(format!("{pct}%"))
+                .show_ui(ui, |ui| {
+                    for p in [75, 90, 100, 110, 125, 150, 175, 200] {
+                        let v = p as f32 / 100.0;
+                        if ui
+                            .selectable_value(&mut self.settings.ui_scale, v, format!("{p}%"))
+                            .changed()
+                        {
+                            *changed = true;
+                            ui.ctx()
+                                .set_zoom_factor(crate::settings::clamp_ui_scale(self.settings.ui_scale));
+                        }
+                    }
+                });
+        })
+        .response
+        .on_hover_text("Scales the whole interface — text, widgets and spacing. Applies immediately.");
     }
 
     fn settings_tabs(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
@@ -11950,7 +11974,7 @@ fn delayed_tooltip_lazy(
     response: &egui::Response,
     text: impl FnOnce() -> String,
 ) {
-    const DELAY: f64 = 1.5;
+    const DELAY: f64 = 1.0;
     let id = response.id.with("wz-hover-since");
     if response.hovered() {
         let now = ui.input(|i| i.time);
@@ -11969,7 +11993,7 @@ fn delayed_tooltip_lazy(
 }
 
 fn delayed_tooltip(ui: &egui::Ui, response: &egui::Response, text: &str) {
-    const DELAY: f64 = 1.5;
+    const DELAY: f64 = 1.0;
     if text.is_empty() {
         return;
     }
@@ -11995,7 +12019,7 @@ fn delayed_tooltip_ui(
     response: &egui::Response,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
-    const DELAY: f64 = 1.5;
+    const DELAY: f64 = 1.0;
     let id = response.id.with("wz-hover-since");
     if response.hovered() {
         let now = ui.input(|i| i.time);
