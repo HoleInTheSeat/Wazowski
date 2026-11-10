@@ -4,8 +4,11 @@
 //! - an **AppImage** replaces its own `.AppImage` file (via `$APPIMAGE`),
 //! - a standalone **executable** (the Windows per-user install, a raw binary)
 //!   self-replaces the running exe,
-//! - a **package-manager** install (dnf/apt, under a system prefix) is left
-//!   alone — the user updates it with their package manager.
+//! - an **RPM** install (the running exe is owned by the `wazowski` package, and
+//!   `pkexec` is available) downloads the new `.rpm` and installs it via an admin
+//!   prompt (`pkexec dnf install …`, falling back to `rpm -U`),
+//! - any other **package-manager** install (e.g. apt) is left alone — the user
+//!   updates it with their package manager.
 //!
 //! Network/IO runs on a worker thread; the UI polls a shared cell.
 
@@ -57,12 +60,16 @@ pub enum InstallKind {
     AppImage(PathBuf),
     /// Replace this standalone executable (Windows exe, raw binary).
     Executable(PathBuf),
-    /// Owned by a package manager (dnf/apt/…): update out-of-band.
+    /// Installed from our RPM (the running exe is owned by the `wazowski` package):
+    /// download the new `.rpm` and install it with an admin prompt (`pkexec`).
+    /// `PathBuf` is the exe, for relaunch.
+    Rpm(PathBuf),
+    /// Owned by a package manager we can't drive (apt/…): update out-of-band.
     Managed,
 }
 
 impl InstallKind {
-    /// Whether this install can update itself.
+    /// Whether this install can update itself (in place, or via an admin prompt).
     pub fn can_self_update(&self) -> bool {
         !matches!(self, InstallKind::Managed)
     }
@@ -70,7 +77,9 @@ impl InstallKind {
     /// The file to relaunch after an update.
     fn launch_target(&self) -> Option<PathBuf> {
         match self {
-            InstallKind::AppImage(p) | InstallKind::Executable(p) => Some(p.clone()),
+            InstallKind::AppImage(p) | InstallKind::Executable(p) | InstallKind::Rpm(p) => {
+                Some(p.clone())
+            }
             InstallKind::Managed => std::env::current_exe().ok(),
         }
     }
@@ -94,6 +103,11 @@ pub fn install_kind() -> InstallKind {
         let p = exe.to_string_lossy();
         let system = p.starts_with("/usr/") || p.starts_with("/opt/") || p.starts_with("/bin/");
         if system || !is_writable(&exe) {
+            // If the running binary is owned by our RPM and we can prompt for
+            // admin rights, we can still update it (download .rpm + pkexec install).
+            if rpm_owns(&exe) && has_bin("pkexec") {
+                return InstallKind::Rpm(exe);
+            }
             return InstallKind::Managed;
         }
     }
@@ -214,6 +228,7 @@ fn wanted_suffix(kind: &InstallKind) -> &'static str {
                 "linux-x86_64"
             }
         }
+        InstallKind::Rpm(_) => "linux-x86_64.rpm",
         InstallKind::Managed => "",
     }
 }
@@ -229,10 +244,16 @@ fn select_asset<'a>(release: &'a Release, kind: &InstallKind) -> Option<&'a Asse
 /// Downloads the matching asset and replaces this install in place. On success
 /// the caller should relaunch via [`relaunch`].
 pub fn download_and_apply(release: &Release, kind: &InstallKind) -> Result<()> {
+    // An RPM install can't be overwritten in place; download the new .rpm and
+    // install it with an admin prompt instead.
+    if let InstallKind::Rpm(_) = kind {
+        return install_rpm(release);
+    }
     let asset = select_asset(release, kind)
         .context("this release has no download for your platform/install type")?;
     let target = match kind {
         InstallKind::AppImage(p) | InstallKind::Executable(p) => p.clone(),
+        InstallKind::Rpm(_) => unreachable!("handled above"),
         InstallKind::Managed => bail!("this install is managed by a package manager"),
     };
     // Download to a temp file in the target's directory so the final move is a
@@ -274,9 +295,90 @@ pub fn download_and_apply(release: &Release, kind: &InstallKind) -> Result<()> {
             // tmp_path is consumed on success by self_replace moving it; if it
             // still exists, dropping it cleans up.
         }
-        InstallKind::Managed => unreachable!(),
+        InstallKind::Rpm(_) | InstallKind::Managed => unreachable!(),
     }
     Ok(())
+}
+
+/// Downloads the release's `.rpm` and installs it with an admin prompt (`pkexec`),
+/// preferring `dnf` (resolves dependencies) and falling back to `rpm`. The new
+/// package replaces the running one under `/usr`; the caller then relaunches.
+fn install_rpm(release: &Release) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let asset = release
+            .assets
+            .iter()
+            .find(|a| a.name.ends_with("linux-x86_64.rpm"))
+            .context("this release has no .rpm to install")?;
+        // Download to a temp file readable by root (pkexec runs the installer as root).
+        let path = std::env::temp_dir().join(&asset.name);
+        let mut reader = ureq::get(&asset.browser_download_url)
+            .set("User-Agent", USER_AGENT)
+            .call()
+            .context("could not download the update")?
+            .into_reader();
+        let mut file =
+            std::fs::File::create(&path).context("could not save the downloaded .rpm")?;
+        std::io::copy(&mut reader, &mut file).context("could not save the downloaded .rpm")?;
+        file.sync_all().ok();
+        drop(file);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        }
+        // Build the install command (absolute program path; pkexec runs it as root).
+        let (prog, mut args) = if let Some(dnf) = bin_path("dnf") {
+            (dnf, vec!["install".into(), "-y".into(), "--nogpgcheck".into()])
+        } else if let Some(rpm) = bin_path("rpm") {
+            (rpm, vec!["-Uvh".into(), "--replacepkgs".into()])
+        } else {
+            bail!("neither dnf nor rpm was found to install the update");
+        };
+        args.push(path.to_string_lossy().into_owned());
+        let status = std::process::Command::new("pkexec")
+            .arg(prog)
+            .args(&args)
+            .status()
+            .context("could not run pkexec (is PolicyKit installed?)")?;
+        let _ = std::fs::remove_file(&path);
+        match status.code() {
+            Some(0) => Ok(()),
+            // pkexec: 126 = the auth dialog was dismissed, 127 = not authorized.
+            Some(126) => bail!("the admin prompt was dismissed — update cancelled"),
+            Some(127) => bail!("not authorized to install the update"),
+            other => bail!("the installer exited with status {other:?}"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = release;
+        bail!("rpm updates are only supported on Linux")
+    }
+}
+
+/// The absolute path of an executable named `name` on `PATH`, if any.
+#[cfg(target_os = "linux")]
+fn bin_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .and_then(|paths| std::env::split_paths(&paths).map(|d| d.join(name)).find(|p| p.is_file()))
+}
+
+/// Whether the `wazowski` RPM package owns `exe` (so rpm/dnf can upgrade it).
+#[cfg(target_os = "linux")]
+fn rpm_owns(exe: &std::path::Path) -> bool {
+    std::process::Command::new("rpm")
+        .arg("-qf")
+        .arg(exe)
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("wazowski"))
+        .unwrap_or(false)
+}
+
+/// Whether an executable named `name` is on `PATH`.
+#[cfg(target_os = "linux")]
+fn has_bin(name: &str) -> bool {
+    bin_path(name).is_some()
 }
 
 /// Relaunches the (now-updated) app and exits this process.

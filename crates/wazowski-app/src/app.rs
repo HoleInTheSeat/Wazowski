@@ -3737,6 +3737,7 @@ impl App {
         }
         let mut act: Option<Act> = None;
         let can_update = self.install_kind.can_self_update();
+        let is_rpm = matches!(self.install_kind, crate::update::InstallKind::Rpm(_));
         let current = crate::update::current_version();
         if let Dialog::Update(phase) = &self.dialog {
             egui::Modal::new(egui::Id::unique("update")).show(ctx, |ui| {
@@ -3776,10 +3777,20 @@ impl App {
                                 )
                                 .weak(),
                             );
+                        } else if is_rpm {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(
+                                    "Installs the new system package — you'll be asked for your \
+                                     admin password.",
+                                )
+                                .weak(),
+                            );
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if can_update && ui.button("⬇ Download & install").clicked() {
+                            let btn = if is_rpm { "⬇ Download & install (admin)" } else { "⬇ Download & install" };
+                            if can_update && ui.button(btn).clicked() {
                                 act = Some(Act::Download);
                             }
                             if ui.button("View release").clicked() {
