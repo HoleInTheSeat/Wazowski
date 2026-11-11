@@ -192,6 +192,7 @@ pub fn connect_rdp(
     height: u16,
     view_only: bool,
     quality: RdpQuality,
+    smart_sizing: bool,
 ) -> RemoteHandle {
     let frame = Arc::new(Mutex::new(FrameBuf::default()));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -208,6 +209,7 @@ pub fn connect_rdp(
         height,
         view_only,
         quality,
+        smart_sizing,
     };
     let active = Arc::new(AtomicBool::new(true));
     let frame_bg = Arc::clone(&frame);

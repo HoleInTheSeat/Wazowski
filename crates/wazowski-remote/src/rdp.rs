@@ -31,6 +31,11 @@ pub struct RdpParams {
     pub height: u16,
     pub view_only: bool,
     pub quality: crate::RdpQuality,
+    /// Ask the server to match its resolution to the window as it resizes
+    /// (Display Control). `width`/`height` are the initial size and fallback.
+    // TODO(phase 2): consumed when the Display Control DVC is wired up.
+    #[allow(dead_code)]
+    pub smart_sizing: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
