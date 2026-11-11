@@ -52,7 +52,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 anyhow.workspace = true
 keyring.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 open = "5"
 fs2 = "0.4"
 png = "0.18"
