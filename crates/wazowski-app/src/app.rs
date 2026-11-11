@@ -2139,7 +2139,7 @@ impl App {
                     to_remote_rdp_quality(session.rdp_quality),
                     session.rdp_smart_sizing,
                 );
-                let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
+                let tab = RemoteTab::new(handle, false, RemoteKind::Rdp, session.rdp_smart_sizing);
                 // Link the tab to its saved session (if any) so it gets a tooltip.
                 let sid = self.saved_session_id(session);
                 self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
@@ -2158,7 +2158,7 @@ impl App {
                     },
                 };
                 let handle = connect_vnc(&session.host, session.port, password, options);
-                let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc);
+                let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc, false);
                 let sid = self.saved_session_id(session);
                 self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
                 self.tabs[self.active].session_id = sid;
@@ -8318,7 +8318,7 @@ impl App {
                 },
             };
             let handle = connect_vnc(&session.host, session.port, pw, options);
-            let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc);
+            let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc, false);
             let sid = self.saved_session_id(&session);
             self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
             self.tabs[self.active].session_id = sid;
@@ -8344,7 +8344,7 @@ impl App {
                 to_remote_rdp_quality(session.rdp_quality),
                 session.rdp_smart_sizing,
             );
-            let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
+            let tab = RemoteTab::new(handle, false, RemoteKind::Rdp, session.rdp_smart_sizing);
             let sid = self.saved_session_id(&session);
             self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
             self.tabs[self.active].session_id = sid;

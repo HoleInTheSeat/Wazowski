@@ -153,6 +153,8 @@ async fn run_inner(
                     X11Event::PointerEvent((x, y, buttons).into())
                 }
                 RemoteInput::Key { keysym, down } => X11Event::KeyEvent((keysym, down).into()),
+                // VNC has no client-driven resize; ignore.
+                RemoteInput::Resize { .. } => continue,
             };
             let _ = client.input(x11).await;
         }

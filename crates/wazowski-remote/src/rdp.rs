@@ -33,9 +33,33 @@ pub struct RdpParams {
     pub quality: crate::RdpQuality,
     /// Ask the server to match its resolution to the window as it resizes
     /// (Display Control). `width`/`height` are the initial size and fallback.
-    // TODO(phase 2): consumed when the Display Control DVC is wired up.
-    #[allow(dead_code)]
     pub smart_sizing: bool,
+}
+
+/// Clamps a requested resize to the RDPEDISP-valid range: 200–8192 px, and the
+/// width must be even.
+fn clamp_rdp_size(width: u16, height: u16) -> (u32, u32) {
+    let w = u32::from(width.clamp(200, 8192) & !1);
+    let h = u32::from(height.clamp(200, 8192));
+    (w, h)
+}
+
+/// Builds the bulk decompressor for a negotiated compression type, mirroring
+/// `ironrdp-session`'s own logic, so the fast-path processor can be rebuilt after
+/// a dynamic-resize reactivation.
+fn bulk_decompressor(
+    ct: Option<ironrdp::pdu::rdp::client_info::CompressionType>,
+) -> Option<ironrdp_bulk::BulkCompressor> {
+    use ironrdp::pdu::rdp::client_info::CompressionType as Pct;
+    use ironrdp_bulk::CompressionType as Bct;
+    let ct = ct?;
+    let bct = match ct {
+        Pct::K8 => Bct::Rdp4,
+        Pct::K64 => Bct::Rdp5,
+        Pct::Rdp6 => Bct::Rdp6,
+        Pct::Rdp61 => Bct::Rdp61,
+    };
+    ironrdp_bulk::BulkCompressor::new(bct).ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,7 +184,18 @@ async fn run_inner(
     let mut framed = ironrdp_tokio::TokioFramed::new(tcp);
 
     let config = build_config(params)?;
-    let mut connector = ClientConnector::new(config, client_addr);
+    let mut connector = ClientConnector::new(config.clone(), client_addr);
+    // Register the Display Control virtual channel so the client can request
+    // dynamic resolution changes (smart sizing). Only when enabled, to keep
+    // non-smart sessions byte-for-byte identical.
+    if params.smart_sizing {
+        use ironrdp::displaycontrol::client::DisplayControlClient;
+        use ironrdp::dvc::DrdynvcClient;
+        connector = connector.with_static_channel(
+            DrdynvcClient::new()
+                .with_dynamic_channel(DisplayControlClient::new(|_caps| Ok(Vec::new()))),
+        );
+    }
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await
@@ -194,6 +229,11 @@ async fn run_inner(
         desktop.width,
         desktop.height,
     );
+    // Kept for rebuilding the fast-path processor after a dynamic-resize
+    // reactivation (channel ids and compression don't change on reactivation).
+    let io_channel_id = result.io_channel_id;
+    let user_channel_id = result.user_channel_id;
+    let compression_type = result.compression_type;
     let mut active = ActiveStageBuilder {
         static_channels: result.static_channels,
         user_channel_id: result.user_channel_id,
@@ -235,15 +275,37 @@ async fn run_inner(
             }
             input = in_rx.recv() => {
                 let Some(input) = input else { break };
-                if params.view_only {
-                    Vec::new()
-                } else {
-                    let events = translate_input(input, &mut keyboard, &mut mouse_buttons);
-                    if events.is_empty() {
+                match input {
+                    RemoteInput::Resize { width, height } => {
+                        // Smart sizing: ask the server to match the window. If the
+                        // Display Control channel isn't up (not enabled, or the
+                        // server declined), `encode_resize` returns None and we
+                        // simply stay at the current resolution (the fallback).
+                        if params.smart_sizing {
+                            let (w, h) = clamp_rdp_size(width, height);
+                            if let Some(res) = active.encode_resize(w, h, None, None) {
+                                let bytes = res.map_err(|e| anyhow::anyhow!("RDP resize: {e}"))?;
+                                use ironrdp_tokio::FramedWrite;
+                                upgraded_framed
+                                    .write_all(&bytes)
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!("RDP resize write: {e}"))?;
+                            }
+                        }
                         Vec::new()
-                    } else {
-                        active.process_fastpath_input(&mut image, &events)
-                            .map_err(|e| anyhow::anyhow!("RDP input: {e}"))?
+                    }
+                    other if params.view_only => {
+                        let _ = other;
+                        Vec::new()
+                    }
+                    other => {
+                        let events = translate_input(other, &mut keyboard, &mut mouse_buttons);
+                        if events.is_empty() {
+                            Vec::new()
+                        } else {
+                            active.process_fastpath_input(&mut image, &events)
+                                .map_err(|e| anyhow::anyhow!("RDP input: {e}"))?
+                        }
                     }
                 }
             }
@@ -266,7 +328,55 @@ async fn run_inner(
                 ActiveStageOutput::GraphicsUpdate(_) => dirty = true,
                 ActiveStageOutput::Terminate(_) => break 'session,
                 ActiveStageOutput::DeactivateAll => {
-                    anyhow::bail!("the RDP server re-initialized the session (resolution change?) — reconnect")
+                    // Deactivation–Reactivation: the server is changing the desktop
+                    // (e.g. a smart-sizing resolution change). Re-run the activation
+                    // sequence, then resize the framebuffer and rebuild the
+                    // fast-path processor *in place* so the Display Control channel
+                    // (and any other DVCs) survive.
+                    use ironrdp::connector::connection_activation::{
+                        ConnectionActivationSequence, ConnectionActivationState,
+                    };
+                    let mut seq = ConnectionActivationSequence::new(
+                        config.clone(),
+                        io_channel_id,
+                        user_channel_id,
+                    );
+                    let mut buf = ironrdp::core::WriteBuf::new();
+                    loop {
+                        ironrdp_tokio::single_sequence_step(&mut upgraded_framed, &mut seq, &mut buf)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("RDP reactivation: {e}"))?;
+                        if let ConnectionActivationState::Finalized {
+                            desktop_size,
+                            share_id,
+                            enable_server_pointer,
+                            pointer_software_rendering,
+                        } = seq.connection_activation_state()
+                        {
+                            image = DecodedImage::new(
+                                ironrdp::graphics::image_processing::PixelFormat::RgbA32,
+                                desktop_size.width,
+                                desktop_size.height,
+                            );
+                            active.set_fastpath_processor(
+                                ironrdp::session::fast_path::ProcessorBuilder {
+                                    io_channel_id,
+                                    user_channel_id,
+                                    share_id,
+                                    enable_server_pointer,
+                                    pointer_software_rendering,
+                                    bulk_decompressor: bulk_decompressor(compression_type),
+                                }
+                                .build(),
+                            );
+                            active.set_share_id(share_id);
+                            active.set_enable_server_pointer(enable_server_pointer);
+                            let _ = ev_tx
+                                .send(RemoteEvent::Resized(desktop_size.width, desktop_size.height));
+                            dirty = true;
+                            break;
+                        }
+                    }
                 }
                 // Cursor shapes/positions: the server renders the pointer into the
                 // framebuffer for us (pointer_software_rendering), so ignore these.
@@ -309,6 +419,8 @@ fn translate_input(
     match input {
         RemoteInput::Pointer { x, y, buttons } => mouse_events(x, y, buttons, mouse_buttons),
         RemoteInput::Key { keysym, down } => key_events(keysym, down, kb),
+        // Resize is handled before this point (via Display Control), not as input.
+        RemoteInput::Resize { .. } => Vec::new(),
     }
 }
 

@@ -39,10 +39,18 @@ pub struct RemoteTab {
     /// When a new frame last arrived, to pick the repaint cadence: fast while the
     /// remote is actively updating, slow when its screen is static.
     last_frame: std::time::Instant,
+    /// RDP smart sizing: when set, the pane's pixel size is sent to the backend
+    /// (debounced) so the server matches its resolution to the window.
+    report_resize: bool,
+    /// Debounce state for smart sizing: the size we want, the last size actually
+    /// sent, and when the pending size should be sent.
+    resize_want: (u16, u16),
+    resize_sent: (u16, u16),
+    resize_deadline: Option<std::time::Instant>,
 }
 
 impl RemoteTab {
-    pub fn new(handle: RemoteHandle, view_only: bool, kind: RemoteKind) -> Self {
+    pub fn new(handle: RemoteHandle, view_only: bool, kind: RemoteKind, report_resize: bool) -> Self {
         Self {
             handle,
             kind,
@@ -54,6 +62,10 @@ impl RemoteTab {
             buttons: 0,
             mods: Modifiers::default(),
             last_frame: std::time::Instant::now(),
+            report_resize,
+            resize_want: (0, 0),
+            resize_sent: (0, 0),
+            resize_deadline: None,
         }
     }
 
@@ -165,6 +177,12 @@ impl RemoteTab {
             Color32::WHITE,
         );
 
+        // Smart sizing: ask the server to match the pane's pixel size (debounced).
+        // Done after drawing so the `texture` borrow above has ended.
+        if self.report_resize {
+            self.maybe_request_resize(ui, resp.rect.size());
+        }
+
         if self.view_only {
             return;
         }
@@ -174,6 +192,38 @@ impl RemoteTab {
         self.handle_pointer(ui, &resp, draw_rect, scale);
         if resp.has_focus() {
             self.handle_keyboard(ui);
+        }
+    }
+
+    /// Smart sizing: converts the pane's point size to device pixels and, after a
+    /// short settle delay (so dragging the window doesn't spam the server), sends a
+    /// resize request to the backend. The backend applies it via RDP Display
+    /// Control, or ignores it if that isn't available.
+    fn maybe_request_resize(&mut self, ui: &egui::Ui, area_points: egui::Vec2) {
+        let ppp = ui.ctx().pixels_per_point();
+        let w = (area_points.x * ppp).round().clamp(1.0, 8192.0) as u16;
+        let h = (area_points.y * ppp).round().clamp(1.0, 8192.0) as u16;
+        // Re-arm the settle timer whenever the target moves by more than a pixel.
+        let moved = (i32::from(w) - i32::from(self.resize_want.0)).abs() > 1
+            || (i32::from(h) - i32::from(self.resize_want.1)).abs() > 1;
+        if moved {
+            self.resize_want = (w, h);
+            self.resize_deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
+        }
+        if let Some(deadline) = self.resize_deadline {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                self.resize_deadline = None;
+                if self.resize_want != self.resize_sent && self.resize_want.0 > 0 && self.resize_want.1 > 0
+                {
+                    self.resize_sent = self.resize_want;
+                    let (width, height) = self.resize_want;
+                    self.handle.send_input(RemoteInput::Resize { width, height });
+                }
+            } else {
+                ui.ctx().request_repaint_after(deadline - now);
+            }
         }
     }
 
