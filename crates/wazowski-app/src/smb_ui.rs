@@ -150,7 +150,9 @@ impl SmbBrowser {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+    /// Renders the browser and returns the natural width (points) of its file
+    /// list, so the containing pane can auto-size to it.
+    pub fn ui(&mut self, ui: &mut egui::Ui, ctx: &Context) -> f32 {
         self.poll(ctx);
         if !self.started {
             self.started = true;
@@ -214,7 +216,8 @@ impl SmbBrowser {
         ui.separator();
 
         let mut action: Option<Act> = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let out = egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             // Directories first, then files, each alphabetical.
             let mut order: Vec<usize> = (0..self.entries.len()).collect();
             order.sort_by(|&a, &b| {
@@ -280,6 +283,7 @@ impl SmbBrowser {
             }
             None => {}
         }
+        out.content_size.x
     }
 
     /// Downloads `name` from the current directory to a user-chosen path.

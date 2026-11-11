@@ -222,7 +222,9 @@ impl FileBrowser {
     }
 
     /// Renders the panel.
-    pub fn ui(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+    /// Renders the browser and returns the natural width (points) of its file
+    /// list, so the containing pane can auto-size to it.
+    pub fn ui(&mut self, ui: &mut egui::Ui, ctx: &Context) -> f32 {
         if !self.started {
             self.started = true;
             self.list(".".into(), ctx);
@@ -348,10 +350,10 @@ impl FileBrowser {
                 }
             });
         }
-        self.entry_list(ui, ctx);
+        self.entry_list(ui, ctx)
     }
 
-    fn entry_list(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+    fn entry_list(&mut self, ui: &mut egui::Ui, ctx: &Context) -> f32 {
         enum Act {
             Navigate(String),
             Open(String),
@@ -361,7 +363,8 @@ impl FileBrowser {
         }
         let mut act = None;
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let out = egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             for (i, entry) in self.entries.iter().enumerate() {
                 let icon = if entry.is_dir { "📁" } else { "📄" };
                 let label = if entry.is_dir {
@@ -425,6 +428,7 @@ impl FileBrowser {
             Some(Act::Delete(name, is_dir)) => self.delete(&name, is_dir, ctx),
             None => {}
         }
+        out.content_size.x
     }
 
     fn go_up(&mut self, ctx: &Context) {

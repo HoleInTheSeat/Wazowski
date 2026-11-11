@@ -1305,6 +1305,12 @@ pub struct App {
     filter_settings: String,
     /// Filter text for the Settings ▸ Keybindings list.
     filter_keybinds: String,
+    /// Natural width (points) of the current left pane's list content, measured
+    /// each frame so the pane can auto-size to it (clamped to a min/max).
+    pane_content_w: f32,
+    /// Measured width (points) of the icon rail, so the collapsed pane can size
+    /// to it with equal padding on both sides.
+    rail_w: f32,
     /// Master password remembered for "Paste password" this session (when the
     /// user ticked "Remember for this session"). Not persisted; cleared on quit.
     paste_pw_master: Option<String>,
@@ -1704,6 +1710,8 @@ impl App {
             filter_settings: String::new(),
             filter_keybinds: String::new(),
             paste_pw_master: None,
+            pane_content_w: 180.0,
+            rail_w: 40.0,
         };
         app.migrate_servers_one_per_kind();
         apply_visuals(ctx, app.dark_mode);
@@ -4084,20 +4092,39 @@ impl App {
         let mut clicked: Option<SidebarView> = None;
         // A vertical icon rail to switch views, beside the view's content.
         ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
+            let rail = ui.vertical(|ui| {
                 const SIZE: f32 = 26.0;
                 let icon = |glyph: &str, color: Color32| RichText::new(glyph).size(SIZE).color(color);
                 // Fill the full column height so Settings can pin to the bottom.
                 let full_height = ui.available_height();
                 ui.set_min_height(full_height);
-                let mut rail_button = |ui: &mut egui::Ui, view, glyph, color, tip: &str| {
+                // Track the widest button so the collapsed pane can size to it.
+                // Measuring the buttons (not the rail container, whose width depends
+                // on the panel width we derive from it) avoids a feedback wiggle.
+                let mut max_btn_w = 0.0f32;
+                let mut rail_button = |ui: &mut egui::Ui, view, glyph: &str, color, tip: &str| {
                     let hint = if prev == view && self.can_collapse_sidebar() {
                         let verb = if collapsed { "show" } else { "hide" };
                         format!("{tip} — click to {verb} the pane")
                     } else {
                         tip.to_owned()
                     };
-                    if ui.selectable_label(prev == view, icon(glyph, color)).on_hover_text(hint).clicked() {
+                    // Measure the glyph itself (galley + button padding) rather than
+                    // the response rect, which grows on hover (widget expansion) and
+                    // would make the collapsed pane wiggle as the mouse moves.
+                    let gw = ui
+                        .painter()
+                        .layout_no_wrap(
+                            glyph.to_owned(),
+                            egui::FontId::proportional(SIZE),
+                            Color32::WHITE,
+                        )
+                        .size()
+                        .x;
+                    max_btn_w = max_btn_w.max(gw + 2.0 * ui.spacing().button_padding.x);
+                    let resp =
+                        ui.selectable_label(prev == view, icon(glyph, color)).on_hover_text(hint);
+                    if resp.clicked() {
                         clicked = Some(view);
                     }
                 };
@@ -4124,7 +4151,10 @@ impl App {
                         "Settings",
                     );
                 });
+                max_btn_w
             });
+            // Record the widest rail button so the collapsed pane can size to it.
+            self.rail_w = rail.inner;
             // Hide the content pane when collapsed; the rail stays.
             if !collapsed {
                 ui.separator();
@@ -4185,11 +4215,15 @@ impl App {
         {
             self.settings_category = first;
         }
-        for (cat, label) in all {
-            if matches(cat, label) {
-                ui.selectable_value(&mut self.settings_category, cat, label);
+        let category = &mut self.settings_category;
+        let w = pane_scroll(ui, |ui| {
+            for (cat, label) in all {
+                if matches(cat, label) {
+                    ui.selectable_value(category, cat, label);
+                }
             }
-        }
+        });
+        self.pane_content_w = w;
     }
 
     /// The Tools view's left pane: server/network/host tool categories.
@@ -4228,7 +4262,7 @@ impl App {
                 ],
             ),
         ];
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let w = pane_scroll(ui, |ui| {
             for (category, items) in categories {
                 let matches: Vec<_> = items
                     .iter()
@@ -4247,6 +4281,7 @@ impl App {
                 ui.add_space(6.0);
             }
         });
+        self.pane_content_w = w;
     }
 
     /// The Vault view's left pane: credentials grouped by type.
@@ -4350,7 +4385,7 @@ impl App {
         }
         let mut act: Option<RowAct> = None;
         let selected_id = self.vault_selected.clone();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let w = pane_scroll(ui, |ui| {
             if passwords.is_empty() && keys.is_empty() && tokens.is_empty() {
                 let msg = if needle.is_empty() {
                     format!("No credentials yet. Click {} to add one.", icons::PLUS)
@@ -4404,6 +4439,7 @@ impl App {
                 }
             }
         });
+        self.pane_content_w = w;
         match act {
             Some(RowAct::Open(id)) => self.select_credential(&id),
             Some(RowAct::Duplicate(id)) => self.duplicate_credential(&id),
@@ -4526,6 +4562,8 @@ impl App {
             t.files.is_some() && matches!(&t.content, TabContent::Terminal(p) if p.count() == 1)
         });
 
+        // Measured list width (set by whichever branch renders a browser).
+        let mut measured: Option<f32> = None;
         if has_smb {
             let loc = self.tabs[self.active].smb.as_ref().map(|s| s.location()).unwrap_or_default();
             ui.heading("Files (SMB)");
@@ -4536,7 +4574,7 @@ impl App {
                 && let Some(smb) = &mut tab.smb
             {
                 smb.set_highlight(&highlight);
-                smb.ui(ui, ctx);
+                measured = Some(smb.ui(ui, ctx));
             }
         } else if has_sftp {
             ui.heading("Files (SFTP)");
@@ -4546,20 +4584,18 @@ impl App {
                 && let Some(files) = &mut tab.files
             {
                 files.set_highlight(&highlight);
-                files.ui(ui, ctx);
+                measured = Some(files.ui(ui, ctx));
             }
         } else {
             ui.heading("Files");
             filter_box(ui, &mut self.filter_files, focus);
             ui.separator();
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(
-                    "Open an SSH session (unsplit) for SFTP, or an RDP session for SMB (\\\\host\\C$), \
-                     to browse files here.",
-                )
-                .weak(),
-            );
+            // No session to browse — leave the body empty and let the pane shrink
+            // to its minimum width.
+            measured = Some(0.0);
+        }
+        if let Some(w) = measured {
+            self.pane_content_w = w;
         }
     }
 
@@ -4622,9 +4658,8 @@ impl App {
             });
 
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                self.session_tree(ui, ctx);
-            });
+            let w = pane_scroll(ui, |ui| self.session_tree(ui, ctx));
+            self.pane_content_w = w;
         });
     }
 
@@ -4648,7 +4683,7 @@ impl App {
         filter_box(ui, &mut self.filter_macros, focus);
         ui.separator();
         let needle = self.filter_macros.to_lowercase();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let w = pane_scroll(ui, |ui| {
             if self.macros.macros.is_empty() {
                 ui.label(RichText::new("No macros yet. Click + to add one.").weak());
             }
@@ -4696,6 +4731,7 @@ impl App {
                     });
             }
         });
+        self.pane_content_w = w;
         match act {
             Some(Act::Run(i, target)) => self.dialog = Dialog::ConfirmMacro { index: i, target },
             Some(Act::Edit(i)) => {
@@ -5006,14 +5042,16 @@ impl App {
             }
             TreeAction::Delete(store, id) => self.store_remove(&store, &id),
             TreeAction::Duplicate(store, id) => {
+                // Don't create the copy outright; open the New-session dialog
+                // pre-populated from the original so the user can tweak and save.
                 if let Some(original) = self.session_in(&store, &id) {
-                    let mut copy = original.clone();
-                    copy.id = Session::new("", "", "").id; // fresh id
-                    copy.name = format!("{} copy", original.name);
-                    self.store_upsert(&store, copy)
-                } else {
-                    Ok(())
+                    let mut form = SessionForm::from_session(&original);
+                    form.id = None; // a fresh session on save, not an edit
+                    form.name = format!("{} copy", original.name);
+                    form.target = store;
+                    self.dialog = Dialog::EditSession(form);
                 }
+                Ok(())
             }
             TreeAction::MoveTo { from, id, to, folder } => {
                 if from == to {
@@ -11717,12 +11755,22 @@ impl eframe::App for App {
             .show(ui, |ui| self.title_bar(ui, &ctx))
             .response
             .rect;
-        // Collapse the pane to just the icon rail when the user hid it.
+        // Collapse the pane to just the icon rail when the user hid it; otherwise
+        // auto-size it to the current pane's content, clamped to a sane range.
+        // Widths are in points, so they already scale with the interface-scale
+        // setting (which zooms the whole UI).
         let left = egui::Panel::left("sessions");
         let left = if self.sidebar_collapsed && self.can_collapse_sidebar() {
-            left.resizable(false).default_size(48.0).size_range(48.0..=48.0)
+            // Rail width + the panel frame's 8pt horizontal margin on each side, so
+            // the collapsed icon has equal padding left and right.
+            left.resizable(false).exact_size(self.rail_w + 16.0)
         } else {
-            left.resizable(true).default_size(240.0).size_range(160.0..=420.0)
+            // Rail + separators + margins around the measured list content.
+            const CHROME: f32 = 58.0;
+            const MIN_W: f32 = 200.0;
+            const MAX_W: f32 = 480.0;
+            let w = (self.pane_content_w + CHROME).clamp(MIN_W, MAX_W);
+            left.resizable(false).exact_size(w)
         };
         left.show(ui, |ui| self.sidebar(ui, &ctx));
         egui::Panel::top("tabs").show(ui, |ui| self.tab_strip(ui));
@@ -12974,6 +13022,20 @@ fn entered(ui: &egui::Ui, resp: &egui::Response) -> bool {
 /// Keys not allowed as a shortcut's main key. egui reports Ctrl/Alt/Shift via
 /// `Modifiers` rather than as `Key`s, so only Escape needs excluding here (it
 /// cancels capture instead of becoming a binding).
+/// Renders a left-pane list inside a two-axis scroll area with no word wrap, and
+/// returns the natural width (points) of its content so the pane can auto-size to
+/// it. A plain wheel scrolls vertically; Shift+wheel scrolls horizontally (egui's
+/// default for a two-axis scroll area). When the content is wider than the pane's
+/// max width, the horizontal scrollbar appears at the bottom of the pane.
+fn pane_scroll(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> f32 {
+    let out = egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        // Never wrap: long session/folder names extend and the pane scrolls.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        add(ui);
+    });
+    out.content_size.x
+}
+
 fn is_modifier_key(key: Key) -> bool {
     matches!(
         key,
