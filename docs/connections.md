@@ -45,6 +45,12 @@ RDP sessions render **inside a Wazowski tab** — no external client. (Built on
   (default), or *Quality* (full color, themes/font smoothing). Lower quality
   helps on slow links or when scrolling lots of text.
 - **Resolution**: set a fixed width×height, or leave blank to fit the window.
+- **Smart sizing**: when ticked, the remote desktop's resolution follows the
+  Wazowski window — it re-renders to match the pane as you resize (crisp, not
+  scaled), using RDP's Display Control channel. The resolution above is the
+  initial size and the fallback if the server doesn't support dynamic resize
+  (the session simply stays at that resolution). Resizes are debounced, so the
+  server is only asked once you stop dragging.
 - **Domain**: optional Windows domain.
 - A session with no stored password prompts at connect time.
 

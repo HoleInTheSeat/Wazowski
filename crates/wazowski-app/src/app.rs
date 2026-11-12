@@ -1096,6 +1096,8 @@ struct SessionForm {
     rdp_height: String,
     /// RDP: visual-quality / bandwidth trade-off.
     rdp_quality: RdpQuality,
+    /// RDP: match the remote resolution to the window (Display Control).
+    rdp_smart_sizing: bool,
     error: Option<String>,
     /// Which store to save into.
     target: StoreId,
@@ -2135,8 +2137,9 @@ impl App {
                     session.rdp_height,
                     false,
                     to_remote_rdp_quality(session.rdp_quality),
+                    session.rdp_smart_sizing,
                 );
-                let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
+                let tab = RemoteTab::new(handle, false, RemoteKind::Rdp, session.rdp_smart_sizing);
                 // Link the tab to its saved session (if any) so it gets a tooltip.
                 let sid = self.saved_session_id(session);
                 self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
@@ -2155,7 +2158,7 @@ impl App {
                     },
                 };
                 let handle = connect_vnc(&session.host, session.port, password, options);
-                let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc);
+                let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc, false);
                 let sid = self.saved_session_id(session);
                 self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
                 self.tabs[self.active].session_id = sid;
@@ -8315,7 +8318,7 @@ impl App {
                 },
             };
             let handle = connect_vnc(&session.host, session.port, pw, options);
-            let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc);
+            let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc, false);
             let sid = self.saved_session_id(&session);
             self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
             self.tabs[self.active].session_id = sid;
@@ -8339,8 +8342,9 @@ impl App {
                 session.rdp_height,
                 false,
                 to_remote_rdp_quality(session.rdp_quality),
+                session.rdp_smart_sizing,
             );
-            let tab = RemoteTab::new(handle, false, RemoteKind::Rdp);
+            let tab = RemoteTab::new(handle, false, RemoteKind::Rdp, session.rdp_smart_sizing);
             let sid = self.saved_session_id(&session);
             self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
             self.tabs[self.active].session_id = sid;
@@ -10689,6 +10693,12 @@ impl App {
                                     .hint_text("height"),
                             );
                             ui.label(RichText::new("(blank = fit)").weak());
+                            ui.separator();
+                            ui.checkbox(&mut form.rdp_smart_sizing, "Smart sizing").on_hover_text(
+                                "Match the remote resolution to the window as you resize it. \
+                                 The resolution above is the initial size and the fallback if \
+                                 the server doesn't support dynamic resize.",
+                            );
                         });
                         ui.end_row();
                         ui.label("Quality");
@@ -10932,6 +10942,7 @@ impl App {
         let rdp_width = form.rdp_width.trim().parse().unwrap_or(0);
         let rdp_height = form.rdp_height.trim().parse().unwrap_or(0);
         let rdp_quality = form.rdp_quality;
+        let rdp_smart_sizing = form.rdp_smart_sizing;
         let (source, entry, new_kind, new_name, secret_input, key_passphrase) = (
             form.source,
             form.entry.clone(),
@@ -10967,6 +10978,7 @@ impl App {
         session.rdp_width = rdp_width;
         session.rdp_height = rdp_height;
         session.rdp_quality = rdp_quality;
+        session.rdp_smart_sizing = rdp_smart_sizing;
 
         // Prompt-everytime stores nothing; Vault references an entry by its
         // stable id (so the entry can be renamed later without breaking the link).
@@ -11862,6 +11874,7 @@ impl SessionForm {
             rdp_width: String::new(),
             rdp_height: String::new(),
             rdp_quality: RdpQuality::default(),
+            rdp_smart_sizing: false,
             error: None,
             target: StoreId::Local,
         }
@@ -11901,6 +11914,7 @@ impl SessionForm {
             rdp_width: if session.rdp_width == 0 { String::new() } else { session.rdp_width.to_string() },
             rdp_height: if session.rdp_height == 0 { String::new() } else { session.rdp_height.to_string() },
             rdp_quality: session.rdp_quality,
+            rdp_smart_sizing: session.rdp_smart_sizing,
             error: None,
             target: StoreId::Local,
         }

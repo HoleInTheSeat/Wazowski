@@ -48,6 +48,9 @@ pub enum RemoteInput {
     Pointer { x: u16, y: u16, buttons: u8 },
     /// A key transition, by X11 keysym.
     Key { keysym: u32, down: bool },
+    /// Request the remote desktop resize to these pixel dimensions (RDP Display
+    /// Control / smart sizing). Ignored by backends that don't support it.
+    Resize { width: u16, height: u16 },
 }
 
 /// Per-protocol connection options.
@@ -192,6 +195,7 @@ pub fn connect_rdp(
     height: u16,
     view_only: bool,
     quality: RdpQuality,
+    smart_sizing: bool,
 ) -> RemoteHandle {
     let frame = Arc::new(Mutex::new(FrameBuf::default()));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -208,6 +212,7 @@ pub fn connect_rdp(
         height,
         view_only,
         quality,
+        smart_sizing,
     };
     let active = Arc::new(AtomicBool::new(true));
     let frame_bg = Arc::clone(&frame);

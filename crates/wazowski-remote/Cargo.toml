@@ -15,7 +15,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 # (connector 0.10 / session 0.11 / pdu 0.9). The connector's transitive `picky` is
 # patched (see the workspace `[patch.crates-io]`) to drop a pre-release curve25519
 # pin that otherwise conflicts with russh.
-ironrdp = { version = "0.17", default-features = false, features = ["connector", "session", "graphics", "input", "svc", "dvc", "pdu", "core"] }
+ironrdp = { version = "0.17", default-features = false, features = ["connector", "session", "graphics", "input", "svc", "dvc", "displaycontrol", "pdu", "core"] }
 ironrdp-tokio = "0.10"
 # native-tls (system TLS) rather than rustls for RDP: rustls only negotiates
 # ECDHE+AEAD cipher suites, which older Windows/SChannel RDP hosts (e.g. Server

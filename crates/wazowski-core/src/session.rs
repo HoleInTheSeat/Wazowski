@@ -168,6 +168,11 @@ pub struct Session {
     /// RDP: visual-quality / bandwidth trade-off.
     #[serde(default)]
     pub rdp_quality: RdpQuality,
+    /// RDP: ask the server to match its resolution to the window as it's resized
+    /// (Display Control / dynamic resize). The `rdp_width`/`rdp_height` above are
+    /// the initial size and the fallback if dynamic resize isn't available.
+    #[serde(default)]
+    pub rdp_smart_sizing: bool,
 }
 
 /// RDP visual-quality / bandwidth trade-off.
@@ -222,6 +227,7 @@ impl Session {
             rdp_width: 0,
             rdp_height: 0,
             rdp_quality: RdpQuality::default(),
+            rdp_smart_sizing: false,
         }
     }
 
