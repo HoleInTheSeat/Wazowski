@@ -13,6 +13,8 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.platform }}
+    # TEMP (macOS-only test beta): skip the Linux/Windows raw-binary builds.
+    if: false
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -62,6 +64,8 @@ jobs:
 
   package-linux:
     name: Package Linux (RPM + AppImage)
+    # TEMP (macOS-only test beta): skip Linux packaging.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -136,6 +140,8 @@ jobs:
 
   package-windows:
     name: Package Windows (installer)
+    # TEMP (macOS-only test beta): skip Windows packaging.
+    if: false
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -264,7 +270,9 @@ jobs:
     # never got a runner (a frequent macOS arm64 capacity issue). The Linux and
     # Windows artifacts still publish; the macOS .app/.dmg + binary are included
     # if that job managed to run, and can be backfilled by re-running it later.
-    if: ${{ !cancelled() && needs.package-linux.result == 'success' }}
+    # TEMP (macOS-only test beta): publish when the macOS job succeeded (Linux is
+    # skipped). Restore `needs.package-linux.result == 'success'` for full releases.
+    if: ${{ !cancelled() && needs.package-macos.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
