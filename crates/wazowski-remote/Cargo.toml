@@ -17,10 +17,6 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 # pin that otherwise conflicts with russh.
 ironrdp = { version = "0.17", default-features = false, features = ["connector", "session", "graphics", "input", "svc", "dvc", "displaycontrol", "pdu", "core"] }
 ironrdp-tokio = "0.10"
-# Bulk (de)compressor, needed to rebuild the fast-path processor after a
-# dynamic-resize reactivation (Display Control). Mirrors what ironrdp-session
-# does internally from the negotiated compression type.
-ironrdp-bulk = "0.1"
 # native-tls (system TLS) rather than rustls for RDP: rustls only negotiates
 # ECDHE+AEAD cipher suites, which older Windows/SChannel RDP hosts (e.g. Server
 # 2012-era, ECDHE-CBC + RSA-GCM only) don't offer — so rustls can't connect while

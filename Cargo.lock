@@ -7301,7 +7301,6 @@ version = "2.7.0"
 dependencies = [
  "anyhow",
  "ironrdp",
- "ironrdp-bulk",
  "ironrdp-tls",
  "ironrdp-tokio",
  "log",

@@ -44,23 +44,6 @@ fn clamp_rdp_size(width: u16, height: u16) -> (u32, u32) {
     (w, h)
 }
 
-/// Builds the bulk decompressor for a negotiated compression type, mirroring
-/// `ironrdp-session`'s own logic, so the fast-path processor can be rebuilt after
-/// a dynamic-resize reactivation.
-fn bulk_decompressor(
-    ct: Option<ironrdp::pdu::rdp::client_info::CompressionType>,
-) -> Option<ironrdp_bulk::BulkCompressor> {
-    use ironrdp::pdu::rdp::client_info::CompressionType as Pct;
-    use ironrdp_bulk::CompressionType as Bct;
-    let ct = ct?;
-    let bct = match ct {
-        Pct::K8 => Bct::Rdp4,
-        Pct::K64 => Bct::Rdp5,
-        Pct::Rdp6 => Bct::Rdp6,
-        Pct::Rdp61 => Bct::Rdp61,
-    };
-    ironrdp_bulk::BulkCompressor::new(bct).ok()
-}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
@@ -229,11 +212,10 @@ async fn run_inner(
         desktop.width,
         desktop.height,
     );
-    // Kept for rebuilding the fast-path processor after a dynamic-resize
-    // reactivation (channel ids and compression don't change on reactivation).
+    // Kept for driving the Deactivation-Reactivation sequence on a dynamic resize
+    // (the channel ids don't change on reactivation).
     let io_channel_id = result.io_channel_id;
     let user_channel_id = result.user_channel_id;
-    let compression_type = result.compression_type;
     let mut active = ActiveStageBuilder {
         static_channels: result.static_channels,
         user_channel_id: result.user_channel_id,
@@ -257,9 +239,52 @@ async fn run_inner(
     let mut publish_timer = tokio::time::interval(Duration::from_millis(16));
     publish_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Smart sizing: the latest requested size not yet applied. Held (and retried
+    // each loop iteration) until the Display Control channel is ready — on first
+    // connect it usually isn't ready for the first few hundred ms, so a one-shot
+    // send would be dropped and the window would never fit.
+    let mut want_resize: Option<(u32, u32)> = None;
+
     'session: loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Flush a pending smart-size request once the Display Control channel has
+        // received the server's capabilities and the target differs from the
+        // current desktop size. Sending before capabilities arrive is silently
+        // ignored by the server (per RDPEDISP), so we must wait for `ready()`,
+        // not just an open channel — otherwise the first request after connect is
+        // dropped and the window never fits.
+        if let Some((w, h)) = want_resize {
+            if w == u32::from(image.width()) && h == u32::from(image.height()) {
+                want_resize = None; // already that size
+            } else {
+                use ironrdp::displaycontrol::client::DisplayControlClient;
+                let ready = active
+                    .get_dvc::<DisplayControlClient>()
+                    .and_then(|dvc| dvc.channel_processor_downcast_ref::<DisplayControlClient>())
+                    .is_some_and(|dc| dc.ready());
+                if ready {
+                    match active.encode_resize(w, h, None, None) {
+                        Some(Ok(bytes)) => {
+                            log::debug!("RDP smart-size: requesting {w}x{h} ({} bytes)", bytes.len());
+                            use ironrdp_tokio::FramedWrite;
+                            upgraded_framed
+                                .write_all(&bytes)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("RDP resize write: {e}"))?;
+                            want_resize = None;
+                        }
+                        Some(Err(e)) => {
+                            log::warn!("RDP smart-size encode failed: {e}");
+                            want_resize = None;
+                        }
+                        None => {}
+                    }
+                }
+                // else: capabilities not received yet — keep and retry.
+            }
         }
 
         let outputs = tokio::select! {
@@ -277,20 +302,11 @@ async fn run_inner(
                 let Some(input) = input else { break };
                 match input {
                     RemoteInput::Resize { width, height } => {
-                        // Smart sizing: ask the server to match the window. If the
-                        // Display Control channel isn't up (not enabled, or the
-                        // server declined), `encode_resize` returns None and we
-                        // simply stay at the current resolution (the fallback).
+                        // Record the desired size; it's actually sent (and retried
+                        // until the Display Control channel is ready) by the flush
+                        // step below. Newest request wins.
                         if params.smart_sizing {
-                            let (w, h) = clamp_rdp_size(width, height);
-                            if let Some(res) = active.encode_resize(w, h, None, None) {
-                                let bytes = res.map_err(|e| anyhow::anyhow!("RDP resize: {e}"))?;
-                                use ironrdp_tokio::FramedWrite;
-                                upgraded_framed
-                                    .write_all(&bytes)
-                                    .await
-                                    .map_err(|e| anyhow::anyhow!("RDP resize write: {e}"))?;
-                            }
+                            want_resize = Some(clamp_rdp_size(width, height));
                         }
                         Vec::new()
                     }
@@ -311,8 +327,16 @@ async fn run_inner(
             }
             pdu = upgraded_framed.read_pdu() => {
                 let (action, payload) = pdu.map_err(|e| anyhow::anyhow!("RDP read: {e}"))?;
-                active.process(&mut image, action, &payload)
-                    .map_err(|e| anyhow::anyhow!("RDP process: {e}"))?
+                match active.process(&mut image, action, &payload) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        log::error!(
+                            "RDP process failed: action={action:?} payload_len={} err={e:?}",
+                            payload.len()
+                        );
+                        return Err(anyhow::anyhow!("RDP process: {e}"));
+                    }
+                }
             }
         };
 
@@ -336,39 +360,42 @@ async fn run_inner(
                     use ironrdp::connector::connection_activation::{
                         ConnectionActivationSequence, ConnectionActivationState,
                     };
+                    log::debug!("RDP: DeactivateAll received — starting reactivation");
                     let mut seq = ConnectionActivationSequence::new(
                         config.clone(),
                         io_channel_id,
                         user_channel_id,
                     );
                     let mut buf = ironrdp::core::WriteBuf::new();
+                    let mut steps = 0u32;
                     loop {
                         ironrdp_tokio::single_sequence_step(&mut upgraded_framed, &mut seq, &mut buf)
                             .await
                             .map_err(|e| anyhow::anyhow!("RDP reactivation: {e}"))?;
+                        steps += 1;
                         if let ConnectionActivationState::Finalized {
                             desktop_size,
                             share_id,
                             enable_server_pointer,
-                            pointer_software_rendering,
+                            ..
                         } = seq.connection_activation_state()
                         {
+                            log::debug!(
+                                "RDP: reactivation finalized after {steps} steps: {}x{} share_id={share_id} server_pointer={enable_server_pointer}",
+                                desktop_size.width,
+                                desktop_size.height,
+                            );
                             image = DecodedImage::new(
                                 ironrdp::graphics::image_processing::PixelFormat::RgbA32,
                                 desktop_size.width,
                                 desktop_size.height,
                             );
-                            active.set_fastpath_processor(
-                                ironrdp::session::fast_path::ProcessorBuilder {
-                                    io_channel_id,
-                                    user_channel_id,
-                                    share_id,
-                                    enable_server_pointer,
-                                    pointer_software_rendering,
-                                    bulk_decompressor: bulk_decompressor(compression_type),
-                                }
-                                .build(),
-                            );
+                            // Keep the existing fast-path processor: a resize is a
+                            // Deactivation-Reactivation over the *same* connection, so
+                            // its bulk-decompressor history (the MPPC sliding window)
+                            // must carry over — rebuilding it fresh corrupts the
+                            // decompression of later updates. Only the share id and the
+                            // server-pointer flag can change; channel ids don't.
                             active.set_share_id(share_id);
                             active.set_enable_server_pointer(enable_server_pointer);
                             let _ = ev_tx
