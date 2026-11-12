@@ -56,7 +56,7 @@ base64 = "0.23"
 open = "5"
 fs2 = "0.4"
 png = "0.18"
-ureq = "2"
+ureq = "3"
 self-replace.workspace = true
 if-addrs.workspace = true
 # Writing a .zip of the exploded session tree (Export Local sessions). Pure-Rust
