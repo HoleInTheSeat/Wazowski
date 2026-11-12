@@ -128,11 +128,12 @@ fn is_writable(path: &Path) -> bool {
 pub fn latest_release() -> Result<Release> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let body = ureq::get(&url)
-        .set("User-Agent", USER_AGENT)
-        .set("Accept", "application/vnd.github+json")
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/vnd.github+json")
         .call()
         .context("could not reach GitHub")?
-        .into_string()
+        .into_body()
+        .read_to_string()
         .context("could not read the release response")?;
     let rel: ReleaseJson =
         serde_json::from_str(&body).context("could not parse the release data")?;
@@ -265,9 +266,10 @@ pub fn download_and_apply(release: &Release, kind: &InstallKind) -> Result<()> {
         .tempfile_in(dir)
         .context("could not create a temp file for the download")?;
     let mut reader = ureq::get(&asset.browser_download_url)
-        .set("User-Agent", USER_AGENT)
+        .header("User-Agent", USER_AGENT)
         .call()
         .context("could not download the update")?
+        .into_body()
         .into_reader();
     std::io::copy(&mut reader, tmp.as_file_mut()).context("could not save the download")?;
     tmp.as_file_mut().sync_all().ok();
@@ -314,10 +316,11 @@ fn install_rpm(release: &Release) -> Result<()> {
         // Download to a temp file readable by root (pkexec runs the installer as root).
         let path = std::env::temp_dir().join(&asset.name);
         let mut reader = ureq::get(&asset.browser_download_url)
-            .set("User-Agent", USER_AGENT)
-            .call()
+        .header("User-Agent", USER_AGENT)
+        .call()
             .context("could not download the update")?
-            .into_reader();
+        .into_body()
+        .into_reader();
         let mut file =
             std::fs::File::create(&path).context("could not save the downloaded .rpm")?;
         std::io::copy(&mut reader, &mut file).context("could not save the downloaded .rpm")?;

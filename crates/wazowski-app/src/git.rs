@@ -412,13 +412,16 @@ fn os_username() -> String {
 /// commit links to that GitHub user. `None` on any network/parse failure.
 fn github_identity(token: &str) -> Option<(String, String)> {
     let body = ureq::get("https://api.github.com/user")
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("User-Agent", "Wazowski")
-        .set("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(5))
+        .config()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "Wazowski")
+        .header("Accept", "application/vnd.github+json")
         .call()
         .ok()?
-        .into_string()
+        .into_body()
+        .read_to_string()
         .ok()?;
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;
     let login = json.get("login")?.as_str()?.to_owned();

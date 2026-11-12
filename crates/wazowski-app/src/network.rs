@@ -461,15 +461,15 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-fn into_response(resp: ureq::Response) -> HttpResponse {
-    let status = resp.status();
-    let status_text = resp.status_text().to_owned();
+fn into_response(resp: ureq::http::Response<ureq::Body>) -> HttpResponse {
+    let status = resp.status().as_u16();
+    let status_text = resp.status().canonical_reason().unwrap_or("").to_owned();
     let headers = resp
-        .headers_names()
+        .headers()
         .iter()
-        .filter_map(|n| resp.header(n).map(|v| (n.clone(), v.to_owned())))
+        .map(|(n, v)| (n.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
         .collect();
-    let body = resp.into_string().unwrap_or_default();
+    let body = resp.into_body().read_to_string().unwrap_or_default();
     HttpResponse { status, status_text, headers, body }
 }
 
@@ -477,30 +477,37 @@ fn into_response(resp: ureq::Response) -> HttpResponse {
 /// (with their status and body) so the UI can display them; only transport
 /// errors become `Err`.
 pub fn http_fetch(req: HttpRequest) -> Result<HttpResponse, String> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
-    let mut r = agent.request(&req.method, &req.url);
+    // `http_status_as_error(false)` makes ureq return non-2xx responses as `Ok`
+    // (instead of an error), so the UI can show their status and body.
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+
+    let method = ureq::http::Method::from_bytes(req.method.as_bytes())
+        .map_err(|_| format!("invalid HTTP method: {}", req.method))?;
+    let mut builder = ureq::http::Request::builder().method(method).uri(&req.url);
     for (k, v) in &req.headers {
-        r = r.set(k, v);
+        builder = builder.header(k, v);
     }
-    let result = match &req.body {
-        Some(b) if !b.is_empty() => r.send_string(b),
-        _ => r.call(),
-    };
-    match result {
-        Ok(resp) => Ok(into_response(resp)),
-        Err(ureq::Error::Status(_, resp)) => Ok(into_response(resp)),
-        Err(e) => Err(e.to_string()),
-    }
+    let body = req.body.clone().unwrap_or_default();
+    let request = builder.body(body).map_err(|e| e.to_string())?;
+    agent.run(request).map(into_response).map_err(|e| e.to_string())
 }
 
 /// Looks up this machine's public IP via api.ipify.org (an external query).
 pub fn public_ip() -> Result<String, String> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
     agent
         .get("https://api.ipify.org")
         .call()
         .map_err(|e| e.to_string())?
-        .into_string()
+        .into_body()
+        .read_to_string()
         .map(|s| s.trim().to_owned())
         .map_err(|e| e.to_string())
 }
