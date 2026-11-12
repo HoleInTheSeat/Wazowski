@@ -42,6 +42,9 @@ pub struct RemoteTab {
     /// RDP smart sizing: when set, the pane's pixel size is sent to the backend
     /// (debounced) so the server matches its resolution to the window.
     report_resize: bool,
+    /// RDP DPI scale percent sent with a resize; `0` = auto (follow the display's
+    /// scale factor, so HiDPI/Retina text stays readable).
+    rdp_scale: u16,
     /// Debounce state for smart sizing: the size we want, the last size actually
     /// sent, and when the pending size should be sent.
     resize_want: (u16, u16),
@@ -50,7 +53,13 @@ pub struct RemoteTab {
 }
 
 impl RemoteTab {
-    pub fn new(handle: RemoteHandle, view_only: bool, kind: RemoteKind, report_resize: bool) -> Self {
+    pub fn new(
+        handle: RemoteHandle,
+        view_only: bool,
+        kind: RemoteKind,
+        report_resize: bool,
+        rdp_scale: u16,
+    ) -> Self {
         Self {
             handle,
             kind,
@@ -63,6 +72,7 @@ impl RemoteTab {
             mods: Modifiers::default(),
             last_frame: std::time::Instant::now(),
             report_resize,
+            rdp_scale,
             resize_want: (0, 0),
             resize_sent: (0, 0),
             resize_deadline: None,
@@ -219,7 +229,14 @@ impl RemoteTab {
                 {
                     self.resize_sent = self.resize_want;
                     let (width, height) = self.resize_want;
-                    self.handle.send_input(RemoteInput::Resize { width, height });
+                    // Auto (0): match the display's scale so the remote renders at
+                    // the right physical size on HiDPI/Retina; otherwise the override.
+                    let scale_percent = if self.rdp_scale == 0 {
+                        (ppp * 100.0).round().clamp(100.0, 500.0) as u16
+                    } else {
+                        self.rdp_scale.clamp(100, 500)
+                    };
+                    self.handle.send_input(RemoteInput::Resize { width, height, scale_percent });
                 }
             } else {
                 ui.ctx().request_repaint_after(deadline - now);

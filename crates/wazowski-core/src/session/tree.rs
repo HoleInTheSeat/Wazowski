@@ -82,6 +82,8 @@ struct SessionDoc {
     rdp_quality: RdpQuality,
     #[serde(default, skip_serializing_if = "is_false")]
     rdp_smart_sizing: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    rdp_scale: u16,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -112,6 +114,7 @@ impl SessionDoc {
             rdp_height: s.rdp_height,
             rdp_quality: s.rdp_quality,
             rdp_smart_sizing: s.rdp_smart_sizing,
+            rdp_scale: s.rdp_scale,
         }
     }
 
@@ -140,6 +143,7 @@ impl SessionDoc {
             rdp_height: self.rdp_height,
             rdp_quality: self.rdp_quality,
             rdp_smart_sizing: self.rdp_smart_sizing,
+            rdp_scale: self.rdp_scale,
         }
     }
 }

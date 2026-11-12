@@ -243,7 +243,9 @@ async fn run_inner(
     // each loop iteration) until the Display Control channel is ready — on first
     // connect it usually isn't ready for the first few hundred ms, so a one-shot
     // send would be dropped and the window would never fit.
-    let mut want_resize: Option<(u32, u32)> = None;
+    // (width, height, scale_percent) of the pending / last-applied resize.
+    let mut want_resize: Option<(u32, u32, u16)> = None;
+    let mut last_resize: Option<(u32, u32, u16)> = None;
 
     'session: loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -251,14 +253,13 @@ async fn run_inner(
         }
 
         // Flush a pending smart-size request once the Display Control channel has
-        // received the server's capabilities and the target differs from the
-        // current desktop size. Sending before capabilities arrive is silently
-        // ignored by the server (per RDPEDISP), so we must wait for `ready()`,
-        // not just an open channel — otherwise the first request after connect is
-        // dropped and the window never fits.
-        if let Some((w, h)) = want_resize {
-            if w == u32::from(image.width()) && h == u32::from(image.height()) {
-                want_resize = None; // already that size
+        // received the server's capabilities. Sending before capabilities arrive is
+        // silently ignored by the server (per RDPEDISP), so we must wait for
+        // `ready()`, not just an open channel — otherwise the first request after
+        // connect is dropped and the window never fits.
+        if let Some(want) = want_resize {
+            if Some(want) == last_resize {
+                want_resize = None; // already applied
             } else {
                 use ironrdp::displaycontrol::client::DisplayControlClient;
                 let ready = active
@@ -266,14 +267,19 @@ async fn run_inner(
                     .and_then(|dvc| dvc.channel_processor_downcast_ref::<DisplayControlClient>())
                     .is_some_and(|dc| dc.ready());
                 if ready {
-                    match active.encode_resize(w, h, None, None) {
+                    let (w, h, scale) = want;
+                    match active.encode_resize(w, h, Some(u32::from(scale)), None) {
                         Some(Ok(bytes)) => {
-                            log::debug!("RDP smart-size: requesting {w}x{h} ({} bytes)", bytes.len());
+                            log::debug!(
+                                "RDP smart-size: requesting {w}x{h} @ {scale}% ({} bytes)",
+                                bytes.len()
+                            );
                             use ironrdp_tokio::FramedWrite;
                             upgraded_framed
                                 .write_all(&bytes)
                                 .await
                                 .map_err(|e| anyhow::anyhow!("RDP resize write: {e}"))?;
+                            last_resize = Some(want);
                             want_resize = None;
                         }
                         Some(Err(e)) => {
@@ -301,12 +307,13 @@ async fn run_inner(
             input = in_rx.recv() => {
                 let Some(input) = input else { break };
                 match input {
-                    RemoteInput::Resize { width, height } => {
+                    RemoteInput::Resize { width, height, scale_percent } => {
                         // Record the desired size; it's actually sent (and retried
                         // until the Display Control channel is ready) by the flush
                         // step below. Newest request wins.
                         if params.smart_sizing {
-                            want_resize = Some(clamp_rdp_size(width, height));
+                            let (w, h) = clamp_rdp_size(width, height);
+                            want_resize = Some((w, h, scale_percent.clamp(100, 500)));
                         }
                         Vec::new()
                     }

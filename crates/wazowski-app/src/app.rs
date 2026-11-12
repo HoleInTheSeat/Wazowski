@@ -1098,6 +1098,8 @@ struct SessionForm {
     rdp_quality: RdpQuality,
     /// RDP: match the remote resolution to the window (Display Control).
     rdp_smart_sizing: bool,
+    /// RDP: smart-sizing DPI scale percent; `0` = auto (follow the display).
+    rdp_scale: u16,
     error: Option<String>,
     /// Which store to save into.
     target: StoreId,
@@ -2139,7 +2141,7 @@ impl App {
                     to_remote_rdp_quality(session.rdp_quality),
                     session.rdp_smart_sizing,
                 );
-                let tab = RemoteTab::new(handle, false, RemoteKind::Rdp, session.rdp_smart_sizing);
+                let tab = RemoteTab::new(handle, false, RemoteKind::Rdp, session.rdp_smart_sizing, session.rdp_scale);
                 // Link the tab to its saved session (if any) so it gets a tooltip.
                 let sid = self.saved_session_id(session);
                 self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
@@ -2158,7 +2160,7 @@ impl App {
                     },
                 };
                 let handle = connect_vnc(&session.host, session.port, password, options);
-                let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc, false);
+                let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc, false, 0);
                 let sid = self.saved_session_id(session);
                 self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
                 self.tabs[self.active].session_id = sid;
@@ -8318,7 +8320,7 @@ impl App {
                 },
             };
             let handle = connect_vnc(&session.host, session.port, pw, options);
-            let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc, false);
+            let tab = RemoteTab::new(handle, session.vnc_view_only, RemoteKind::Vnc, false, 0);
             let sid = self.saved_session_id(&session);
             self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
             self.tabs[self.active].session_id = sid;
@@ -8344,7 +8346,7 @@ impl App {
                 to_remote_rdp_quality(session.rdp_quality),
                 session.rdp_smart_sizing,
             );
-            let tab = RemoteTab::new(handle, false, RemoteKind::Rdp, session.rdp_smart_sizing);
+            let tab = RemoteTab::new(handle, false, RemoteKind::Rdp, session.rdp_smart_sizing, session.rdp_scale);
             let sid = self.saved_session_id(&session);
             self.push_tab(session.name.clone(), TabContent::Remote(Box::new(tab)), None);
             self.tabs[self.active].session_id = sid;
@@ -10701,6 +10703,29 @@ impl App {
                             );
                         });
                         ui.end_row();
+                        ui.label("Scale");
+                        ui.add_enabled_ui(form.rdp_smart_sizing, |ui| {
+                            let label = if form.rdp_scale == 0 {
+                                "Auto".to_owned()
+                            } else {
+                                format!("{}%", form.rdp_scale)
+                            };
+                            egui::ComboBox::from_id_salt("rdp-scale")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut form.rdp_scale, 0, "Auto");
+                                    for p in [100u16, 125, 150, 175, 200] {
+                                        ui.selectable_value(&mut form.rdp_scale, p, format!("{p}%"));
+                                    }
+                                });
+                        })
+                        .response
+                        .on_hover_text(
+                            "DPI scale the remote renders at while smart sizing. Auto follows your \
+                             display (e.g. 200% on a Retina screen) so text stays a readable size. \
+                             Applies only with Smart sizing, and only if the server supports it.",
+                        );
+                        ui.end_row();
                         ui.label("Quality");
                         egui::ComboBox::from_id_salt("rdp-quality")
                             .selected_text(rdp_quality_label(form.rdp_quality))
@@ -10943,6 +10968,7 @@ impl App {
         let rdp_height = form.rdp_height.trim().parse().unwrap_or(0);
         let rdp_quality = form.rdp_quality;
         let rdp_smart_sizing = form.rdp_smart_sizing;
+        let rdp_scale = form.rdp_scale;
         let (source, entry, new_kind, new_name, secret_input, key_passphrase) = (
             form.source,
             form.entry.clone(),
@@ -10979,6 +11005,7 @@ impl App {
         session.rdp_height = rdp_height;
         session.rdp_quality = rdp_quality;
         session.rdp_smart_sizing = rdp_smart_sizing;
+        session.rdp_scale = rdp_scale;
 
         // Prompt-everytime stores nothing; Vault references an entry by its
         // stable id (so the entry can be renamed later without breaking the link).
@@ -11875,6 +11902,7 @@ impl SessionForm {
             rdp_height: String::new(),
             rdp_quality: RdpQuality::default(),
             rdp_smart_sizing: false,
+            rdp_scale: 0,
             error: None,
             target: StoreId::Local,
         }
@@ -11915,6 +11943,7 @@ impl SessionForm {
             rdp_height: if session.rdp_height == 0 { String::new() } else { session.rdp_height.to_string() },
             rdp_quality: session.rdp_quality,
             rdp_smart_sizing: session.rdp_smart_sizing,
+            rdp_scale: session.rdp_scale,
             error: None,
             target: StoreId::Local,
         }

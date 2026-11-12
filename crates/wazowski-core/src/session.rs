@@ -173,6 +173,11 @@ pub struct Session {
     /// the initial size and the fallback if dynamic resize isn't available.
     #[serde(default)]
     pub rdp_smart_sizing: bool,
+    /// RDP: DPI scale sent with a smart-sizing resize, as a percent (100–500).
+    /// `0` means auto — follow the display's scale factor (so a HiDPI/Retina
+    /// screen gets readable, correctly-sized remote text).
+    #[serde(default)]
+    pub rdp_scale: u16,
 }
 
 /// RDP visual-quality / bandwidth trade-off.
@@ -228,6 +233,7 @@ impl Session {
             rdp_height: 0,
             rdp_quality: RdpQuality::default(),
             rdp_smart_sizing: false,
+            rdp_scale: 0,
         }
     }
 

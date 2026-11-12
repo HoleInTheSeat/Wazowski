@@ -48,9 +48,10 @@ pub enum RemoteInput {
     Pointer { x: u16, y: u16, buttons: u8 },
     /// A key transition, by X11 keysym.
     Key { keysym: u32, down: bool },
-    /// Request the remote desktop resize to these pixel dimensions (RDP Display
-    /// Control / smart sizing). Ignored by backends that don't support it.
-    Resize { width: u16, height: u16 },
+    /// Request the remote desktop resize to these pixel dimensions, at the given
+    /// DPI scale percent (100–500; RDP Display Control / smart sizing). Ignored by
+    /// backends that don't support it.
+    Resize { width: u16, height: u16, scale_percent: u16 },
 }
 
 /// Per-protocol connection options.
