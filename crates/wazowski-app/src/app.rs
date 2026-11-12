@@ -3967,10 +3967,10 @@ impl App {
                         });
                     }
                     UpdatePhase::Installed => {
-                        ui.label("Update installed. Restart Wazowski to use the new version.");
+                        ui.label("Update installed. Relaunch Wazowski to use the new version.");
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Restart now").clicked() {
+                            if ui.button("Relaunch now").clicked() {
                                 act = Some(Act::Restart);
                             }
                             if ui.button("Later").clicked() {

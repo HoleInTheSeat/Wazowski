@@ -384,7 +384,10 @@ fn has_bin(name: &str) -> bool {
 /// Relaunches the (now-updated) app and exits this process.
 pub fn relaunch(kind: &InstallKind) -> ! {
     if let Some(exe) = kind.launch_target() {
-        let _ = std::process::Command::new(exe).spawn();
+        // `--relaunched` tells the new process this is a post-update handoff, so
+        // it waits for us to release the single-instance lock instead of seeing
+        // "already running" and exiting.
+        let _ = std::process::Command::new(exe).arg("--relaunched").spawn();
     }
     std::process::exit(0);
 }

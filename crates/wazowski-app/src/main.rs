@@ -39,6 +39,23 @@ fn acquire_instance_lock() -> Option<File> {
     file.try_lock_exclusive().ok().map(|()| file)
 }
 
+/// Acquires the single-instance lock, retrying when this is a post-update
+/// relaunch (`--relaunched`): the instance that spawned us is exiting but may
+/// still hold the lock for a moment. Retries up to 5 times, 1s apart, so the
+/// handed-off launch reliably takes over. A normal launch tries just once.
+fn acquire_instance_lock_retrying(relaunched: bool) -> Option<File> {
+    let attempts = if relaunched { 5 } else { 1 };
+    for attempt in 0..attempts {
+        if let Some(lock) = acquire_instance_lock() {
+            return Some(lock);
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    None
+}
+
 /// On macOS a Finder/`.app` launch inherits only a minimal PATH that omits
 /// Homebrew, so the app can't find `brew` (or brew-installed tools like iperf3,
 /// smbclient, jq, git). Prepend the standard Homebrew bin dirs that exist, so
@@ -72,14 +89,31 @@ fn main() -> eframe::Result {
 
     // A connection URI argument (ssh:// or telnet://), e.g. from a browser.
     let launch_uri = std::env::args().skip(1).find(|a| uri::is_connect_uri(a));
+    // A relaunch after an in-app update passes `--relaunched`, so we wait for the
+    // previous instance to release the single-instance lock instead of bailing.
+    let relaunched = std::env::args().any(|a| a == "--relaunched");
 
     // Single-instance guard, unless the user allowed multiple instances.
     let settings = Settings::load_or_default();
     let instance_lock = if settings.allow_multiple_instances {
         None
     } else {
-        match acquire_instance_lock() {
+        match acquire_instance_lock_retrying(relaunched) {
             Some(lock) => Some(lock),
+            // A relaunch that still can't get the lock after retrying: the old
+            // instance never exited. Tell the user rather than vanishing.
+            None if relaunched => {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Wazowski")
+                    .set_description(
+                        "Wazowski couldn't relaunch after updating — the previous \
+                         instance is still running. Please close it and open \
+                         Wazowski again.",
+                    )
+                    .show();
+                return Ok(());
+            }
             None => {
                 // Another instance owns the window. If we were launched to open a
                 // URI, hand it off so it opens there (a new tab) instead of here.

@@ -15,13 +15,13 @@ How the update is applied depends on how you installed Wazowski:
 
 | Install | Auto-update |
 |---|---|
-| **Windows installer** (per-user) | **Yes** — downloads and replaces the app, no admin prompt. Click **Restart now** when it's done. |
+| **Windows installer** (per-user) | **Yes** — downloads and replaces the app, no admin prompt. Click **Relaunch now** when it's done. |
 | **Linux AppImage** | **Yes** — replaces the `.AppImage` in place. |
 | **Raw binary** (downloaded exe/binary) | **Yes**, if the file is writable. |
 | **Linux RPM (`dnf`)** | **Yes** — downloads the new `.rpm` and installs it with an **admin prompt** (`pkexec`), using `dnf` (or `rpm`). Needs PolicyKit (`pkexec`); without it, update with `dnf upgrade` instead. |
 | **macOS** | **Yes** — replaces the app in place. Builds are **unsigned/un-notarized**, so macOS Gatekeeper may re-show its "can't be opened" warning after an update; see [Troubleshooting](troubleshooting.md#macos-malware--cant-be-opened-on-first-launch-only-option-is-trash). |
 
-After **Download & install**, choose **Restart now** to relaunch into the new
+After **Download & install**, choose **Relaunch now** to relaunch into the new
 version (or **Later** to restart yourself).
 
 ## Windows installer
