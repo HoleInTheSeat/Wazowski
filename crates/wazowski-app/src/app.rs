@@ -10628,7 +10628,20 @@ impl App {
         if let Dialog::EditSession(form) = &mut self.dialog {
             let title = if form.id.is_some() { "Edit session" } else { "New session" };
             egui::Modal::new(egui::Id::unique("edit-session")).show(ctx, |ui| {
-                ui.set_width(400.0);
+                // Cap the dialog to the window so a tall form scrolls instead of
+                // spilling past the top/bottom edges. Width is kept fixed, so a
+                // horizontal bar appears only on a very narrow window.
+                let screen = ctx
+                    .input(|i| i.raw.screen_rect)
+                    .unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0)));
+                let max_h = (screen.height() - 80.0).max(200.0);
+                let max_w = (screen.width() - 60.0).clamp(320.0, 620.0);
+                ui.set_max_width(max_w);
+                egui::ScrollArea::both()
+                    .max_height(max_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                ui.set_width(400.0_f32.min(max_w));
                 ui.heading(title);
                 ui.add_space(6.0);
                 // Session-type picker: a row of icon buttons with tooltips.
@@ -10931,6 +10944,7 @@ impl App {
                         cancel = true;
                     }
                 });
+                }); // end ScrollArea
             });
         }
         if save {
