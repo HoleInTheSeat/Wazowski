@@ -114,8 +114,32 @@ pub fn remote_attach_command(name: &str) -> String {
 /// the shell — drops the client back to the plain login shell. A harmless no-op
 /// (prints a short error) if the shell isn't inside tmux. No trailing newline —
 /// the caller adds the Enter that runs it.
+///
+/// Note: `detach-client` run as a command has no "current client", so it can
+/// detach *every* client attached to the session. To detach only the local
+/// client, send the prefix + `d` keystroke instead — see
+/// [`remote_prefix_query_command`] and [`prefix_control_byte`].
 pub fn remote_detach_command() -> String {
     "tmux detach-client".to_owned()
+}
+
+/// The remote command that prints the session's tmux prefix key (e.g. `C-b`),
+/// so a detach can be sent as that exact keystroke rather than a command.
+pub fn remote_prefix_query_command() -> String {
+    "tmux show-options -gv prefix".to_owned()
+}
+
+/// Parses a tmux prefix key as printed by `show-options` (e.g. `C-b`, `C-a`)
+/// into the control byte a terminal sends for it: `C-b` → 0x02, `C-a` → 0x01.
+/// Falls back to the default prefix `C-b` (0x02) for anything unrecognised.
+pub fn prefix_control_byte(s: &str) -> u8 {
+    const DEFAULT: u8 = 0x02; // C-b
+    let s = s.trim();
+    let rest = s.strip_prefix("C-").or_else(|| s.strip_prefix("c-"));
+    match rest.and_then(|r| r.chars().next()) {
+        Some(c) if c.is_ascii_alphabetic() => (c.to_ascii_lowercase() as u8) & 0x1f,
+        _ => DEFAULT,
+    }
 }
 
 /// The remote command to move the SSH shell's view to a session, typed into the
@@ -327,11 +351,23 @@ mod tests {
         assert_eq!(remote_rename_command("a", "b"), "tmux rename-session -t 'a' 'b'");
         assert_eq!(remote_new_command("x"), "tmux new-session -d -s 'x'");
         assert_eq!(remote_attach_command("x"), "tmux attach -t 'x'");
+        assert_eq!(remote_detach_command(), "tmux detach-client");
+        assert_eq!(remote_prefix_query_command(), "tmux show-options -gv prefix");
         assert_eq!(
             remote_switch_or_attach_command("x"),
             "tmux switch-client -t 'x' 2>/dev/null || tmux attach -t 'x'"
         );
         assert!(remote_list_command().starts_with("tmux list-sessions -F '"));
+    }
+
+    #[test]
+    fn prefix_control_byte_maps_and_falls_back() {
+        assert_eq!(prefix_control_byte("C-b"), 0x02);
+        assert_eq!(prefix_control_byte("C-a"), 0x01);
+        assert_eq!(prefix_control_byte("C-b\n"), 0x02); // trailing newline
+        assert_eq!(prefix_control_byte("c-a"), 0x01); // lenient case
+        assert_eq!(prefix_control_byte(""), 0x02); // empty → default C-b
+        assert_eq!(prefix_control_byte("None"), 0x02); // unexpected → default
     }
 
     #[test]

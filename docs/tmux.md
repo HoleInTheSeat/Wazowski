@@ -22,8 +22,11 @@ host (over the SSH connection).
   Switch to a different SSH tab and the folder follows it; with no SSH tab
   active it prompts you to open one. The host is named under the heading — its
   friendly name (the saved session's name / hostname), or the address you
-  connected to if there's no friendlier name. **Click that name** to detach from
-  tmux entirely and drop back to the plain SSH shell in that tab.
+  connected to if there's no friendlier name. **Click that name** to detach and
+  drop back to the plain SSH shell in that tab. Detaching sends the tmux
+  **prefix + `d`** keystroke (the prefix is read from the host, so a remapped
+  prefix such as `Ctrl+a` still works), which detaches **only your client** —
+  anyone else attached to the same session stays connected.
 
 Each session row shows its name, its window count, and a dot (`●`) when a client
 is already attached. The list refreshes automatically every couple of seconds

@@ -16,7 +16,7 @@ use wazowski_remote::{
     connect_vnc,
 };
 use wazowski_ssh::{
-    AuthMaterial, ConnectParams, Exec, HostKeyPolicy, UnknownHostKey, trust_host,
+    AuthMaterial, ConnectParams, Exec, ExecOutput, HostKeyPolicy, UnknownHostKey, trust_host,
 };
 use wazowski_term::{
     COMMON_BAUDS, LocalPty, SearchQuery, SerialBackend, SerialConfig, SerialDevice, SerialFlow,
@@ -1346,6 +1346,10 @@ pub struct App {
     tmux_remote_job: Option<network::Job<Result<Vec<TmuxSession>, String>>>,
     /// In-flight remote action (kill/rename/new) job; its error is surfaced.
     tmux_remote_action: Option<network::Job<Result<(), String>>>,
+    /// In-flight query of the remote tmux prefix key for a pending detach, with
+    /// the target tab id. On completion the prefix + `d` keystroke is sent so
+    /// only this client detaches.
+    tmux_detach_job: Option<(u64, network::Job<Result<ExecOutput, String>>)>,
     /// When the remote list was last refreshed, driving the auto-poll.
     tmux_remote_last: Option<std::time::Instant>,
     /// Filter text for the Settings ▸ Keybindings list.
@@ -1772,6 +1776,7 @@ impl App {
             tmux_remote_host: None,
             tmux_remote_job: None,
             tmux_remote_action: None,
+            tmux_detach_job: None,
             tmux_remote_last: None,
             filter_keybinds: String::new(),
             paste_pw_master: None,
@@ -3154,19 +3159,38 @@ impl App {
         }
     }
 
-    /// Detaches the active SSH tab's shell from tmux entirely (back to the plain
-    /// login shell) and focuses that tab, so clicking the host returns you to the
-    /// real SSH session.
+    /// Detaches the active SSH tab's shell from tmux (back to the plain login
+    /// shell) and focuses that tab, so clicking the host returns you to the real
+    /// SSH session. Detaches **only this client**: rather than running
+    /// `detach-client` (which, as a command, can drop every attached client), it
+    /// first asks the host for its tmux prefix key, then sends the prefix + `d`
+    /// keystroke — the same thing you'd type by hand — so clients other people
+    /// have on the session stay put.
     fn detach_tmux_remote(&mut self) {
-        let Some((tab_id, _, _)) = self.active_ssh_exec() else { return };
+        let Some((tab_id, _, exec)) = self.active_ssh_exec() else { return };
         // Bring the SSH tab to the front so the shell you're dropped into shows.
         if let Some(i) = self.tabs.iter().position(|t| t.id == tab_id) {
             self.active = i;
         }
-        let line = format!("{}\n", wazowski_core::tmux::remote_detach_command());
-        if self.paste_into_tab(tab_id, line.as_bytes())
-            && let Some(tab) = self.tabs.get_mut(self.active)
-        {
+        let cmd = wazowski_core::tmux::remote_prefix_query_command();
+        self.tmux_detach_job = Some((tab_id, network::spawn_job(move || exec.run(&cmd))));
+    }
+
+    /// Finishes a pending detach once its prefix query returns: sends the
+    /// `prefix` then `d` keystroke to the target tab, falling back to the default
+    /// prefix if the query failed.
+    fn poll_tmux_detach(&mut self) {
+        let Some((tab_id, job)) = &self.tmux_detach_job else { return };
+        let Some(result) = job.poll() else { return };
+        let tab_id = *tab_id;
+        self.tmux_detach_job = None;
+        let out = match result {
+            Ok(o) => o.stdout,
+            Err(_) => String::new(), // unreachable prefix → default C-b
+        };
+        let prefix = wazowski_core::tmux::prefix_control_byte(&out);
+        self.paste_into_tab(tab_id, &[prefix, b'd']);
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.tmux_attached = None;
         }
     }
@@ -12357,6 +12381,14 @@ impl eframe::App for App {
         // Remember the live window geometry (when the option is on) so it can be
         // written out on close.
         self.track_window_geometry(&ctx);
+
+        // Finish a pending tmux detach as soon as its prefix query returns, and
+        // keep repainting at a short interval until it does (the job is polled,
+        // not pushed).
+        if self.tmux_detach_job.is_some() {
+            self.poll_tmux_detach();
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
 
         // Confirm before closing the window while sessions/shells are open, or
         // while shared sources have unpushed changes. Pending changes are computed
