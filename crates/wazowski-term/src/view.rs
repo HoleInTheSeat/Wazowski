@@ -16,7 +16,13 @@ use crate::colors::{Palette, dim};
 use crate::input::key_to_bytes;
 use crate::terminal::Terminal;
 
-const PADDING: f32 = 4.0;
+const PADDING: f32 = 7.0;
+/// Extra space on the left, so there's a comfortable click target *before* the
+/// first column — it was fiddly to start a selection on the very first character
+/// when the cell sat right against the pane edge. Clicks in this gutter map to
+/// column 0 (see `Grid::point_at`), so a drag that begins here grabs the first
+/// character cleanly.
+const LEFT_PADDING: f32 = 12.0;
 
 /// Draws a [`Terminal`] filling the available space and feeds it keyboard and mouse input.
 ///
@@ -110,7 +116,10 @@ impl<'a> TerminalView<'a> {
         ui.advance_cursor_after_rect(rect);
 
         let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
-        let inner = rect.shrink(PADDING);
+        let inner = Rect::from_min_max(
+            pos2(rect.left() + LEFT_PADDING, rect.top() + PADDING),
+            pos2(rect.right() - PADDING, rect.bottom() - PADDING),
+        );
         let cols = ((inner.width() / cell.x).floor() as usize).max(2);
         let rows = ((inner.height() / cell.y).floor() as usize).max(1);
         t.resize(TermSize {
