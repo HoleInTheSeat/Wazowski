@@ -1,0 +1,66 @@
+# tmux sessions
+
+The **tmux** pane lists and manages [tmux](https://github.com/tmux/tmux)
+sessions — both on this machine and on the host of the SSH tab you're currently
+looking at — so you can attach, create, rename, and terminate them without
+remembering tmux's command-line incantations.
+
+Open it from the icon rail (the grid icon) or with **`Ctrl+Shift+6`**.
+
+tmux is a *terminal multiplexer*: it keeps shells and running programs alive in
+named **sessions** that survive you disconnecting, so you can detach and
+reattach later and find everything as you left it. Wazowski doesn't bundle tmux
+— it drives the `tmux` already installed on the machine (local) or on the remote
+host (over the SSH connection).
+
+## Two folders: Local and Remote
+
+- **Local** — tmux sessions on the computer running Wazowski. Shown whenever
+  `tmux` is on your `PATH`; if it isn't, the folder says so.
+- **Remote** — tmux sessions on the host of the **currently active SSH tab**.
+  Switch to a different SSH tab and the folder follows it; with no SSH tab
+  active it prompts you to open one. The host name is shown under the heading.
+
+Each session row shows its name, its window count, and a dot (`●`) when a client
+is already attached. The list refreshes automatically every couple of seconds
+while the pane is open, and there's a refresh button (↻) in the header. Use the
+filter box to narrow a long list by name.
+
+## Attaching
+
+**Click a session** (or right-click → **Attach**) to attach to it:
+
+- **Local** opens a new terminal tab running `tmux attach` for that session.
+  Detaching (tmux's `Ctrl+b d`) or ending the session exits the tab, and the
+  session keeps running.
+- **Remote** types `tmux attach` into the active SSH tab's shell — the normal
+  way to attach over an existing connection. Make sure that shell is at a prompt
+  first.
+
+## Creating, renaming, terminating
+
+Right-click a session for the full menu, or use **＋ New session…** at the
+bottom of either folder:
+
+- **New session…** — prompts for a name and creates a detached session
+  (`tmux new-session -d`). It then appears in the list, ready to attach.
+- **Rename…** — prompts for a new name.
+- **Terminate** — kills the session after a confirmation. Everything running in
+  it is stopped and any attached clients are detached. **This can't be undone** —
+  it's different from *detaching*, which leaves the session running.
+
+Remote actions run over the SSH connection in the background, so the UI never
+blocks waiting on the network; any error is surfaced afterward.
+
+## Requirements
+
+- **Local:** `tmux` installed and on your `PATH`.
+- **Remote:** an active SSH tab, with `tmux` installed on that host. Listing uses
+  a one-off command over the same SSH connection (no extra login).
+
+## tmux's own shortcuts
+
+Once you're attached, you're in tmux, which has its own keys (prefixed by
+`Ctrl+b`). **Settings → Keybindings** includes a read-only **tmux shortcuts**
+reference for the common ones. Those are tmux defaults configured in
+`~/.tmux.conf`, not in Wazowski. See [Keyboard shortcuts](keybindings.md).

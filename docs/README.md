@@ -22,21 +22,23 @@ consoles, saved sessions, credentials, macros, quick servers, and network tools.
 8. [Quick servers](quick-servers.md) — HTTP / TFTP / SFTP / iperf3 servers.
 9. [Network & host tools](tools.md) — the JSON/jq puller, API client, IP-address
    viewer, and per-session network tools.
-10. [Settings & backup](settings-and-backup.md) — every setting, plus exporting
+10. [tmux sessions](tmux.md) — list, attach, create, rename, and terminate tmux
+    sessions on this machine and on the active SSH host.
+11. [Settings & backup](settings-and-backup.md) — every setting, plus exporting
     and importing your whole configuration.
-11. [Keyboard shortcuts](keybindings.md) — the default keymap and how to rebind.
-12. [Importing from MobaXterm](importing-from-mobaxterm.md) — converting
+12. [Keyboard shortcuts](keybindings.md) — the default keymap and how to rebind.
+13. [Importing from MobaXterm](importing-from-mobaxterm.md) — converting
     `.mxtsessions` files.
-13. [Updating](updating.md) — in-app updates and the Windows installer.
-14. [Troubleshooting](troubleshooting.md) — common issues and fixes.
-15. [Releasing & CI](releasing.md) — how builds, tests, versioning, tagging, and
+14. [Updating](updating.md) — in-app updates and the Windows installer.
+15. [Troubleshooting](troubleshooting.md) — common issues and fixes.
+16. [Releasing & CI](releasing.md) — how builds, tests, versioning, tagging, and
     GitHub Releases work (for maintainers).
 
 ## Core concepts
 
 - **Tabs** hold connections and shells; a tab can be **split** into panes.
-- The **left pane** switches between six views via the icon rail: **Sessions**,
-  **Macros**, **Files**, **Tools**, **Vault**, and **Settings**.
+- The **left pane** switches between views via the icon rail: **Sessions**,
+  **Files**, **Macros**, **Tools**, **Vault**, **tmux**, and **Settings**.
 - **Sessions** are saved connection definitions (SSH/RDP/VNC) organised in
   folders. They hold no secrets — credentials are referenced by name from the
   **vault**.

@@ -8983,6 +8983,48 @@ impl App {
             ui.add_space(4.0);
             ui.label(RichText::new("Esc to cancel capture").weak());
         }
+
+        // A read-only reference for tmux's own default shortcuts, shown because
+        // Wazowski can attach to tmux sessions (see the tmux pane). These are
+        // tmux defaults, configured in ~/.tmux.conf — not rebindable here.
+        ui.add_space(10.0);
+        egui::CollapsingHeader::new("tmux shortcuts (reference)").default_open(false).show(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "tmux's own default keys. Press the prefix (Ctrl+b), release it, \
+                     then the key. Configured in ~/.tmux.conf, not here.",
+                )
+                .weak(),
+            );
+            ui.add_space(6.0);
+            let refs: &[(&str, &str)] = &[
+                ("Ctrl+b", "Prefix (precedes every tmux key below)"),
+                ("Prefix d", "Detach (leaves the session running)"),
+                ("Prefix c", "New window"),
+                ("Prefix ,", "Rename current window"),
+                ("Prefix n / p", "Next / previous window"),
+                ("Prefix 0–9", "Select window by number"),
+                ("Prefix w", "List windows"),
+                ("Prefix &", "Kill window"),
+                ("Prefix %", "Split pane left/right"),
+                ("Prefix \"", "Split pane top/bottom"),
+                ("Prefix arrows", "Move between panes"),
+                ("Prefix z", "Zoom / unzoom the current pane"),
+                ("Prefix x", "Kill the current pane"),
+                ("Prefix [", "Copy mode / scroll back (q to exit)"),
+                ("Prefix ]", "Paste"),
+                ("Prefix :", "Command prompt"),
+                ("Prefix ?", "List all tmux key bindings"),
+            ];
+            egui::Grid::new("tmux-ref-grid").num_columns(2).spacing([16.0, 5.0]).show(ui, |ui| {
+                for (keys, desc) in refs {
+                    ui.label(RichText::new(*keys).monospace());
+                    ui.label(*desc);
+                    ui.end_row();
+                }
+            });
+        });
+
         if save && let Err(e) = self.keymap.save() {
             self.error = Some(format!("Could not save keybindings: {e:#}"));
         }

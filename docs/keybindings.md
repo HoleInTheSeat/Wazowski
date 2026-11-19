@@ -22,6 +22,7 @@ defaults are below.
 | Macros pane | `Ctrl+Shift+3` |
 | Tools pane | `Ctrl+Shift+4` |
 | Vault pane | `Ctrl+Shift+5` |
+| tmux pane | `Ctrl+Shift+6` |
 | Settings pane | `Ctrl+Shift+S` |
 | Terminal: larger font | `Ctrl+=` |
 | Terminal: smaller font | `Ctrl+-` |
@@ -42,6 +43,13 @@ In **Settings → Keybindings**, click a shortcut and press the new combination 
 rebind it. Use the filter box at the top to find an action quickly. Changes are
 saved to `keybindings.toml` in your config dir and are included in a
 [settings backup](settings-and-backup.md).
+
+## tmux shortcuts (reference)
+
+**Settings → Keybindings** also shows a read-only **tmux shortcuts** reference —
+tmux's own default keys (new window, split, detach, and so on), for when you've
+attached to a tmux session from the [tmux pane](tmux.md). Those are tmux
+defaults, set in your `~/.tmux.conf`, not rebindable in Wazowski.
 
 ## Macro shortcuts
 
