@@ -11,11 +11,13 @@
 //! this crate independent of how secrets are stored.
 
 mod connection;
+mod exec;
 mod host_key;
 mod keygen;
 mod sftp;
 
 pub use connection::{AuthMaterial, ConnectError, ConnectParams, SshBackend, connect};
+pub use exec::{Exec, ExecOutput};
 pub use keygen::{
     GeneratedKey, KeyAlgo, generate, generate_ed25519, public_from_private, to_unencrypted_openssh,
 };

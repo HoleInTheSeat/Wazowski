@@ -19,6 +19,7 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use wazowski_term::{Backend, BackendEvent, TermSize};
 
+use crate::exec::{Exec, ExecOutput, ExecRequest};
 use crate::host_key::{self, Handler, HostKeyPolicy, UnknownHostKey, Verdict};
 use crate::sftp::{FileEntry, Sftp, SftpOp, SftpReply, SftpRequest};
 
@@ -85,6 +86,8 @@ pub struct SshBackend {
     cmds: Option<UnboundedSender<Cmd>>,
     /// Sender for SFTP requests over the same connection.
     sftp: UnboundedSender<SftpRequest>,
+    /// Sender for one-shot exec requests over the same connection.
+    exec: UnboundedSender<ExecRequest>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -93,6 +96,11 @@ impl SshBackend {
     /// is opened lazily on first use.
     pub fn sftp(&self) -> Sftp {
         Sftp::new(self.sftp.clone())
+    }
+
+    /// Returns a handle for running one-shot commands on this session.
+    pub fn exec(&self) -> Exec {
+        Exec::new(self.exec.clone())
     }
 }
 
@@ -136,6 +144,7 @@ pub fn connect(
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel(256);
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let (sftp_tx, sftp_rx) = unbounded_channel();
+    let (exec_tx, exec_rx) = unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
     let thread = thread::Builder::new()
@@ -148,15 +157,23 @@ pub fn connect(
                     return;
                 }
             };
-            runtime.block_on(session_task(params, wake, out_tx, cmd_rx, sftp_rx, ready_tx));
+            runtime.block_on(session_task(
+                params, wake, out_tx, cmd_rx, sftp_rx, exec_rx, ready_tx,
+            ));
         })
         .map_err(|e| ConnectError::Other(e.into()))?;
 
     // Wait for the task to report whether the handshake succeeded.
     match ready_rx.recv() {
-        Ok(Ok(())) => {
-            Ok((SshBackend { cmds: Some(cmd_tx), sftp: sftp_tx, thread: Some(thread) }, out_rx))
-        }
+        Ok(Ok(())) => Ok((
+            SshBackend {
+                cmds: Some(cmd_tx),
+                sftp: sftp_tx,
+                exec: exec_tx,
+                thread: Some(thread),
+            },
+            out_rx,
+        )),
         Ok(Err(e)) => {
             let _ = thread.join();
             Err(e)
@@ -177,6 +194,7 @@ async fn session_task(
     out: SyncSender<BackendEvent>,
     cmds: UnboundedReceiver<Cmd>,
     sftp: UnboundedReceiver<SftpRequest>,
+    exec: UnboundedReceiver<ExecRequest>,
     ready: std::sync::mpsc::Sender<Result<(), ConnectError>>,
 ) {
     match establish(&params).await {
@@ -185,7 +203,7 @@ async fn session_task(
             if ready.send(Ok(())).is_err() {
                 return;
             }
-            if let Err(e) = pump(handle, params, &wake, &out, cmds, sftp).await {
+            if let Err(e) = pump(handle, params, &wake, &out, cmds, sftp, exec).await {
                 log::warn!("ssh session ended: {e:#}");
             }
             let _ = out.send(BackendEvent::Exited);
@@ -399,6 +417,7 @@ async fn pump(
     out: &SyncSender<BackendEvent>,
     mut cmds: UnboundedReceiver<Cmd>,
     mut sftp_rx: UnboundedReceiver<SftpRequest>,
+    mut exec_rx: UnboundedReceiver<ExecRequest>,
 ) -> anyhow::Result<()> {
     let channel = handle.channel_open_session().await?;
     let size = params.size;
@@ -419,6 +438,8 @@ async fn pump(
     let mut sftp_session: Option<StdArc<SftpSession>> = None;
     // Set to false once all SFTP handles are dropped, to stop polling that arm.
     let mut sftp_open = true;
+    // Set to false once all exec handles are dropped, to stop polling that arm.
+    let mut exec_open = true;
 
     let mut channel = channel;
     loop {
@@ -456,6 +477,24 @@ async fn pump(
                 }
                 // All SFTP handles dropped; stop selecting on this arm.
                 None => sftp_open = false,
+            },
+            request = exec_rx.recv(), if exec_open => match request {
+                Some(request) => {
+                    // Open a dedicated channel here (brief), then hand it to a task
+                    // so a slow command never blocks the shell or other requests.
+                    match handle.channel_open_session().await {
+                        Ok(channel) => {
+                            tokio::spawn(run_exec(channel, request));
+                        }
+                        Err(e) => {
+                            let _ = request
+                                .reply
+                                .send(Err(format!("could not open an exec channel: {e}")));
+                        }
+                    }
+                }
+                // All exec handles dropped; stop selecting on this arm.
+                None => exec_open = false,
             },
             msg = channel.wait() => match msg {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
@@ -507,6 +546,44 @@ async fn ensure_sftp(
 async fn run_sftp_op(session: StdArc<SftpSession>, request: SftpRequest) {
     let result = execute_sftp(&session, request.op).await.map_err(|e| e.to_string());
     let _ = request.reply.send(result);
+}
+
+/// Runs one command on the given session channel and sends its captured output
+/// back to the caller.
+async fn run_exec(channel: russh::Channel<client::Msg>, request: ExecRequest) {
+    let result = exec_once(channel, &request.command).await.map_err(|e| e.to_string());
+    let _ = request.reply.send(result);
+}
+
+/// Runs `command` on an already-opened session channel and collects
+/// stdout/stderr and the exit status until the channel closes.
+async fn exec_once(
+    mut channel: russh::Channel<client::Msg>,
+    command: &str,
+) -> anyhow::Result<ExecOutput> {
+    channel.exec(true, command).await?;
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut exit: u32 = 0;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+            // ext == 1 is stderr; other extended types are rare and ignored.
+            ChannelMsg::ExtendedData { data, ext } => {
+                if ext == 1 {
+                    stderr.extend_from_slice(&data);
+                }
+            }
+            ChannelMsg::ExitStatus { exit_status } => exit = exit_status,
+            ChannelMsg::Eof => {}
+            _ => {}
+        }
+    }
+    Ok(ExecOutput {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit,
+    })
 }
 
 async fn execute_sftp(

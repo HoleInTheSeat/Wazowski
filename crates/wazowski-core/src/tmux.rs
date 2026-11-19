@@ -76,6 +76,54 @@ pub fn attach_args(name: &str) -> Vec<String> {
     vec!["attach-session".into(), "-t".into(), name.into()]
 }
 
+/// Wraps a string in single quotes for safe use as one argument in a remote
+/// shell command (SSH exec runs the command through the login shell). Embedded
+/// single quotes are escaped the POSIX way: `'\''`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The remote command to list sessions — the same `-F` format as the local
+/// path, quoted for the remote shell.
+pub fn remote_list_command() -> String {
+    format!("tmux list-sessions -F {}", shell_quote(LIST_FORMAT))
+}
+
+/// The remote command to kill (terminate) a session.
+pub fn remote_kill_command(name: &str) -> String {
+    format!("tmux kill-session -t {}", shell_quote(name))
+}
+
+/// The remote command to rename a session.
+pub fn remote_rename_command(old: &str, new: &str) -> String {
+    format!("tmux rename-session -t {} {}", shell_quote(old), shell_quote(new))
+}
+
+/// The remote command to create a new detached session.
+pub fn remote_new_command(name: &str) -> String {
+    format!("tmux new-session -d -s {}", shell_quote(name))
+}
+
+/// The remote command to attach to a session, typed into the SSH shell (no
+/// trailing newline — the caller adds the Enter that runs it).
+pub fn remote_attach_command(name: &str) -> String {
+    format!("tmux attach -t {}", shell_quote(name))
+}
+
+/// Interprets the result of a remote `list-sessions` (its stdout, stderr, and
+/// exit status) into sessions, treating tmux's "no server running" as an empty
+/// list rather than an error — matching the local path's behaviour.
+pub fn interpret_list(stdout: &str, stderr: &str, exit: u32) -> Result<Vec<TmuxSession>, String> {
+    if exit == 0 {
+        return Ok(parse_sessions(stdout));
+    }
+    if is_no_server(stderr) {
+        return Ok(Vec::new());
+    }
+    let msg = stderr.trim();
+    Err(if msg.is_empty() { format!("tmux exited with status {exit}") } else { msg.to_string() })
+}
+
 /// Parses the stdout of `tmux list-sessions -F LIST_FORMAT` into sessions.
 ///
 /// Lines that are blank or malformed (too few fields) are skipped rather than
@@ -245,6 +293,37 @@ mod tests {
         assert!(is_no_server("no server running on /tmp/tmux-1000/default"));
         assert!(is_no_server("error connecting to /tmp/x (No server running)"));
         assert!(!is_no_server("session not found: main"));
+    }
+
+    #[test]
+    fn shell_quoting_wraps_and_escapes() {
+        assert_eq!(shell_quote("main"), "'main'");
+        assert_eq!(shell_quote("my session"), "'my session'");
+        // A single quote becomes '\'' (close, escaped quote, reopen).
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn remote_commands_are_quoted() {
+        assert_eq!(remote_kill_command("main"), "tmux kill-session -t 'main'");
+        assert_eq!(remote_rename_command("a", "b"), "tmux rename-session -t 'a' 'b'");
+        assert_eq!(remote_new_command("x"), "tmux new-session -d -s 'x'");
+        assert!(remote_list_command().starts_with("tmux list-sessions -F '"));
+    }
+
+    #[test]
+    fn interpret_list_handles_success_empty_and_error() {
+        let ok = line("main", "1", "0", "1");
+        assert_eq!(interpret_list(&ok, "", 0).unwrap().len(), 1);
+        // No server running → empty list, not an error.
+        assert_eq!(interpret_list("", "no server running on ...", 1).unwrap().len(), 0);
+        // A real error surfaces the stderr.
+        assert_eq!(
+            interpret_list("", "some other failure", 1).unwrap_err(),
+            "some other failure"
+        );
+        // Non-zero with no stderr still errors.
+        assert!(interpret_list("", "", 2).is_err());
     }
 
     #[test]

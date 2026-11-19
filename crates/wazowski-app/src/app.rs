@@ -16,7 +16,7 @@ use wazowski_remote::{
     connect_vnc,
 };
 use wazowski_ssh::{
-    AuthMaterial, ConnectParams, HostKeyPolicy, UnknownHostKey, trust_host,
+    AuthMaterial, ConnectParams, Exec, HostKeyPolicy, UnknownHostKey, trust_host,
 };
 use wazowski_term::{
     COMMON_BAUDS, LocalPty, SearchQuery, SerialBackend, SerialConfig, SerialDevice, SerialFlow,
@@ -50,6 +50,9 @@ struct Tab {
     content: TabContent,
     /// Present for SSH tabs: the SFTP file browser for the same session.
     files: Option<FileBrowser>,
+    /// Present for SSH tabs: a handle to run one-shot commands on the session,
+    /// used by the tmux pane's Remote folder.
+    exec: Option<Exec>,
     /// Present for RDP tabs: the SMB file browser for `\\host\C$`.
     smb: Option<crate::smb_ui::SmbBrowser>,
     /// How to restart this tab's session once it ends. SSH/serial tabs stay open
@@ -719,12 +722,12 @@ enum Dialog {
     /// Type a vault password into a terminal tab: first confirm the master
     /// password, then pick the entry.
     PastePassword(Box<PastePasswordState>),
-    /// Rename a local tmux session (`old` → the edited `name`).
-    TmuxRename { old: String, name: String, error: Option<String> },
-    /// Create a new, detached local tmux session with the entered name.
-    TmuxNew { name: String, error: Option<String> },
-    /// Confirm terminating (killing) a local tmux session.
-    ConfirmTmuxKill { name: String },
+    /// Rename a tmux session (`old` → the edited `name`).
+    TmuxRename { scope: TmuxScope, old: String, name: String, error: Option<String> },
+    /// Create a new, detached tmux session with the entered name.
+    TmuxNew { scope: TmuxScope, name: String, error: Option<String> },
+    /// Confirm terminating (killing) a tmux session.
+    ConfirmTmuxKill { scope: TmuxScope, name: String },
 }
 
 /// State for the "Paste password" dialog (tab right-click menu).
@@ -1325,6 +1328,21 @@ pub struct App {
     tmux_version: Option<Option<String>>,
     /// When the local tmux list was last refreshed, driving the auto-poll.
     tmux_last_refresh: Option<std::time::Instant>,
+    /// Cached remote tmux sessions (for the active SSH tab's host).
+    tmux_remote: Vec<TmuxSession>,
+    /// Last error from listing remote tmux sessions.
+    tmux_remote_err: Option<String>,
+    /// The SSH tab id the remote cache belongs to; `None` when no SSH tab is
+    /// active. A change resets the cache.
+    tmux_remote_tab: Option<u64>,
+    /// The host of the active SSH tab, shown as the Remote folder's subheading.
+    tmux_remote_host: Option<String>,
+    /// In-flight remote `list-sessions` job.
+    tmux_remote_job: Option<network::Job<Result<Vec<TmuxSession>, String>>>,
+    /// In-flight remote action (kill/rename/new) job; its error is surfaced.
+    tmux_remote_action: Option<network::Job<Result<(), String>>>,
+    /// When the remote list was last refreshed, driving the auto-poll.
+    tmux_remote_last: Option<std::time::Instant>,
     /// Filter text for the Settings ▸ Keybindings list.
     filter_keybinds: String,
     /// Natural width (points) of the current left pane's list content, measured
@@ -1390,6 +1408,13 @@ enum SidebarView {
     Vault,
     Tmux,
     Settings,
+}
+
+/// Which tmux a pane action targets: this machine, or the active SSH tab's host.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TmuxScope {
+    Local,
+    Remote,
 }
 
 /// An item selected in the Tools pane. Category headers aren't selectable.
@@ -1736,6 +1761,13 @@ impl App {
             tmux_local_err: None,
             tmux_version: None,
             tmux_last_refresh: None,
+            tmux_remote: Vec::new(),
+            tmux_remote_err: None,
+            tmux_remote_tab: None,
+            tmux_remote_host: None,
+            tmux_remote_job: None,
+            tmux_remote_action: None,
+            tmux_remote_last: None,
             filter_keybinds: String::new(),
             paste_pw_master: None,
             pane_content_w: 180.0,
@@ -1995,6 +2027,7 @@ impl App {
             label: label.into(),
             content,
             files,
+            exec: None,
             smb: None,
             restart: None,
             origin_term,
@@ -2544,8 +2577,10 @@ impl App {
             match pending.poll() {
                 Progress::Waiting => any_active = true,
                 Progress::Ready(Connected { backend, output }) => {
-                    // Grab an SFTP handle before the backend is boxed into the terminal.
+                    // Grab SFTP and exec handles before the backend is boxed into
+                    // the terminal.
                     let mut files = FileBrowser::new(backend.sftp());
+                    let exec = backend.exec();
                     // Restore this session's remembered SFTP auto-refresh setting.
                     files.set_auto_refresh(auto_refresh);
                     let params = c.params.clone();
@@ -2554,6 +2589,7 @@ impl App {
                     let tab = &mut self.tabs[index];
                     tab.content = TabContent::Terminal(Box::new(Panes::new(Box::new(term))));
                     tab.files = Some(files);
+                    tab.exec = Some(exec);
                     tab.restart = Some(RestartKind::Ssh(Box::new(params)));
                     tab.origin_term = Some(term_id);
                     tab.connected_at = Some(std::time::Instant::now());
@@ -2967,6 +3003,111 @@ impl App {
             }
             Err(e) => self.error = Some(format!("Could not attach to tmux session: {e:#}")),
         }
+    }
+
+    /// If the active tab is a connected SSH terminal, returns its id, host, and a
+    /// cloned exec handle for running tmux commands on that host.
+    fn active_ssh_exec(&self) -> Option<(u64, String, Exec)> {
+        let tab = self.tabs.get(self.active)?;
+        if !matches!(tab.content, TabContent::Terminal(_)) {
+            return None;
+        }
+        let exec = tab.exec.clone()?;
+        let host = match &tab.restart {
+            Some(RestartKind::Ssh(p)) => p.host.clone(),
+            _ => String::new(),
+        };
+        Some((tab.id, host, exec))
+    }
+
+    /// Kicks off a background listing of the active SSH tab's tmux sessions.
+    /// Resets the cache when the active SSH tab changes, and never piles up more
+    /// than one in-flight listing.
+    fn refresh_tmux_remote(&mut self) {
+        let Some((tab_id, host, exec)) = self.active_ssh_exec() else {
+            // No SSH tab active: forget any previous host's cache.
+            self.tmux_remote.clear();
+            self.tmux_remote_err = None;
+            self.tmux_remote_tab = None;
+            self.tmux_remote_host = None;
+            self.tmux_remote_last = None;
+            return;
+        };
+        if self.tmux_remote_tab != Some(tab_id) {
+            // Switched to a different SSH tab — drop the old host's sessions.
+            self.tmux_remote.clear();
+            self.tmux_remote_err = None;
+        }
+        self.tmux_remote_tab = Some(tab_id);
+        self.tmux_remote_host = Some(host);
+        self.tmux_remote_last = Some(std::time::Instant::now());
+        if self.tmux_remote_job.is_some() {
+            return; // A listing is already running.
+        }
+        let cmd = wazowski_core::tmux::remote_list_command();
+        self.tmux_remote_job = Some(network::spawn_job(move || match exec.run(&cmd) {
+            Ok(o) => wazowski_core::tmux::interpret_list(&o.stdout, &o.stderr, o.exit),
+            Err(e) => Err(e),
+        }));
+    }
+
+    /// Polls the in-flight remote listing and action jobs, folding their results
+    /// into the cache. Called each frame while the tmux pane is visible.
+    fn poll_tmux_remote(&mut self) {
+        if let Some(job) = &self.tmux_remote_job
+            && let Some(result) = job.poll()
+        {
+            self.tmux_remote_job = None;
+            match result {
+                Ok(sessions) => {
+                    self.tmux_remote = sessions;
+                    self.tmux_remote_err = None;
+                }
+                Err(e) => {
+                    self.tmux_remote.clear();
+                    self.tmux_remote_err = Some(e);
+                }
+            }
+        }
+        if let Some(job) = &self.tmux_remote_action
+            && let Some(result) = job.poll()
+        {
+            self.tmux_remote_action = None;
+            if let Err(e) = result {
+                self.error = Some(format!("tmux: {e}"));
+            }
+            // Re-list now so the change shows without waiting for the next tick.
+            self.tmux_remote_last = None;
+        }
+    }
+
+    /// Runs a one-shot tmux command on the active SSH tab's host in the
+    /// background. Returns false if no SSH tab is active.
+    fn start_remote_tmux_cmd(&mut self, cmd: String) -> bool {
+        let Some((_, _, exec)) = self.active_ssh_exec() else {
+            return false;
+        };
+        self.tmux_remote_action = Some(network::spawn_job(move || match exec.run(&cmd) {
+            Ok(o) if o.exit == 0 => Ok(()),
+            Ok(o) => {
+                let msg = o.stderr.trim();
+                Err(if msg.is_empty() {
+                    format!("command exited with status {}", o.exit)
+                } else {
+                    msg.to_string()
+                })
+            }
+            Err(e) => Err(e),
+        }));
+        true
+    }
+
+    /// Attaches to a remote tmux session by typing `tmux attach` into the active
+    /// SSH tab's shell (the normal way to attach over an existing connection).
+    fn attach_tmux_remote(&mut self, name: &str) {
+        let Some((tab_id, _, _)) = self.active_ssh_exec() else { return };
+        let line = format!("{}\n", wazowski_core::tmux::remote_attach_command(name));
+        self.paste_into_tab(tab_id, line.as_bytes());
     }
 
     /// Saves the active tab: a terminal's scrollback output, or an RDP/VNC tab's
@@ -4378,37 +4519,28 @@ impl App {
     /// and **Remote** (the active SSH tab's host — wired up in a later phase).
     /// Clicking a session attaches to it in a new terminal tab.
     fn sidebar_tmux(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Fold in any finished remote list/action jobs first.
+        self.poll_tmux_remote();
+
         // Auto-poll: tmux can't push list changes, so refresh on a short interval
         // while the pane is visible. A manual Refresh button forces it too.
-        let stale = self
-            .tmux_last_refresh
-            .map(|t| t.elapsed() >= std::time::Duration::from_secs(2))
-            .unwrap_or(true);
-        if stale {
+        let interval = std::time::Duration::from_secs(2);
+        if self.tmux_last_refresh.map(|t| t.elapsed() >= interval).unwrap_or(true) {
             self.refresh_tmux_local();
         }
-        // Keep polling while this pane is on screen.
-        ctx.request_repaint_after(std::time::Duration::from_secs(2));
-
-        // A click or context-menu choice inside the scroll body is recorded here
-        // and acted on afterwards, so the body borrows no `self`.
-        enum TmuxAction {
-            Attach(String),
-            Rename(String),
-            Kill(String),
-            New,
-            Refresh,
+        // Remote: refresh when the interval elapses or the active SSH tab changes.
+        let active_ssh = self.active_ssh_exec().map(|(id, _, _)| id);
+        let remote_stale =
+            self.tmux_remote_last.map(|t| t.elapsed() >= interval).unwrap_or(true);
+        if active_ssh != self.tmux_remote_tab || (active_ssh.is_some() && remote_stale) {
+            self.refresh_tmux_remote();
         }
+        // Keep polling while this pane is on screen.
+        ctx.request_repaint_after(interval);
 
         let mut action: Option<TmuxAction> = None;
-        let tmux_ok = !matches!(self.tmux_version, Some(None));
         ui.horizontal(|ui| {
             ui.heading("tmux");
-            if tmux_ok
-                && ui.small_button(icons::PLUS).on_hover_text("New session…").clicked()
-            {
-                action = Some(TmuxAction::New);
-            }
             if ui.small_button(icons::SYNC).on_hover_text("Refresh").clicked() {
                 action = Some(TmuxAction::Refresh);
             }
@@ -4417,16 +4549,22 @@ impl App {
         filter_box(ui, &mut self.filter_tmux, focus);
         ui.separator();
 
-        // Snapshot what the scroll body needs, so the closure borrows no `self`.
+        // Snapshot what the (self-free) scroll body needs.
         let needle = self.filter_tmux.to_lowercase();
+        let filter = |list: &[TmuxSession]| -> Vec<TmuxSession> {
+            list.iter()
+                .filter(|s| needle.is_empty() || s.name.to_lowercase().contains(&needle))
+                .cloned()
+                .collect()
+        };
         let not_installed = matches!(self.tmux_version, Some(None));
-        let err = self.tmux_local_err.clone();
-        let sessions: Vec<TmuxSession> = self
-            .tmux_local
-            .iter()
-            .filter(|s| needle.is_empty() || s.name.to_lowercase().contains(&needle))
-            .cloned()
-            .collect();
+        let local_err = self.tmux_local_err.clone();
+        let local = filter(&self.tmux_local);
+        let has_ssh = active_ssh.is_some();
+        let remote_host = self.tmux_remote_host.clone();
+        let remote_err = self.tmux_remote_err.clone();
+        let remote_loading = self.tmux_remote_job.is_some() && self.tmux_remote.is_empty();
+        let remote = filter(&self.tmux_remote);
 
         let w = pane_scroll(ui, |ui| {
             egui::CollapsingHeader::new(RichText::new("Local").strong())
@@ -4434,47 +4572,20 @@ impl App {
                 .show(ui, |ui| {
                     if not_installed {
                         ui.add_space(2.0);
-                        ui.colored_label(
-                            Color32::from_rgb(200, 150, 90),
-                            "tmux not found on PATH",
-                        );
-                    } else if let Some(e) = &err {
-                        ui.add_space(2.0);
-                        ui.colored_label(Color32::from_rgb(220, 120, 120), e);
-                    } else if sessions.is_empty() {
-                        ui.add_space(2.0);
-                        ui.weak("No sessions");
+                        ui.colored_label(Color32::from_rgb(200, 150, 90), "tmux not found on PATH");
                     } else {
-                        for s in &sessions {
-                            let resp = tmux_session_row(ui, s);
-                            if resp.clicked() {
-                                action = Some(TmuxAction::Attach(s.name.clone()));
-                            }
-                            resp.context_menu(|ui| {
-                                // Specific actions first…
-                                if ui.button("Attach").clicked() {
-                                    action = Some(TmuxAction::Attach(s.name.clone()));
-                                    ui.close();
-                                }
-                                if ui.button("New session…").clicked() {
-                                    action = Some(TmuxAction::New);
-                                    ui.close();
-                                }
-                                if ui.button("Refresh").clicked() {
-                                    action = Some(TmuxAction::Refresh);
-                                    ui.close();
-                                }
-                                ui.separator();
-                                // …then the generic ones.
-                                if ui.button("Rename…").clicked() {
-                                    action = Some(TmuxAction::Rename(s.name.clone()));
-                                    ui.close();
-                                }
-                                if ui.button("Terminate").clicked() {
-                                    action = Some(TmuxAction::Kill(s.name.clone()));
-                                    ui.close();
-                                }
-                            });
+                        if let Some(e) = &local_err {
+                            ui.add_space(2.0);
+                            ui.colored_label(Color32::from_rgb(220, 120, 120), e);
+                        } else if local.is_empty() {
+                            ui.add_space(2.0);
+                            ui.weak("No sessions");
+                        } else {
+                            tmux_rows(ui, &local, TmuxScope::Local, &mut action);
+                        }
+                        ui.add_space(2.0);
+                        if ui.selectable_label(false, "    ＋ New session…").clicked() {
+                            action = Some(TmuxAction::New(TmuxScope::Local));
                         }
                     }
                 });
@@ -4482,24 +4593,52 @@ impl App {
             egui::CollapsingHeader::new(RichText::new("Remote").strong())
                 .default_open(true)
                 .show(ui, |ui| {
+                    if !has_ssh {
+                        ui.add_space(2.0);
+                        ui.weak("Open an SSH tab to see its tmux sessions");
+                        return;
+                    }
+                    if let Some(host) = &remote_host {
+                        ui.add_space(2.0);
+                        ui.weak(format!("    {host}"));
+                    }
+                    if let Some(e) = &remote_err {
+                        ui.add_space(2.0);
+                        ui.colored_label(Color32::from_rgb(220, 120, 120), e);
+                    } else if remote_loading {
+                        ui.add_space(2.0);
+                        ui.weak("Loading…");
+                    } else if remote.is_empty() {
+                        ui.add_space(2.0);
+                        ui.weak("No sessions");
+                    } else {
+                        tmux_rows(ui, &remote, TmuxScope::Remote, &mut action);
+                    }
                     ui.add_space(2.0);
-                    ui.weak("Open an SSH tab to see its tmux sessions");
+                    if ui.selectable_label(false, "    ＋ New session…").clicked() {
+                        action = Some(TmuxAction::New(TmuxScope::Remote));
+                    }
                 });
         });
         self.pane_content_w = w;
 
         match action {
-            Some(TmuxAction::Attach(name)) => self.open_tmux_attach(&name, ctx),
-            Some(TmuxAction::Rename(name)) => {
-                self.dialog = Dialog::TmuxRename { old: name.clone(), name, error: None };
+            Some(TmuxAction::Attach(TmuxScope::Local, name)) => self.open_tmux_attach(&name, ctx),
+            Some(TmuxAction::Attach(TmuxScope::Remote, name)) => self.attach_tmux_remote(&name),
+            Some(TmuxAction::Rename(scope, name)) => {
+                self.dialog = Dialog::TmuxRename { scope, old: name.clone(), name, error: None };
             }
-            Some(TmuxAction::Kill(name)) => {
-                self.dialog = Dialog::ConfirmTmuxKill { name };
+            Some(TmuxAction::Kill(scope, name)) => {
+                self.dialog = Dialog::ConfirmTmuxKill { scope, name };
             }
-            Some(TmuxAction::New) => {
-                self.dialog = Dialog::TmuxNew { name: String::new(), error: None };
+            Some(TmuxAction::New(scope)) => {
+                self.dialog = Dialog::TmuxNew { scope, name: String::new(), error: None };
             }
-            Some(TmuxAction::Refresh) => self.refresh_tmux_local(),
+            Some(TmuxAction::Refresh) => {
+                self.refresh_tmux_local();
+                // Force a remote re-list on the next frame too.
+                self.tmux_remote_last = None;
+            }
             None => {}
         }
     }
@@ -8210,8 +8349,8 @@ impl App {
     }
 
     fn show_tmux_rename(&mut self, ctx: &egui::Context) {
-        let Dialog::TmuxRename { old, name, error } = &mut self.dialog else { return };
-        let (old, mut name, mut error) = (old.clone(), name.clone(), error.clone());
+        let Dialog::TmuxRename { scope, old, name, error } = &mut self.dialog else { return };
+        let (scope, old, mut name, mut error) = (*scope, old.clone(), name.clone(), error.clone());
         let mut submit = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::unique("tmux-rename")).show(ctx, |ui| {
@@ -8240,19 +8379,33 @@ impl App {
             });
         });
         if submit {
-            let new = name.trim();
+            let new = name.trim().to_string();
             if new.is_empty() {
                 error = Some("Name cannot be empty".into());
             } else if new == old {
                 // No change — just close.
                 self.dialog = Dialog::None;
                 return;
-            } else if let Err(e) = wazowski_core::tmux::local_rename(&old, new) {
-                error = Some(e.to_string());
             } else {
-                self.refresh_tmux_local();
-                self.dialog = Dialog::None;
-                return;
+                match scope {
+                    TmuxScope::Local => {
+                        if let Err(e) = wazowski_core::tmux::local_rename(&old, &new) {
+                            error = Some(e.to_string());
+                        } else {
+                            self.refresh_tmux_local();
+                            self.dialog = Dialog::None;
+                            return;
+                        }
+                    }
+                    TmuxScope::Remote => {
+                        let cmd = wazowski_core::tmux::remote_rename_command(&old, &new);
+                        if self.start_remote_tmux_cmd(cmd) {
+                            self.dialog = Dialog::None;
+                            return;
+                        }
+                        error = Some("No active SSH session.".into());
+                    }
+                }
             }
         }
         if cancel {
@@ -8267,8 +8420,8 @@ impl App {
     }
 
     fn show_tmux_new(&mut self, ctx: &egui::Context) {
-        let Dialog::TmuxNew { name, error } = &mut self.dialog else { return };
-        let (mut name, mut error) = (name.clone(), error.clone());
+        let Dialog::TmuxNew { scope, name, error } = &mut self.dialog else { return };
+        let (scope, mut name, mut error) = (*scope, name.clone(), error.clone());
         let mut submit = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::unique("tmux-new")).show(ctx, |ui| {
@@ -8296,30 +8449,44 @@ impl App {
             });
         });
         if submit {
-            let new = name.trim();
+            let new = name.trim().to_string();
             if new.is_empty() {
                 error = Some("Name cannot be empty".into());
-            } else if let Err(e) = wazowski_core::tmux::local_new_detached(new) {
-                error = Some(e.to_string());
             } else {
-                self.refresh_tmux_local();
-                self.dialog = Dialog::None;
-                return;
+                match scope {
+                    TmuxScope::Local => {
+                        if let Err(e) = wazowski_core::tmux::local_new_detached(&new) {
+                            error = Some(e.to_string());
+                        } else {
+                            self.refresh_tmux_local();
+                            self.dialog = Dialog::None;
+                            return;
+                        }
+                    }
+                    TmuxScope::Remote => {
+                        let cmd = wazowski_core::tmux::remote_new_command(&new);
+                        if self.start_remote_tmux_cmd(cmd) {
+                            self.dialog = Dialog::None;
+                            return;
+                        }
+                        error = Some("No active SSH session.".into());
+                    }
+                }
             }
         }
         if cancel {
             self.dialog = Dialog::None;
             return;
         }
-        if let Dialog::TmuxNew { name: n, error: err } = &mut self.dialog {
+        if let Dialog::TmuxNew { name: n, error: err, .. } = &mut self.dialog {
             *n = name;
             *err = error;
         }
     }
 
     fn show_confirm_tmux_kill(&mut self, ctx: &egui::Context) {
-        let Dialog::ConfirmTmuxKill { name } = &self.dialog else { return };
-        let name = name.clone();
+        let Dialog::ConfirmTmuxKill { scope, name } = &self.dialog else { return };
+        let (scope, name) = (*scope, name.clone());
         let mut kill = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::unique("confirm-tmux-kill")).show(ctx, |ui| {
@@ -8340,10 +8507,20 @@ impl App {
             });
         });
         if kill {
-            if let Err(e) = wazowski_core::tmux::local_kill(&name) {
-                self.error = Some(format!("Could not terminate “{name}”: {e}"));
+            match scope {
+                TmuxScope::Local => {
+                    if let Err(e) = wazowski_core::tmux::local_kill(&name) {
+                        self.error = Some(format!("Could not terminate “{name}”: {e}"));
+                    }
+                    self.refresh_tmux_local();
+                }
+                TmuxScope::Remote => {
+                    let cmd = wazowski_core::tmux::remote_kill_command(&name);
+                    if !self.start_remote_tmux_cmd(cmd) {
+                        self.error = Some("No active SSH session.".into());
+                    }
+                }
             }
-            self.refresh_tmux_local();
             self.dialog = Dialog::None;
         }
         if cancel {
@@ -13444,6 +13621,57 @@ fn entered(ui: &egui::Ui, resp: &egui::Response) -> bool {
 /// it. A plain wheel scrolls vertically; Shift+wheel scrolls horizontally (egui's
 /// default for a two-axis scroll area). When the content is wider than the pane's
 /// max width, the horizontal scrollbar appears at the bottom of the pane.
+/// A deferred tmux pane action, recorded while rendering the (self-free) scroll
+/// body and acted on afterwards. Each carries the [`TmuxScope`] it targets.
+enum TmuxAction {
+    Attach(TmuxScope, String),
+    Rename(TmuxScope, String),
+    Kill(TmuxScope, String),
+    New(TmuxScope),
+    Refresh,
+}
+
+/// Renders the session rows for one folder (Local or Remote), wiring click →
+/// attach and the right-click context menu into `action`.
+fn tmux_rows(
+    ui: &mut egui::Ui,
+    sessions: &[TmuxSession],
+    scope: TmuxScope,
+    action: &mut Option<TmuxAction>,
+) {
+    for s in sessions {
+        let resp = tmux_session_row(ui, s);
+        if resp.clicked() {
+            *action = Some(TmuxAction::Attach(scope, s.name.clone()));
+        }
+        resp.context_menu(|ui| {
+            // Specific actions first…
+            if ui.button("Attach").clicked() {
+                *action = Some(TmuxAction::Attach(scope, s.name.clone()));
+                ui.close();
+            }
+            if ui.button("New session…").clicked() {
+                *action = Some(TmuxAction::New(scope));
+                ui.close();
+            }
+            if ui.button("Refresh").clicked() {
+                *action = Some(TmuxAction::Refresh);
+                ui.close();
+            }
+            ui.separator();
+            // …then the generic ones.
+            if ui.button("Rename…").clicked() {
+                *action = Some(TmuxAction::Rename(scope, s.name.clone()));
+                ui.close();
+            }
+            if ui.button("Terminate").clicked() {
+                *action = Some(TmuxAction::Kill(scope, s.name.clone()));
+                ui.close();
+            }
+        });
+    }
+}
+
 /// Renders one tmux session as a clickable row — name, window count, and a dot
 /// when a client is attached — returning its [`egui::Response`] so the caller
 /// can act on a click (attach) or attach a context menu.
