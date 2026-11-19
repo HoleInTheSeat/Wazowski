@@ -19,10 +19,10 @@ defaults are below.
 | Serial: lower baud | `Ctrl+Shift+↓` |
 | Sessions pane | `Ctrl+Shift+1` |
 | Files pane | `Ctrl+Shift+2` |
-| Macros pane | `Ctrl+Shift+3` |
-| Tools pane | `Ctrl+Shift+4` |
-| Vault pane | `Ctrl+Shift+5` |
-| tmux pane | `Ctrl+Shift+6` |
+| tmux pane | `Ctrl+Shift+3` |
+| Macros pane | `Ctrl+Shift+4` |
+| Tools pane | `Ctrl+Shift+5` |
+| Vault pane | `Ctrl+Shift+6` |
 | Settings pane | `Ctrl+Shift+S` |
 | Terminal: larger font | `Ctrl+=` |
 | Terminal: smaller font | `Ctrl+-` |

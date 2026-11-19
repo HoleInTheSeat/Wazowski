@@ -68,6 +68,11 @@ struct Tab {
     connected_at: Option<std::time::Instant>,
     /// This tab's terminal font size (seeded from the settings default).
     font_size: f32,
+    /// The tmux session this tab is currently attached to, if any. Set when the
+    /// tmux pane attaches (a local `tmux: …` tab, or an SSH tab the shell was
+    /// told to attach). Lets a click re-focus an existing tab, avoid re-attaching
+    /// the session you're already in, and switch sessions without nesting.
+    tmux_attached: Option<String>,
 }
 
 /// How a terminal tab's session can be restarted after it ends.
@@ -2034,6 +2039,7 @@ impl App {
             session_id: None,
             connected_at,
             font_size: self.settings.terminal_font_size,
+            tmux_attached: None,
         };
         let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
         let index = if adjacent && !self.tabs.is_empty() {
@@ -2985,6 +2991,16 @@ impl App {
     /// session ending) exits `tmux attach`, so the tab auto-closes like a shell
     /// while the tmux session itself lives on.
     fn open_tmux_attach(&mut self, name: &str, ctx: &egui::Context) {
+        // Already open in a tab? Just switch to it (a no-op if it's the active
+        // tab — clicking the session you're already in does nothing).
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| t.tmux_attached.as_deref() == Some(name))
+        {
+            self.active = i;
+            return;
+        }
         let size = TermSize::default();
         let repaint = ctx.clone();
         let args = wazowski_core::tmux::attach_args(name);
@@ -2999,6 +3015,7 @@ impl App {
                 );
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.restart = Some(RestartKind::Shell);
+                    tab.tmux_attached = Some(name.to_owned());
                 }
             }
             Err(e) => self.error = Some(format!("Could not attach to tmux session: {e:#}")),
@@ -3102,12 +3119,32 @@ impl App {
         true
     }
 
-    /// Attaches to a remote tmux session by typing `tmux attach` into the active
-    /// SSH tab's shell (the normal way to attach over an existing connection).
+    /// Attaches to a remote tmux session by typing into the active SSH tab's
+    /// shell (the normal way to attach over an existing connection). If the shell
+    /// is already showing another tmux session, it switches to this one instead
+    /// of attaching again — no "sessions should be nested" warning. Clicking the
+    /// session the shell is already in does nothing.
     fn attach_tmux_remote(&mut self, name: &str) {
         let Some((tab_id, _, _)) = self.active_ssh_exec() else { return };
-        let line = format!("{}\n", wazowski_core::tmux::remote_attach_command(name));
-        self.paste_into_tab(tab_id, line.as_bytes());
+        let current = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.tmux_attached.as_deref());
+        let cmd = match current {
+            // Already in this session — leave the shell alone.
+            Some(cur) if cur == name => return,
+            // In a different session (or possibly none): switch if we can,
+            // otherwise attach. The command self-corrects either way.
+            Some(_) => wazowski_core::tmux::remote_switch_or_attach_command(name),
+            // Not known to be attached — a plain attach.
+            None => wazowski_core::tmux::remote_attach_command(name),
+        };
+        let line = format!("{cmd}\n");
+        if self.paste_into_tab(tab_id, line.as_bytes())
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.tmux_attached = Some(name.to_owned());
+        }
     }
 
     /// Saves the active tab: a terminal's scrollback output, or an RDP/VNC tab's
@@ -4357,14 +4394,14 @@ impl App {
                         clicked = Some(view);
                     }
                 };
-                // Top group; new buttons are added just after Vault, above the gap.
+                // Top group; new buttons are added just before the gap.
                 for (view, glyph, color, tip) in [
                     (SidebarView::Sessions, icons::DESKTOP, Color32::from_rgb(90, 170, 255), "Sessions"),
                     (SidebarView::Files, icons::FOLDER, Color32::from_rgb(120, 200, 120), "Files (SFTP)"),
+                    (SidebarView::Tmux, icons::GRID, Color32::from_rgb(130, 200, 180), "tmux sessions"),
                     (SidebarView::Macros, icons::SCROLL, Color32::from_rgb(240, 170, 60), "Macros"),
                     (SidebarView::Tools, icons::WRENCH, Color32::from_rgb(200, 150, 110), "Tools (servers & network)"),
                     (SidebarView::Vault, icons::LOCK_KEY, Color32::from_rgb(210, 190, 90), "Vault (credentials)"),
-                    (SidebarView::Tmux, icons::GRID, Color32::from_rgb(130, 200, 180), "tmux sessions"),
                 ] {
                     rail_button(ui, view, glyph, color, tip);
                 }

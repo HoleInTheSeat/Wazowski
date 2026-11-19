@@ -110,6 +110,16 @@ pub fn remote_attach_command(name: &str) -> String {
     format!("tmux attach -t {}", shell_quote(name))
 }
 
+/// The remote command to move the SSH shell's view to a session, typed into the
+/// shell. Works whether or not the shell is already inside tmux: if it is,
+/// `switch-client` re-points the existing client without the "sessions should be
+/// nested" warning; if it isn't, that call fails quietly and a plain `attach`
+/// runs instead. No trailing newline — the caller adds the Enter that runs it.
+pub fn remote_switch_or_attach_command(name: &str) -> String {
+    let t = shell_quote(name);
+    format!("tmux switch-client -t {t} 2>/dev/null || tmux attach -t {t}")
+}
+
 /// Interprets the result of a remote `list-sessions` (its stdout, stderr, and
 /// exit status) into sessions, treating tmux's "no server running" as an empty
 /// list rather than an error — matching the local path's behaviour.
@@ -308,6 +318,11 @@ mod tests {
         assert_eq!(remote_kill_command("main"), "tmux kill-session -t 'main'");
         assert_eq!(remote_rename_command("a", "b"), "tmux rename-session -t 'a' 'b'");
         assert_eq!(remote_new_command("x"), "tmux new-session -d -s 'x'");
+        assert_eq!(remote_attach_command("x"), "tmux attach -t 'x'");
+        assert_eq!(
+            remote_switch_or_attach_command("x"),
+            "tmux switch-client -t 'x' 2>/dev/null || tmux attach -t 'x'"
+        );
         assert!(remote_list_command().starts_with("tmux list-sessions -F '"));
     }
 

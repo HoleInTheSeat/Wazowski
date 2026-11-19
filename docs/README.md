@@ -38,7 +38,7 @@ consoles, saved sessions, credentials, macros, quick servers, and network tools.
 
 - **Tabs** hold connections and shells; a tab can be **split** into panes.
 - The **left pane** switches between views via the icon rail: **Sessions**,
-  **Files**, **Macros**, **Tools**, **Vault**, **tmux**, and **Settings**.
+  **Files**, **tmux**, **Macros**, **Tools**, **Vault**, and **Settings**.
 - **Sessions** are saved connection definitions (SSH/RDP/VNC) organised in
   folders. They hold no secrets — credentials are referenced by name from the
   **vault**.

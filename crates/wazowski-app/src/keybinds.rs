@@ -160,10 +160,10 @@ impl Action {
             Action::BaudDown => KeyboardShortcut::new(ctrl_shift, Key::ArrowDown),
             Action::ViewSessions => KeyboardShortcut::new(ctrl_shift, Key::Num1),
             Action::ViewFiles => KeyboardShortcut::new(ctrl_shift, Key::Num2),
-            Action::ViewMacros => KeyboardShortcut::new(ctrl_shift, Key::Num3),
-            Action::ViewTools => KeyboardShortcut::new(ctrl_shift, Key::Num4),
-            Action::ViewVault => KeyboardShortcut::new(ctrl_shift, Key::Num5),
-            Action::ViewTmux => KeyboardShortcut::new(ctrl_shift, Key::Num6),
+            Action::ViewTmux => KeyboardShortcut::new(ctrl_shift, Key::Num3),
+            Action::ViewMacros => KeyboardShortcut::new(ctrl_shift, Key::Num4),
+            Action::ViewTools => KeyboardShortcut::new(ctrl_shift, Key::Num5),
+            Action::ViewVault => KeyboardShortcut::new(ctrl_shift, Key::Num6),
             Action::ViewSettings => KeyboardShortcut::new(ctrl_shift, Key::S),
             Action::FontSizeUp => KeyboardShortcut::new(ctrl, Key::Equals),
             Action::FontSizeDown => KeyboardShortcut::new(ctrl, Key::Minus),
@@ -319,11 +319,12 @@ mod tests {
         // An untouched action still has its default.
         assert_eq!(map.get(Action::CloseTab), Action::CloseTab.default_shortcut());
         // The old `view_*` pane keys are ignored, so the new defaults apply
-        // (Files=2, Macros=3) rather than the old swapped layout.
+        // (Files=2, tmux=3, Macros=4) rather than the old swapped layout.
         assert_eq!(map.get(Action::ViewFiles), Action::ViewFiles.default_shortcut());
         assert_eq!(map.get(Action::ViewMacros), Action::ViewMacros.default_shortcut());
         assert_eq!(map.text(Action::ViewFiles), "Ctrl+Shift+2");
-        assert_eq!(map.text(Action::ViewMacros), "Ctrl+Shift+3");
+        assert_eq!(map.text(Action::ViewTmux), "Ctrl+Shift+3");
+        assert_eq!(map.text(Action::ViewMacros), "Ctrl+Shift+4");
     }
 
     #[test]

@@ -5,7 +5,8 @@ sessions — both on this machine and on the host of the SSH tab you're currentl
 looking at — so you can attach, create, rename, and terminate them without
 remembering tmux's command-line incantations.
 
-Open it from the icon rail (the grid icon) or with **`Ctrl+Shift+6`**.
+Open it from the icon rail (the grid icon, under Files) or with
+**`Ctrl+Shift+3`**.
 
 tmux is a *terminal multiplexer*: it keeps shells and running programs alive in
 named **sessions** that survive you disconnecting, so you can detach and
@@ -32,10 +33,15 @@ filter box to narrow a long list by name.
 
 - **Local** opens a new terminal tab running `tmux attach` for that session.
   Detaching (tmux's `Ctrl+b d`) or ending the session exits the tab, and the
-  session keeps running.
+  session keeps running. If that session is **already open in a tab**, clicking
+  it just switches to that tab instead of opening a second one.
 - **Remote** types `tmux attach` into the active SSH tab's shell — the normal
   way to attach over an existing connection. Make sure that shell is at a prompt
-  first.
+  first. If the shell is already showing a *different* tmux session, clicking
+  another one **switches** to it rather than attaching again, so you never see
+  tmux's "sessions should be nested" warning.
+
+Either way, clicking the session you're **already in** does nothing.
 
 ## Creating, renaming, terminating
 
