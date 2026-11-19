@@ -12,7 +12,11 @@ plain TOML files in your config dir (`~/.config/wazowski/` on Linux).
   to a chosen saved session.
 - **Remember window size and position** — off by default, so Wazowski opens
   centered on the main monitor at a standard size each launch. Turn it on to
-  reopen at the size and position you last left it.
+  reopen at the size and position you last left it. *On Wayland (e.g. KDE
+  Plasma), window **placement** is controlled by the compositor, not the app —
+  so the position is whatever your compositor restores regardless of this
+  setting, and only the **size** is governed here. Use a KWin window rule if you
+  need a fixed position.*
 - **Open web GUI scheme** — whether the session "Open web GUI" action uses
   `https://` or `http://`.
 

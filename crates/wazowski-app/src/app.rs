@@ -10232,19 +10232,32 @@ impl App {
         if !self.settings.remember_window {
             return;
         }
-        ctx.input(|i| {
+        let (special, native_pos, canvas) = ctx.input(|i| {
             let vp = i.viewport();
             let special = vp.maximized.unwrap_or(false)
                 || vp.fullscreen.unwrap_or(false)
                 || vp.minimized.unwrap_or(false);
-            if special {
-                return;
-            }
-            if let Some(rect) = vp.inner_rect {
-                self.settings.window_size = Some([rect.width(), rect.height()]);
-                self.settings.window_pos = Some([rect.min.x, rect.min.y]);
-            }
+            // The native window rect (and thus its position) is None on Wayland,
+            // where the compositor hides absolute geometry from clients.
+            (special, vp.inner_rect.map(|r| r.min), i.raw.screen_rect)
         });
+        if special {
+            return;
+        }
+        // Take the inner size from the egui canvas, which is reliable on both X11
+        // and Wayland, and convert its points back to the OS-logical points that
+        // `with_inner_size` expects (undoing the UI zoom factor).
+        if let Some(canvas) = canvas {
+            let size = canvas.size() * ctx.zoom_factor();
+            if size.x > 1.0 && size.y > 1.0 {
+                self.settings.window_size = Some([size.x, size.y]);
+            }
+        }
+        // Position is only knowable on X11; on Wayland it's None and the
+        // compositor owns placement, so we simply don't record it there.
+        if let Some(pos) = native_pos {
+            self.settings.window_pos = Some([pos.x, pos.y]);
+        }
     }
 
     /// Writes the remembered window geometry to disk, if the option is on. Called
