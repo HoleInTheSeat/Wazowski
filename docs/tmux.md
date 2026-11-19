@@ -20,7 +20,10 @@ host (over the SSH connection).
   `tmux` is on your `PATH`; if it isn't, the folder says so.
 - **Remote** — tmux sessions on the host of the **currently active SSH tab**.
   Switch to a different SSH tab and the folder follows it; with no SSH tab
-  active it prompts you to open one. The host name is shown under the heading.
+  active it prompts you to open one. The host is named under the heading — its
+  friendly name (the saved session's name / hostname), or the address you
+  connected to if there's no friendlier name. **Click that name** to detach from
+  tmux entirely and drop back to the plain SSH shell in that tab.
 
 Each session row shows its name, its window count, and a dot (`●`) when a client
 is already attached. The list refreshes automatically every couple of seconds

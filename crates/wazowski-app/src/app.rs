@@ -3022,17 +3022,24 @@ impl App {
         }
     }
 
-    /// If the active tab is a connected SSH terminal, returns its id, host, and a
-    /// cloned exec handle for running tmux commands on that host.
+    /// If the active tab is a connected SSH terminal, returns its id, a display
+    /// name for it, and a cloned exec handle for running tmux commands on that
+    /// host. The display name is the tab's friendly label (the saved-session
+    /// name / hostname), falling back to the raw connect host (an IP) when
+    /// there's nothing friendlier.
     fn active_ssh_exec(&self) -> Option<(u64, String, Exec)> {
         let tab = self.tabs.get(self.active)?;
         if !matches!(tab.content, TabContent::Terminal(_)) {
             return None;
         }
         let exec = tab.exec.clone()?;
-        let host = match &tab.restart {
-            Some(RestartKind::Ssh(p)) => p.host.clone(),
-            _ => String::new(),
+        let host = if !tab.label.trim().is_empty() {
+            tab.label.clone()
+        } else {
+            match &tab.restart {
+                Some(RestartKind::Ssh(p)) => p.host.clone(),
+                _ => String::new(),
+            }
         };
         Some((tab.id, host, exec))
     }
@@ -3144,6 +3151,23 @@ impl App {
             && let Some(tab) = self.tabs.get_mut(self.active)
         {
             tab.tmux_attached = Some(name.to_owned());
+        }
+    }
+
+    /// Detaches the active SSH tab's shell from tmux entirely (back to the plain
+    /// login shell) and focuses that tab, so clicking the host returns you to the
+    /// real SSH session.
+    fn detach_tmux_remote(&mut self) {
+        let Some((tab_id, _, _)) = self.active_ssh_exec() else { return };
+        // Bring the SSH tab to the front so the shell you're dropped into shows.
+        if let Some(i) = self.tabs.iter().position(|t| t.id == tab_id) {
+            self.active = i;
+        }
+        let line = format!("{}\n", wazowski_core::tmux::remote_detach_command());
+        if self.paste_into_tab(tab_id, line.as_bytes())
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.tmux_attached = None;
         }
     }
 
@@ -4637,7 +4661,18 @@ impl App {
                     }
                     if let Some(host) = &remote_host {
                         ui.add_space(2.0);
-                        ui.weak(format!("    {host}"));
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            if ui
+                                .link(host.as_str())
+                                .on_hover_text(
+                                    "Detach from tmux — back to the SSH shell",
+                                )
+                                .clicked()
+                            {
+                                action = Some(TmuxAction::DetachRemote);
+                            }
+                        });
                     }
                     if let Some(e) = &remote_err {
                         ui.add_space(2.0);
@@ -4676,6 +4711,7 @@ impl App {
                 // Force a remote re-list on the next frame too.
                 self.tmux_remote_last = None;
             }
+            Some(TmuxAction::DetachRemote) => self.detach_tmux_remote(),
             None => {}
         }
     }
@@ -13708,6 +13744,8 @@ enum TmuxAction {
     Kill(TmuxScope, String),
     New(TmuxScope),
     Refresh,
+    /// Detach the active SSH tab's shell from tmux entirely (the Remote host).
+    DetachRemote,
 }
 
 /// Renders the session rows for one folder (Local or Remote), wiring click →

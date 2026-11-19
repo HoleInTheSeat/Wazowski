@@ -110,6 +110,14 @@ pub fn remote_attach_command(name: &str) -> String {
     format!("tmux attach -t {}", shell_quote(name))
 }
 
+/// The remote command to detach the SSH shell from tmux entirely, typed into
+/// the shell — drops the client back to the plain login shell. A harmless no-op
+/// (prints a short error) if the shell isn't inside tmux. No trailing newline —
+/// the caller adds the Enter that runs it.
+pub fn remote_detach_command() -> String {
+    "tmux detach-client".to_owned()
+}
+
 /// The remote command to move the SSH shell's view to a session, typed into the
 /// shell. Works whether or not the shell is already inside tmux: if it is,
 /// `switch-client` re-points the existing client without the "sessions should be
