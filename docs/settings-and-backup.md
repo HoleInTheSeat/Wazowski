@@ -10,6 +10,9 @@ plain TOML files in your config dir (`~/.config/wazowski/` on Linux).
 - **Allow multiple instances** — run a second Wazowski alongside the first.
 - **Startup tab** — start with the welcome screen, a local shell, or by connecting
   to a chosen saved session.
+- **Remember window size and position** — off by default, so Wazowski opens
+  centered on the main monitor at a standard size each launch. Turn it on to
+  reopen at the size and position you last left it.
 - **Open web GUI scheme** — whether the session "Open web GUI" action uses
   `https://` or `http://`.
 

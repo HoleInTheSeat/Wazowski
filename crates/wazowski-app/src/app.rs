@@ -3647,6 +3647,16 @@ impl App {
                 if shell_on_startup { StartupTab::LocalShell } else { StartupTab::None };
             *changed = true;
         }
+        if ui
+            .checkbox(&mut self.settings.remember_window, "Remember window size and position")
+            .on_hover_text(
+                "On: reopen at the last size and position.\n\
+                 Off (default): center on the main monitor at a standard size each launch.",
+            )
+            .changed()
+        {
+            *changed = true;
+        }
         ui.horizontal(|ui| {
             ui.label("Open web GUI with:");
             egui::ComboBox::from_id_salt("web-scheme")
@@ -8432,15 +8442,13 @@ impl App {
             ui.add_space(6.0);
             ui.label(format!("Rename “{old}” to:"));
             let resp = ui.text_edit_singleline(&mut name);
-            resp.request_focus();
+            autofocus(ui, &resp);
             if let Some(e) = &error {
                 ui.add_space(4.0);
                 ui.colored_label(Color32::from_rgb(220, 120, 120), e);
             }
             // Enter submits.
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                submit = true;
-            }
+            submit |= entered(ui, &resp);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Rename").clicked() {
@@ -8503,14 +8511,12 @@ impl App {
             ui.add_space(6.0);
             ui.label("Session name:");
             let resp = ui.text_edit_singleline(&mut name);
-            resp.request_focus();
+            autofocus(ui, &resp);
             if let Some(e) = &error {
                 ui.add_space(4.0);
                 ui.colored_label(Color32::from_rgb(220, 120, 120), e);
             }
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                submit = true;
-            }
+            submit |= entered(ui, &resp);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Create").clicked() {
@@ -10211,10 +10217,46 @@ impl App {
 
     /// Finishes quitting: clears state and lets the window close.
     fn finish_quit(&mut self, ctx: &egui::Context) {
+        self.persist_window_geometry(ctx);
         self.quitting = true;
         self.quit_pending.clear();
         self.dialog = Dialog::None;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// While "remember size and position" is on, keeps the current window
+    /// geometry in memory (skipping maximized/fullscreen/minimized frames, so the
+    /// underlying windowed size is what we remember). Called every frame; the
+    /// value is written to disk only when the window closes.
+    fn track_window_geometry(&mut self, ctx: &egui::Context) {
+        if !self.settings.remember_window {
+            return;
+        }
+        ctx.input(|i| {
+            let vp = i.viewport();
+            let special = vp.maximized.unwrap_or(false)
+                || vp.fullscreen.unwrap_or(false)
+                || vp.minimized.unwrap_or(false);
+            if special {
+                return;
+            }
+            if let Some(rect) = vp.inner_rect {
+                self.settings.window_size = Some([rect.width(), rect.height()]);
+                self.settings.window_pos = Some([rect.min.x, rect.min.y]);
+            }
+        });
+    }
+
+    /// Writes the remembered window geometry to disk, if the option is on. Called
+    /// on the way out so the next launch can restore it.
+    fn persist_window_geometry(&mut self, ctx: &egui::Context) {
+        if !self.settings.remember_window {
+            return;
+        }
+        self.track_window_geometry(ctx);
+        if let Err(e) = self.settings.save() {
+            eprintln!("Could not save window geometry: {e:#}");
+        }
     }
 
     fn show_confirm_quit(&mut self, ctx: &egui::Context) {
@@ -12299,6 +12341,10 @@ impl eframe::App for App {
         // Deliver a requested clipboard paste to the active remote session.
         self.drain_remote_paste(&ctx);
 
+        // Remember the live window geometry (when the option is on) so it can be
+        // written out on close.
+        self.track_window_geometry(&ctx);
+
         // Confirm before closing the window while sessions/shells are open, or
         // while shared sources have unpushed changes. Pending changes are computed
         // once per close attempt (git calls), not every frame.
@@ -12307,6 +12353,7 @@ impl eframe::App for App {
                 self.quit_pending = self.collect_pending_shared();
             }
             if self.tabs.is_empty() && self.quit_pending.is_empty() {
+                self.persist_window_geometry(&ctx);
                 self.quitting = true;
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

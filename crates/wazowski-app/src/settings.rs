@@ -118,6 +118,18 @@ pub struct Settings {
     /// Saved URLs for the API tool (most-recent first).
     #[serde(default)]
     pub api_urls: Vec<String>,
+    /// When on, the window reopens at its last size and position instead of
+    /// centering fresh on the main monitor each launch. Off by default.
+    #[serde(default)]
+    pub remember_window: bool,
+    /// Last window inner size in points `[w, h]` (only used when
+    /// `remember_window` is on).
+    #[serde(default)]
+    pub window_size: Option<[f32; 2]>,
+    /// Last window top-left position in points `[x, y]` (only used when
+    /// `remember_window` is on).
+    #[serde(default)]
+    pub window_pos: Option<[f32; 2]>,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -155,6 +167,9 @@ impl Default for Settings {
             json_urls: Vec::new(),
             jq_filters: Vec::new(),
             api_urls: Vec::new(),
+            remember_window: false,
+            window_size: None,
+            window_pos: None,
             path: None,
         }
     }

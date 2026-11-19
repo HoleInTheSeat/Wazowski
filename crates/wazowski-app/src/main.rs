@@ -133,17 +133,30 @@ fn main() -> eframe::Result {
         }
     };
 
+    const DEFAULT_SIZE: [f32; 2] = [1200.0, 760.0];
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("Wazowski")
         .with_app_id("wazowski")
         .with_decorations(false)
-        .with_inner_size([1200.0, 760.0])
         .with_min_inner_size([640.0, 400.0]);
+    // By default, open centered on the main monitor at a standard size every
+    // launch. With "remember size and position" on, restore the saved geometry
+    // instead (and only center as a fallback when no position was saved yet).
+    let mut centered = true;
+    if settings.remember_window {
+        viewport = viewport.with_inner_size(settings.window_size.unwrap_or(DEFAULT_SIZE));
+        if let Some(pos) = settings.window_pos {
+            viewport = viewport.with_position(pos);
+            centered = false;
+        }
+    } else {
+        viewport = viewport.with_inner_size(DEFAULT_SIZE);
+    }
     // The window/taskbar icon, embedded from icon.png at the repo root.
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../../icon.png")) {
         viewport = viewport.with_icon(icon);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let options = eframe::NativeOptions { viewport, centered, ..Default::default() };
     eframe::run_native(
         "Wazowski",
         options,
