@@ -43,6 +43,8 @@ pub enum Action {
     ViewTools,
     #[serde(rename = "pane_vault")]
     ViewVault,
+    #[serde(rename = "pane_tmux")]
+    ViewTmux,
     #[serde(rename = "pane_settings")]
     ViewSettings,
     FontSizeUp,
@@ -51,7 +53,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 21] = [
+    pub const ALL: [Action; 22] = [
         Action::NewShell,
         Action::CloseTab,
         Action::NextTab,
@@ -69,6 +71,7 @@ impl Action {
         Action::ViewMacros,
         Action::ViewTools,
         Action::ViewVault,
+        Action::ViewTmux,
         Action::ViewSettings,
         Action::FontSizeUp,
         Action::FontSizeDown,
@@ -95,6 +98,7 @@ impl Action {
             Action::ViewMacros => "Macros pane",
             Action::ViewTools => "Tools pane",
             Action::ViewVault => "Vault pane",
+            Action::ViewTmux => "tmux pane",
             Action::ViewSettings => "Settings pane",
             Action::FontSizeUp => "Terminal: larger font",
             Action::FontSizeDown => "Terminal: smaller font",
@@ -125,6 +129,7 @@ impl Action {
             "pane_macros" => Action::ViewMacros,
             "pane_tools" => Action::ViewTools,
             "pane_vault" => Action::ViewVault,
+            "pane_tmux" => Action::ViewTmux,
             "pane_settings" => Action::ViewSettings,
             "font_size_up" => Action::FontSizeUp,
             "font_size_down" => Action::FontSizeDown,
@@ -158,6 +163,7 @@ impl Action {
             Action::ViewMacros => KeyboardShortcut::new(ctrl_shift, Key::Num3),
             Action::ViewTools => KeyboardShortcut::new(ctrl_shift, Key::Num4),
             Action::ViewVault => KeyboardShortcut::new(ctrl_shift, Key::Num5),
+            Action::ViewTmux => KeyboardShortcut::new(ctrl_shift, Key::Num6),
             Action::ViewSettings => KeyboardShortcut::new(ctrl_shift, Key::S),
             Action::FontSizeUp => KeyboardShortcut::new(ctrl, Key::Equals),
             Action::FontSizeDown => KeyboardShortcut::new(ctrl, Key::Minus),

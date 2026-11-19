@@ -2,6 +2,7 @@
 //! (in later phases) session definitions and configuration.
 
 pub mod session;
+pub mod tmux;
 pub mod vault;
 
 pub use session::{

@@ -20,9 +20,33 @@ impl LocalPty {
         size: TermSize,
         wake: impl Fn() + Send + 'static,
     ) -> anyhow::Result<(Self, Receiver<BackendEvent>)> {
+        Self::spawn_cmd(size, CommandBuilder::new_default_prog(), wake)
+    }
+
+    /// Starts a specific program (rather than the default shell) in a PTY —
+    /// used, for example, to run `tmux attach` so a tmux session appears as an
+    /// ordinary terminal tab. The terminal env (`TERM`, `COLORTERM`) and the
+    /// home working directory are applied just as for [`spawn`].
+    pub fn spawn_program(
+        size: TermSize,
+        program: &str,
+        args: &[String],
+        wake: impl Fn() + Send + 'static,
+    ) -> anyhow::Result<(Self, Receiver<BackendEvent>)> {
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args(args);
+        Self::spawn_cmd(size, cmd, wake)
+    }
+
+    /// Shared launcher: opens a PTY, applies the terminal environment, spawns
+    /// `cmd`, and wires up the reader thread.
+    fn spawn_cmd(
+        size: TermSize,
+        mut cmd: CommandBuilder,
+        wake: impl Fn() + Send + 'static,
+    ) -> anyhow::Result<(Self, Receiver<BackendEvent>)> {
         let pair = native_pty_system().openpty(pty_size(size))?;
 
-        let mut cmd = CommandBuilder::new_default_prog();
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         if let Some(home) = std::env::home_dir() {

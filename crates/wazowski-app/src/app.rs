@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, RichText};
 use wazowski_core::session::Auth;
+use wazowski_core::tmux::TmuxSession;
 use wazowski_core::{
     EntryInfo, FolderStyle, Protocol, RdpQuality, Secret, SecretCategory, Session, SessionStore,
     Vault, VaultError, VncQuality,
@@ -718,6 +719,12 @@ enum Dialog {
     /// Type a vault password into a terminal tab: first confirm the master
     /// password, then pick the entry.
     PastePassword(Box<PastePasswordState>),
+    /// Rename a local tmux session (`old` → the edited `name`).
+    TmuxRename { old: String, name: String, error: Option<String> },
+    /// Create a new, detached local tmux session with the entered name.
+    TmuxNew { name: String, error: Option<String> },
+    /// Confirm terminating (killing) a local tmux session.
+    ConfirmTmuxKill { name: String },
 }
 
 /// State for the "Paste password" dialog (tab right-click menu).
@@ -1307,6 +1314,17 @@ pub struct App {
     filter_tools: String,
     filter_vault: String,
     filter_settings: String,
+    filter_tmux: String,
+    /// Cached local tmux sessions, refreshed on a short interval while the tmux
+    /// pane is visible and whenever an action changes them.
+    tmux_local: Vec<wazowski_core::tmux::TmuxSession>,
+    /// Last error from listing local tmux sessions, surfaced in the pane.
+    tmux_local_err: Option<String>,
+    /// Whether a local `tmux` binary was found. `None` until first checked; the
+    /// value (and tmux's version banner) is cached so detection runs once.
+    tmux_version: Option<Option<String>>,
+    /// When the local tmux list was last refreshed, driving the auto-poll.
+    tmux_last_refresh: Option<std::time::Instant>,
     /// Filter text for the Settings ▸ Keybindings list.
     filter_keybinds: String,
     /// Natural width (points) of the current left pane's list content, measured
@@ -1370,6 +1388,7 @@ enum SidebarView {
     Files,
     Tools,
     Vault,
+    Tmux,
     Settings,
 }
 
@@ -1712,6 +1731,11 @@ impl App {
             filter_tools: String::new(),
             filter_vault: String::new(),
             filter_settings: String::new(),
+            filter_tmux: String::new(),
+            tmux_local: Vec::new(),
+            tmux_local_err: None,
+            tmux_version: None,
+            tmux_last_refresh: None,
             filter_keybinds: String::new(),
             paste_pw_master: None,
             pane_content_w: 180.0,
@@ -2848,6 +2872,9 @@ impl App {
         if triggered(Action::ViewVault, ctx, &self.keymap) {
             self.switch_pane(SidebarView::Vault, ctx);
         }
+        if triggered(Action::ViewTmux, ctx, &self.keymap) {
+            self.switch_pane(SidebarView::Tmux, ctx);
+        }
         if triggered(Action::ViewSettings, ctx, &self.keymap) {
             self.switch_pane(SidebarView::Settings, ctx);
         }
@@ -2883,6 +2910,62 @@ impl App {
             self.ensure_tree_cursor(ctx);
         } else {
             self.focus_filter = true;
+        }
+        if view == SidebarView::Tmux {
+            // Fetch a current list the moment the pane opens, rather than waiting
+            // for the first auto-poll tick.
+            self.refresh_tmux_local();
+        }
+    }
+
+    /// Re-reads the local tmux session list, caching the result (or the error)
+    /// for the tmux pane. Detects the `tmux` binary once and remembers the
+    /// outcome. Cheap enough to call on a short interval.
+    fn refresh_tmux_local(&mut self) {
+        if self.tmux_version.is_none() {
+            self.tmux_version = Some(wazowski_core::tmux::detect_local());
+        }
+        // No tmux binary → nothing to list; the pane shows an install hint.
+        if matches!(self.tmux_version, Some(None)) {
+            self.tmux_local.clear();
+            self.tmux_local_err = None;
+            self.tmux_last_refresh = Some(std::time::Instant::now());
+            return;
+        }
+        match wazowski_core::tmux::local_sessions() {
+            Ok(sessions) => {
+                self.tmux_local = sessions;
+                self.tmux_local_err = None;
+            }
+            Err(e) => {
+                self.tmux_local.clear();
+                self.tmux_local_err = Some(e.to_string());
+            }
+        }
+        self.tmux_last_refresh = Some(std::time::Instant::now());
+    }
+
+    /// Opens a terminal tab attached to a local tmux session. Detaching (or the
+    /// session ending) exits `tmux attach`, so the tab auto-closes like a shell
+    /// while the tmux session itself lives on.
+    fn open_tmux_attach(&mut self, name: &str, ctx: &egui::Context) {
+        let size = TermSize::default();
+        let repaint = ctx.clone();
+        let args = wazowski_core::tmux::attach_args(name);
+        match LocalPty::spawn_program(size, "tmux", &args, move || repaint.request_repaint()) {
+            Ok((pty, output)) => {
+                let terminal = Terminal::new(Box::new(pty), output, size);
+                let panes = Panes::new(Box::new(terminal));
+                self.push_tab(
+                    format!("tmux: {name}"),
+                    TabContent::Terminal(Box::new(panes)),
+                    None,
+                );
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.restart = Some(RestartKind::Shell);
+                }
+            }
+            Err(e) => self.error = Some(format!("Could not attach to tmux session: {e:#}")),
         }
     }
 
@@ -4140,6 +4223,7 @@ impl App {
                     (SidebarView::Macros, icons::SCROLL, Color32::from_rgb(240, 170, 60), "Macros"),
                     (SidebarView::Tools, icons::WRENCH, Color32::from_rgb(200, 150, 110), "Tools (servers & network)"),
                     (SidebarView::Vault, icons::LOCK_KEY, Color32::from_rgb(210, 190, 90), "Vault (credentials)"),
+                    (SidebarView::Tmux, icons::GRID, Color32::from_rgb(130, 200, 180), "tmux sessions"),
                 ] {
                     rail_button(ui, view, glyph, color, tip);
                 }
@@ -4169,6 +4253,7 @@ impl App {
                     SidebarView::Files => self.sidebar_files(ui, ctx),
                     SidebarView::Tools => self.sidebar_tools(ui),
                     SidebarView::Vault => self.sidebar_vault(ui),
+                    SidebarView::Tmux => self.sidebar_tmux(ui, ctx),
                     SidebarView::Settings => self.sidebar_settings_categories(ui),
                 });
             }
@@ -4287,6 +4372,136 @@ impl App {
             }
         });
         self.pane_content_w = w;
+    }
+
+    /// The tmux pane: live tmux sessions grouped into **Local** (this machine)
+    /// and **Remote** (the active SSH tab's host — wired up in a later phase).
+    /// Clicking a session attaches to it in a new terminal tab.
+    fn sidebar_tmux(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Auto-poll: tmux can't push list changes, so refresh on a short interval
+        // while the pane is visible. A manual Refresh button forces it too.
+        let stale = self
+            .tmux_last_refresh
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(2))
+            .unwrap_or(true);
+        if stale {
+            self.refresh_tmux_local();
+        }
+        // Keep polling while this pane is on screen.
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
+
+        // A click or context-menu choice inside the scroll body is recorded here
+        // and acted on afterwards, so the body borrows no `self`.
+        enum TmuxAction {
+            Attach(String),
+            Rename(String),
+            Kill(String),
+            New,
+            Refresh,
+        }
+
+        let mut action: Option<TmuxAction> = None;
+        let tmux_ok = !matches!(self.tmux_version, Some(None));
+        ui.horizontal(|ui| {
+            ui.heading("tmux");
+            if tmux_ok
+                && ui.small_button(icons::PLUS).on_hover_text("New session…").clicked()
+            {
+                action = Some(TmuxAction::New);
+            }
+            if ui.small_button(icons::SYNC).on_hover_text("Refresh").clicked() {
+                action = Some(TmuxAction::Refresh);
+            }
+        });
+        let focus = std::mem::take(&mut self.focus_filter);
+        filter_box(ui, &mut self.filter_tmux, focus);
+        ui.separator();
+
+        // Snapshot what the scroll body needs, so the closure borrows no `self`.
+        let needle = self.filter_tmux.to_lowercase();
+        let not_installed = matches!(self.tmux_version, Some(None));
+        let err = self.tmux_local_err.clone();
+        let sessions: Vec<TmuxSession> = self
+            .tmux_local
+            .iter()
+            .filter(|s| needle.is_empty() || s.name.to_lowercase().contains(&needle))
+            .cloned()
+            .collect();
+
+        let w = pane_scroll(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Local").strong())
+                .default_open(true)
+                .show(ui, |ui| {
+                    if not_installed {
+                        ui.add_space(2.0);
+                        ui.colored_label(
+                            Color32::from_rgb(200, 150, 90),
+                            "tmux not found on PATH",
+                        );
+                    } else if let Some(e) = &err {
+                        ui.add_space(2.0);
+                        ui.colored_label(Color32::from_rgb(220, 120, 120), e);
+                    } else if sessions.is_empty() {
+                        ui.add_space(2.0);
+                        ui.weak("No sessions");
+                    } else {
+                        for s in &sessions {
+                            let resp = tmux_session_row(ui, s);
+                            if resp.clicked() {
+                                action = Some(TmuxAction::Attach(s.name.clone()));
+                            }
+                            resp.context_menu(|ui| {
+                                // Specific actions first…
+                                if ui.button("Attach").clicked() {
+                                    action = Some(TmuxAction::Attach(s.name.clone()));
+                                    ui.close();
+                                }
+                                if ui.button("New session…").clicked() {
+                                    action = Some(TmuxAction::New);
+                                    ui.close();
+                                }
+                                if ui.button("Refresh").clicked() {
+                                    action = Some(TmuxAction::Refresh);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                // …then the generic ones.
+                                if ui.button("Rename…").clicked() {
+                                    action = Some(TmuxAction::Rename(s.name.clone()));
+                                    ui.close();
+                                }
+                                if ui.button("Terminate").clicked() {
+                                    action = Some(TmuxAction::Kill(s.name.clone()));
+                                    ui.close();
+                                }
+                            });
+                        }
+                    }
+                });
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(RichText::new("Remote").strong())
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.add_space(2.0);
+                    ui.weak("Open an SSH tab to see its tmux sessions");
+                });
+        });
+        self.pane_content_w = w;
+
+        match action {
+            Some(TmuxAction::Attach(name)) => self.open_tmux_attach(&name, ctx),
+            Some(TmuxAction::Rename(name)) => {
+                self.dialog = Dialog::TmuxRename { old: name.clone(), name, error: None };
+            }
+            Some(TmuxAction::Kill(name)) => {
+                self.dialog = Dialog::ConfirmTmuxKill { name };
+            }
+            Some(TmuxAction::New) => {
+                self.dialog = Dialog::TmuxNew { name: String::new(), error: None };
+            }
+            Some(TmuxAction::Refresh) => self.refresh_tmux_local(),
+            None => {}
+        }
     }
 
     /// The Vault view's left pane: credentials grouped by type.
@@ -7994,6 +8209,148 @@ impl App {
         }
     }
 
+    fn show_tmux_rename(&mut self, ctx: &egui::Context) {
+        let Dialog::TmuxRename { old, name, error } = &mut self.dialog else { return };
+        let (old, mut name, mut error) = (old.clone(), name.clone(), error.clone());
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("tmux-rename")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading("Rename tmux session");
+            ui.add_space(6.0);
+            ui.label(format!("Rename “{old}” to:"));
+            let resp = ui.text_edit_singleline(&mut name);
+            resp.request_focus();
+            if let Some(e) = &error {
+                ui.add_space(4.0);
+                ui.colored_label(Color32::from_rgb(220, 120, 120), e);
+            }
+            // Enter submits.
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                submit = true;
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Rename").clicked() {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if submit {
+            let new = name.trim();
+            if new.is_empty() {
+                error = Some("Name cannot be empty".into());
+            } else if new == old {
+                // No change — just close.
+                self.dialog = Dialog::None;
+                return;
+            } else if let Err(e) = wazowski_core::tmux::local_rename(&old, new) {
+                error = Some(e.to_string());
+            } else {
+                self.refresh_tmux_local();
+                self.dialog = Dialog::None;
+                return;
+            }
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+            return;
+        }
+        // Write any edits / error back into the live dialog state.
+        if let Dialog::TmuxRename { name: n, error: err, .. } = &mut self.dialog {
+            *n = name;
+            *err = error;
+        }
+    }
+
+    fn show_tmux_new(&mut self, ctx: &egui::Context) {
+        let Dialog::TmuxNew { name, error } = &mut self.dialog else { return };
+        let (mut name, mut error) = (name.clone(), error.clone());
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("tmux-new")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading("New tmux session");
+            ui.add_space(6.0);
+            ui.label("Session name:");
+            let resp = ui.text_edit_singleline(&mut name);
+            resp.request_focus();
+            if let Some(e) = &error {
+                ui.add_space(4.0);
+                ui.colored_label(Color32::from_rgb(220, 120, 120), e);
+            }
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                submit = true;
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Create").clicked() {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if submit {
+            let new = name.trim();
+            if new.is_empty() {
+                error = Some("Name cannot be empty".into());
+            } else if let Err(e) = wazowski_core::tmux::local_new_detached(new) {
+                error = Some(e.to_string());
+            } else {
+                self.refresh_tmux_local();
+                self.dialog = Dialog::None;
+                return;
+            }
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+            return;
+        }
+        if let Dialog::TmuxNew { name: n, error: err } = &mut self.dialog {
+            *n = name;
+            *err = error;
+        }
+    }
+
+    fn show_confirm_tmux_kill(&mut self, ctx: &egui::Context) {
+        let Dialog::ConfirmTmuxKill { name } = &self.dialog else { return };
+        let name = name.clone();
+        let mut kill = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("confirm-tmux-kill")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Terminate tmux session?");
+            ui.add_space(6.0);
+            ui.label(format!(
+                "Terminate “{name}”? Everything running in it is killed and any attached clients are detached. This can't be undone."
+            ));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Terminate").clicked() {
+                    kill = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if kill {
+            if let Err(e) = wazowski_core::tmux::local_kill(&name) {
+                self.error = Some(format!("Could not terminate “{name}”: {e}"));
+            }
+            self.refresh_tmux_local();
+            self.dialog = Dialog::None;
+        }
+        if cancel {
+            self.dialog = Dialog::None;
+        }
+    }
+
     // --- Dialogs ------------------------------------------------------------
 
     fn show_dialog(&mut self, ctx: &egui::Context) {
@@ -8003,6 +8360,9 @@ impl App {
             Dialog::CreateVault { .. } => self.show_create_vault(ctx),
             Dialog::RevealSecret { .. } => self.show_reveal_secret(ctx),
             Dialog::PastePassword(_) => self.show_paste_password(ctx),
+            Dialog::TmuxRename { .. } => self.show_tmux_rename(ctx),
+            Dialog::TmuxNew { .. } => self.show_tmux_new(ctx),
+            Dialog::ConfirmTmuxKill { .. } => self.show_confirm_tmux_kill(ctx),
             Dialog::EditSession(_) => self.show_edit_session(ctx),
             Dialog::QuickConnect(_) => self.show_quick_connect(ctx),
             Dialog::VaultManager(_) => self.show_vault_manager(ctx),
@@ -13084,6 +13444,24 @@ fn entered(ui: &egui::Ui, resp: &egui::Response) -> bool {
 /// it. A plain wheel scrolls vertically; Shift+wheel scrolls horizontally (egui's
 /// default for a two-axis scroll area). When the content is wider than the pane's
 /// max width, the horizontal scrollbar appears at the bottom of the pane.
+/// Renders one tmux session as a clickable row — name, window count, and a dot
+/// when a client is attached — returning its [`egui::Response`] so the caller
+/// can act on a click (attach) or attach a context menu.
+fn tmux_session_row(ui: &mut egui::Ui, s: &TmuxSession) -> egui::Response {
+    let windows = if s.windows == 1 { "1 window".to_string() } else { format!("{} windows", s.windows) };
+    let mut text = s.name.clone();
+    if s.attached {
+        // A filled dot marks a session with a client already attached.
+        text.push_str("  ●");
+    }
+    let hover = if s.attached {
+        format!("{} — {windows}, attached\nClick to attach", s.name)
+    } else {
+        format!("{} — {windows}\nClick to attach", s.name)
+    };
+    ui.selectable_label(false, format!("    {text}")).on_hover_text(hover)
+}
+
 fn pane_scroll(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> f32 {
     let out = egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         // Never wrap: long session/folder names extend and the pane scrolls.
