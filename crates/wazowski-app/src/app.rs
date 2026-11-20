@@ -5080,7 +5080,10 @@ impl App {
                             tmux_rows(ui, &local, TmuxScope::Local, &mut action);
                         }
                         ui.add_space(2.0);
-                        if ui.selectable_label(false, "    ＋ New session…").clicked() {
+                        if ui
+                            .selectable_label(false, format!("    {} New session…", icons::PLUS))
+                            .clicked()
+                        {
                             action = Some(TmuxAction::New(TmuxScope::Local));
                         }
                     }
@@ -5122,7 +5125,10 @@ impl App {
                         tmux_rows(ui, &remote, TmuxScope::Remote, &mut action);
                     }
                     ui.add_space(2.0);
-                    if ui.selectable_label(false, "    ＋ New session…").clicked() {
+                    if ui
+                        .selectable_label(false, format!("    {} New session…", icons::PLUS))
+                        .clicked()
+                    {
                         action = Some(TmuxAction::New(TmuxScope::Remote));
                     }
                 });
@@ -5160,8 +5166,13 @@ impl App {
         let mut import = false;
         let mut backup = false;
         let mut delete = false;
-        ui.horizontal(|ui| {
-            ui.heading("Vault");
+        // The header row (title + action buttons) is often wider than the
+        // credential list below, so measure it and feed it into the pane's
+        // auto-width — otherwise a short/empty list sizes the pane too narrow and
+        // clips the trailing buttons (e.g. Delete vault).
+        let header_w = ui
+            .horizontal(|ui| {
+                ui.heading("Vault");
             if unlocked
                 && ui.small_button(icons::PLUS).on_hover_text("New credential").clicked()
             {
@@ -5178,7 +5189,10 @@ impl App {
                     delete = true;
                 }
             }
-        });
+            })
+            .response
+            .rect
+            .width();
         if new_credential {
             self.vault_selected = None;
             self.vault_form = Some(SecretForm::new());
@@ -5200,6 +5214,9 @@ impl App {
             filter_box(ui, &mut self.filter_vault, focus);
         }
         ui.separator();
+        // Baseline the pane width on the header so the buttons never clip, even in
+        // the Absent/Locked states below that don't measure a list.
+        self.pane_content_w = header_w;
         match &self.vault {
             VaultState::Absent => {
                 ui.label(RichText::new("No vault yet.").weak());
@@ -5307,7 +5324,7 @@ impl App {
                 }
             }
         });
-        self.pane_content_w = w;
+        self.pane_content_w = w.max(header_w);
         match act {
             Some(RowAct::Open(id)) => self.select_credential(&id),
             Some(RowAct::Duplicate(id)) => self.duplicate_credential(&id),
