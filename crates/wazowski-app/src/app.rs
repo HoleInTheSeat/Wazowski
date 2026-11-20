@@ -1426,6 +1426,13 @@ pub struct App {
     /// Natural width (points) of the current left pane's list content, measured
     /// each frame so the pane can auto-size to it (clamped to a min/max).
     pane_content_w: f32,
+    /// The exact width (points) the left panel was given this frame, so the pane
+    /// content can measure the chrome around it.
+    panel_w: f32,
+    /// Measured non-content width of the pane (icon rail + separator + frame
+    /// margins), so the panel can be sized to *exactly* fit its content instead
+    /// of guessing with a constant. Updated each frame from the live layout.
+    pane_chrome: f32,
     /// Measured width (points) of the icon rail, so the collapsed pane can size
     /// to it with equal padding on both sides.
     rail_w: f32,
@@ -1854,6 +1861,8 @@ impl App {
             filter_keybinds: String::new(),
             paste_pw_master: None,
             pane_content_w: 180.0,
+            panel_w: 240.0,
+            pane_chrome: 58.0,
             rail_w: 40.0,
         };
         app.migrate_servers_one_per_kind();
@@ -4884,7 +4893,12 @@ impl App {
             // Hide the content pane when collapsed; the rail stays.
             if !collapsed {
                 ui.separator();
-                ui.vertical(|ui| match self.sidebar_view {
+                ui.vertical(|ui| {
+                    // The content area starts here; the difference from the whole
+                    // panel is the chrome (rail + separator + frame margins), which
+                    // the next frame's width calc uses to fit the content exactly.
+                    self.pane_chrome = (self.panel_w - ui.available_width()).max(0.0);
+                    match self.sidebar_view {
                     SidebarView::Sessions => self.sidebar_sessions(ui, ctx),
                     SidebarView::Macros => self.sidebar_macros(ui),
                     SidebarView::Files => self.sidebar_files(ui, ctx),
@@ -4892,6 +4906,7 @@ impl App {
                     SidebarView::Vault => self.sidebar_vault(ui),
                     SidebarView::Tmux => self.sidebar_tmux(ui, ctx),
                     SidebarView::Settings => self.sidebar_settings_categories(ui),
+                    }
                 });
             }
         });
@@ -13068,11 +13083,13 @@ impl eframe::App for App {
             // the collapsed icon has equal padding left and right.
             left.resizable(false).exact_size(self.rail_w + 16.0)
         } else {
-            // Rail + separators + margins around the measured list content.
-            const CHROME: f32 = 58.0;
+            // Size to the content plus the *measured* chrome (rail + separator +
+            // frame margins), which the pane records each frame — so the content
+            // area ends up exactly as wide as its content and nothing clips.
             const MIN_W: f32 = 200.0;
             const MAX_W: f32 = 480.0;
-            let w = (self.pane_content_w + CHROME).clamp(MIN_W, MAX_W);
+            let w = (self.pane_content_w + self.pane_chrome).clamp(MIN_W, MAX_W);
+            self.panel_w = w;
             left.resizable(false).exact_size(w)
         };
         left.show(ui, |ui| self.sidebar(ui, &ctx));
