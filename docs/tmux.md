@@ -82,6 +82,7 @@ prefix is read from the host. Left to right:
 | ------ | ----- | ---- |
 | `?` | prefix `?` | Show all tmux keybinds |
 | `o` | prefix `o` | Cycle between panes |
+| `s` | prefix `s` | List sessions |
 | `w` | prefix `w` | List windows |
 | `c` | prefix `c` | Create window |
 | `n` | prefix `n` | Next window |

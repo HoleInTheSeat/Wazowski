@@ -231,6 +231,7 @@ enum SplitButton {
 const TMUX_CHORDS: &[(&str, u8, &str)] = &[
     ("?", b'?', "Show all tmux keybinds (prefix ?)"),
     ("o", b'o', "Cycle between panes (prefix o)"),
+    ("s", b's', "List sessions (prefix s)"),
     ("w", b'w', "List windows (prefix w)"),
     ("c", b'c', "Create window (prefix c)"),
     ("n", b'n', "Next window (prefix n)"),
