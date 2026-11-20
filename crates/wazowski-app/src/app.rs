@@ -4914,7 +4914,7 @@ impl App {
 
     /// The Settings view's left pane: the category selector.
     fn sidebar_settings_categories(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
+        let header_w = ui.heading("Settings").rect.width();
         let focus = std::mem::take(&mut self.focus_filter);
         filter_box(ui, &mut self.filter_settings, focus);
         ui.separator();
@@ -4950,12 +4950,12 @@ impl App {
                 }
             }
         });
-        self.pane_content_w = w;
+        self.pane_content_w = w.max(header_w);
     }
 
     /// The Tools view's left pane: server/network/host tool categories.
     fn sidebar_tools(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Tools");
+        let header_w = ui.heading("Tools").rect.width();
         let focus = std::mem::take(&mut self.focus_filter);
         filter_box(ui, &mut self.filter_tools, focus);
         ui.separator();
@@ -5008,7 +5008,7 @@ impl App {
                 ui.add_space(6.0);
             }
         });
-        self.pane_content_w = w;
+        self.pane_content_w = w.max(header_w);
     }
 
     /// The tmux pane: live tmux sessions grouped into **Local** (this machine)
@@ -5035,12 +5035,16 @@ impl App {
         ctx.request_repaint_after(interval);
 
         let mut action: Option<TmuxAction> = None;
-        ui.horizontal(|ui| {
-            ui.heading("tmux");
-            if ui.small_button(icons::SYNC).on_hover_text("Refresh").clicked() {
-                action = Some(TmuxAction::Refresh);
-            }
-        });
+        let header_w = ui
+            .horizontal(|ui| {
+                ui.heading("tmux");
+                if ui.small_button(icons::SYNC).on_hover_text("Refresh").clicked() {
+                    action = Some(TmuxAction::Refresh);
+                }
+            })
+            .response
+            .rect
+            .width();
         let focus = std::mem::take(&mut self.focus_filter);
         filter_box(ui, &mut self.filter_tmux, focus);
         ui.separator();
@@ -5133,7 +5137,7 @@ impl App {
                     }
                 });
         });
-        self.pane_content_w = w;
+        self.pane_content_w = w.max(header_w);
 
         match action {
             Some(TmuxAction::Attach(TmuxScope::Local, name)) => self.open_tmux_attach(&name, ctx),
@@ -5306,21 +5310,21 @@ impl App {
                 ui.add_space(2.0);
                 ui.label(RichText::new("Passwords").strong());
                 for e in &passwords {
-                    row(ui, format!("🔑 {}", e.name), &e.id);
+                    row(ui, format!("{} {}", icons::LOCK_KEY, e.name), &e.id);
                 }
             }
             if !keys.is_empty() {
                 ui.add_space(6.0);
                 ui.label(RichText::new("SSH keypairs").strong());
                 for e in &keys {
-                    row(ui, format!("🗝 {}", e.name), &e.id);
+                    row(ui, format!("{} {}", icons::KEY, e.name), &e.id);
                 }
             }
             if !tokens.is_empty() {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Tokens").strong());
                 for e in &tokens {
-                    row(ui, format!("🎫 {}", e.name), &e.id);
+                    row(ui, format!("{} {}", icons::TAG, e.name), &e.id);
                 }
             }
         });
@@ -5449,9 +5453,10 @@ impl App {
 
         // Measured list width (set by whichever branch renders a browser).
         let mut measured: Option<f32> = None;
+        let header_w: f32;
         if has_smb {
             let loc = self.tabs[self.active].smb.as_ref().map(|s| s.location()).unwrap_or_default();
-            ui.heading("Files (SMB)");
+            header_w = ui.heading("Files (SMB)").rect.width();
             ui.label(RichText::new(loc).monospace().weak());
             filter_box(ui, &mut self.filter_files, focus);
             ui.separator();
@@ -5462,7 +5467,7 @@ impl App {
                 measured = Some(smb.ui(ui, ctx));
             }
         } else if has_sftp {
-            ui.heading("Files (SFTP)");
+            header_w = ui.heading("Files (SFTP)").rect.width();
             filter_box(ui, &mut self.filter_files, focus);
             ui.separator();
             if let Some(tab) = self.tabs.get_mut(self.active)
@@ -5472,7 +5477,7 @@ impl App {
                 measured = Some(files.ui(ui, ctx));
             }
         } else {
-            ui.heading("Files");
+            header_w = ui.heading("Files").rect.width();
             filter_box(ui, &mut self.filter_files, focus);
             ui.separator();
             // No session to browse — leave the body empty and let the pane shrink
@@ -5480,24 +5485,28 @@ impl App {
             measured = Some(0.0);
         }
         if let Some(w) = measured {
-            self.pane_content_w = w;
+            self.pane_content_w = w.max(header_w);
         }
     }
 
     fn sidebar_sessions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.heading("Sessions");
-            if ui.small_button(icons::PLUS).on_hover_text("New session").clicked() {
-                self.dialog = Dialog::EditSession(SessionForm::new());
-            }
-            if ui
-                .small_button(icons::LINK)
-                .on_hover_text("Add shared source")
-                .clicked()
-            {
-                self.dialog = Dialog::AddSource(AddSourceForm::default());
-            }
-        });
+        let header_w = ui
+            .horizontal(|ui| {
+                ui.heading("Sessions");
+                if ui.small_button(icons::PLUS).on_hover_text("New session").clicked() {
+                    self.dialog = Dialog::EditSession(SessionForm::new());
+                }
+                if ui
+                    .small_button(icons::LINK)
+                    .on_hover_text("Add shared source")
+                    .clicked()
+                {
+                    self.dialog = Dialog::AddSource(AddSourceForm::default());
+                }
+            })
+            .response
+            .rect
+            .width();
         let focus = std::mem::take(&mut self.focus_filter);
         filter_box(ui, &mut self.filter_sessions, focus);
 
@@ -5544,7 +5553,7 @@ impl App {
 
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let w = pane_scroll(ui, |ui| self.session_tree(ui, ctx));
-            self.pane_content_w = w;
+            self.pane_content_w = w.max(header_w);
         });
     }
 
@@ -5558,12 +5567,16 @@ impl App {
             New,
         }
         let mut act = None;
-        ui.horizontal(|ui| {
-            ui.heading("Macros");
-            if ui.small_button(icons::PLUS).on_hover_text("New macro").clicked() {
-                act = Some(Act::New);
-            }
-        });
+        let header_w = ui
+            .horizontal(|ui| {
+                ui.heading("Macros");
+                if ui.small_button(icons::PLUS).on_hover_text("New macro").clicked() {
+                    act = Some(Act::New);
+                }
+            })
+            .response
+            .rect
+            .width();
         let focus = std::mem::take(&mut self.focus_filter);
         filter_box(ui, &mut self.filter_macros, focus);
         ui.separator();
@@ -5576,7 +5589,7 @@ impl App {
                 if !needle.is_empty() && !m.name.to_lowercase().contains(&needle) {
                     continue;
                 }
-                let glyph = if m.icon.is_empty() { "⚙" } else { m.icon.as_str() };
+                let glyph = if m.icon.is_empty() { icons::GEAR } else { m.icon.as_str() };
                 let mut text = RichText::new(format!("{glyph} {}", m.name));
                 if let Some([r, g, b]) = m.color {
                     text = text.color(Color32::from_rgb(r, g, b));
@@ -5616,7 +5629,7 @@ impl App {
                     });
             }
         });
-        self.pane_content_w = w;
+        self.pane_content_w = w.max(header_w);
         match act {
             Some(Act::Run(i, target)) => self.dialog = Dialog::ConfirmMacro { index: i, target },
             Some(Act::Edit(i)) => {
@@ -7877,8 +7890,12 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for host in &self.network.subnet_hosts {
                 ui.horizontal(|ui| {
-                    let dot = if host.pingable { "🟢" } else { "⚪" };
-                    ui.label(format!("{dot} {}", host.ip));
+                    let dot_color = if host.pingable {
+                        Color32::from_rgb(90, 200, 90)
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    ui.colored_label(dot_color, format!("● {}", host.ip));
                     let svc = host
                         .services
                         .iter()
@@ -8632,7 +8649,7 @@ impl App {
                     // Offer to generate a fresh keypair when creating a new entry.
                     if !editing {
                         ui.horizontal(|ui| {
-                            ui.menu_button("🔑 Generate keypair…", |ui| {
+                            ui.menu_button(format!("{} Generate keypair…", icons::KEY), |ui| {
                                 for algo in wazowski_ssh::KeyAlgo::ALL {
                                     if ui.button(algo.label()).clicked() {
                                         gen_request = Some(algo);
@@ -11531,7 +11548,7 @@ impl App {
                                         continue;
                                     }
                                     any = true;
-                                    if ui.selectable_label(false, format!("🔑 {}", info.name)).clicked()
+                                    if ui.selectable_label(false, format!("{} {}", icons::LOCK_KEY, info.name)).clicked()
                                     {
                                         pick = Some(info.id.clone());
                                     }
@@ -13118,7 +13135,19 @@ impl eframe::App for App {
         }
     }
 
-    fn save(&mut self, _storage: &mut dyn eframe::Storage) {}
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        // eframe calls this on its auto-save timer and once on shutdown — including
+        // macOS Cmd+Q, which quits the app without going through the window's close
+        // button (so our close_requested handler never runs). `track_window_geometry`
+        // keeps the live size/position in `self.settings` every frame, so flushing
+        // here makes "remember window size and position" persist however the app
+        // exits, on every platform.
+        if self.settings.remember_window
+            && let Err(e) = self.settings.save()
+        {
+            eprintln!("Could not save window geometry: {e:#}");
+        }
+    }
 }
 
 impl SessionForm {
@@ -14091,10 +14120,10 @@ fn vault_picker_ui(
     ui.vertical(|ui| {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(240.0);
-            let groups: [(SecretCategory, &str, &mut bool); 3] = [
-                (SecretCategory::Password, "🔑 Passwords", &mut state.open_password),
-                (SecretCategory::Key, "🗝 SSH Keypairs", &mut state.open_key),
-                (SecretCategory::Token, "🎫 Tokens", &mut state.open_token),
+            let groups: [(SecretCategory, String, &mut bool); 3] = [
+                (SecretCategory::Password, format!("{} Passwords", icons::LOCK_KEY), &mut state.open_password),
+                (SecretCategory::Key, format!("{} SSH Keypairs", icons::KEY), &mut state.open_key),
+                (SecretCategory::Token, format!("{} Tokens", icons::TAG), &mut state.open_token),
             ];
             // Show the current pick even while every group is collapsed.
             if !selected.is_empty() {

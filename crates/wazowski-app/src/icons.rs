@@ -45,6 +45,8 @@ pub const COPY: &str = "\u{e1ca}";
 pub const DOTS: &str = "\u{e208}"; // overflow menu (dots-three-vertical)
 pub const WARNING: &str = "\u{e4e0}"; // warning triangle (offline/errored source)
 pub const GRID: &str = "\u{e464}"; // tmux (squares-four) — tiled panes
+pub const KEY: &str = "\u{e2d6}"; // SSH keypair
+pub const TAG: &str = "\u{e478}"; // token
 
 /// Icons offered in the session/folder appearance picker, as `(glyph, label)`.
 /// Users pick one; the chosen glyph string is stored in the session/folder, and
