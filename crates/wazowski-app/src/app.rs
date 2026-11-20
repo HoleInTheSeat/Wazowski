@@ -81,6 +81,11 @@ struct Tab {
     /// so the tmux shortcut buttons can send the right chord without re-querying.
     /// The prefix is a server-global, stable option, so caching per tab is safe.
     tmux_prefix: Option<u8>,
+    /// Whether we've already checked, for the current alternate-screen episode,
+    /// which tmux session this tab is attached to (so a `.bashrc` auto-attach is
+    /// discovered without the user re-triggering it). Reset when it leaves the
+    /// alternate screen. See `App::reconcile_tmux_state`.
+    tmux_checked: bool,
 }
 
 /// How a terminal tab's session can be restarted after it ends.
@@ -1410,6 +1415,9 @@ pub struct App {
     /// remote prefix query, so the right prefix is used even on the first click
     /// before it's cached. Sent and cached when the query returns.
     tmux_chord_job: Option<TmuxChordJob>,
+    /// In-flight query discovering which tmux session the active SSH tab is
+    /// attached to (for a `.bashrc` auto-attach), with the target tab id.
+    tmux_discover_job: Option<(u64, network::Job<Result<ExecOutput, String>>)>,
     /// When the remote list was last refreshed, driving the auto-poll.
     tmux_remote_last: Option<std::time::Instant>,
     /// Filter text for the Settings ▸ Keybindings list.
@@ -1840,6 +1848,7 @@ impl App {
             tmux_attach_pending: None,
             tmux_attach_after_create: None,
             tmux_chord_job: None,
+            tmux_discover_job: None,
             tmux_remote_last: None,
             filter_keybinds: String::new(),
             paste_pw_master: None,
@@ -2110,6 +2119,7 @@ impl App {
             tmux_attached: None,
             tmux_sync: false,
             tmux_prefix: None,
+            tmux_checked: false,
         };
         let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
         let index = if adjacent && !self.tabs.is_empty() {
@@ -3503,6 +3513,86 @@ impl App {
             tab.tmux_prefix = Some(prefix);
         }
         self.paste_into_tab(tab_id, &[prefix, key]);
+    }
+
+    /// Keeps the active terminal tab's tmux state honest without the user having
+    /// to trigger it: when the tab is in the alternate screen but we don't know
+    /// which session it's in, it asks the host which session the connection is
+    /// attached to (once per alternate-screen episode). This makes a `.bashrc`
+    /// that auto-attaches to tmux on login light up the tmux controls on its own.
+    /// A result means it really is tmux (not a plain full-screen editor); no
+    /// attached client means it isn't, so the controls stay off.
+    fn reconcile_tmux_state(&mut self) {
+        // Don't interfere while an explicit tmux op (detach/switch) is mid-flight,
+        // or while a discovery query is already running.
+        if self.tmux_detach_job.is_some()
+            || self.tmux_attach_pending.is_some()
+            || self.tmux_discover_job.is_some()
+        {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        if !matches!(tab.content, TabContent::Terminal(_)) {
+            return;
+        }
+        let tab_id = tab.id;
+        match self.tab_in_alt_screen(tab_id) {
+            // Back at the shell — allow a fresh check next time a full-screen view
+            // appears. (The session name is left as-is; it's only ever read while
+            // the alternate screen is active, so a stale value is harmless.)
+            Some(false) => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    t.tmux_checked = false;
+                }
+            }
+            // In a full-screen view we haven't identified yet: find out whether
+            // it's tmux, and which session.
+            Some(true) => {
+                let unchecked = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab_id)
+                    .is_some_and(|t| !t.tmux_checked);
+                if !unchecked {
+                    return;
+                }
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    t.tmux_checked = true;
+                }
+                if let Some((_, _, exec)) = self.active_ssh_exec() {
+                    let cmd = wazowski_core::tmux::remote_list_clients_command();
+                    self.tmux_discover_job =
+                        Some((tab_id, network::spawn_job(move || exec.run(&cmd))));
+                } else {
+                    // Local tmux tab: the query is a quick local command.
+                    let found = wazowski_core::tmux::local_attached_session();
+                    self.adopt_or_clear_tmux_session(tab_id, found);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Completes a pending discovery: adopts the found session (or clears it when
+    /// nothing is attached, i.e. a full-screen app that isn't tmux).
+    fn poll_tmux_discover(&mut self) {
+        let Some((tab_id, job)) = self.tmux_discover_job.as_ref() else { return };
+        let Some(result) = job.poll() else { return };
+        let tab_id = *tab_id;
+        self.tmux_discover_job = None;
+        // Ignore a stale result if the tab has since left the alternate screen.
+        if self.tab_in_alt_screen(tab_id) != Some(true) {
+            return;
+        }
+        let found = result.ok().and_then(|o| wazowski_core::tmux::newest_client_session(&o.stdout));
+        self.adopt_or_clear_tmux_session(tab_id, found);
+    }
+
+    /// Sets (or clears) a tab's known tmux session from a discovery result.
+    fn adopt_or_clear_tmux_session(&mut self, tab_id: u64, session: Option<String>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.tmux_attached = session;
+        }
     }
 
     /// Saves the active tab: a terminal's scrollback output, or an RDP/VNC tab's
@@ -12757,9 +12847,16 @@ impl eframe::App for App {
         if self.tmux_chord_job.is_some() {
             self.poll_tmux_chord();
         }
+        // Discover a `.bashrc` auto-attach so the tmux controls light up on their
+        // own, then collect the result.
+        self.reconcile_tmux_state();
+        if self.tmux_discover_job.is_some() {
+            self.poll_tmux_discover();
+        }
         if self.tmux_detach_job.is_some()
             || self.tmux_attach_pending.is_some()
             || self.tmux_chord_job.is_some()
+            || self.tmux_discover_job.is_some()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }

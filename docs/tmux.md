@@ -94,6 +94,13 @@ prefix is read from the host. Left to right:
 The ones that open a tmux prompt or mode (rename, keybind list, copy mode) do so
 right in the session, exactly as if you'd typed the chord yourself.
 
+These controls also appear when you land in tmux **without** attaching through
+Wazowski — for example a `.bashrc` on the server that runs `tmux attach` on
+login. Wazowski notices the full-screen tmux display and asks the host which
+session the connection is on, so the tmux controls light up on their own. (If the
+host has several people attached to different sessions at once, it picks the
+most-recently-active one as its best guess.)
+
 ## Creating, renaming, terminating
 
 Right-click a session for the full menu, or use **＋ New session…** at the

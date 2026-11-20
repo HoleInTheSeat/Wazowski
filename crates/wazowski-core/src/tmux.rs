@@ -180,6 +180,42 @@ pub fn remote_switch_or_attach_command(name: &str) -> String {
     format!("tmux switch-client -t {t} 2>/dev/null || tmux attach -t {t}")
 }
 
+/// Builds the argv to list the tmux server's attached clients as
+/// `"<activity> <session>"` lines — used to discover which session this
+/// connection is attached to (e.g. when a `.bashrc` auto-attaches on login).
+pub fn list_clients_args() -> Vec<String> {
+    vec!["list-clients".into(), "-F".into(), "#{client_activity} #{client_session}".into()]
+}
+
+/// The remote command form of [`list_clients_args`].
+pub fn remote_list_clients_command() -> String {
+    format!("tmux list-clients -F {}", shell_quote("#{client_activity} #{client_session}"))
+}
+
+/// Picks the most-recently-active client's session name from `list-clients`
+/// output (one `"<activity> <session>"` line per client). `None` when there are
+/// no attached clients — i.e. nothing is in tmux. Session names may contain
+/// spaces (only the leading activity field is split off). With more than one
+/// client the newest activity wins, a best-effort guess at "this one".
+pub fn newest_client_session(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (activity, session) = line.split_once(' ').unwrap_or(("0", line));
+            let session = session.trim();
+            if session.is_empty() {
+                return None;
+            }
+            Some((activity.trim().parse::<u64>().unwrap_or(0), session.to_string()))
+        })
+        .max_by_key(|(activity, _)| *activity)
+        .map(|(_, session)| session)
+}
+
 /// The remote command to split the active window of a session, run on the SSH
 /// exec side channel (not typed into the session), so it never injects keys into
 /// a pane. tmux updates every attached client, so the split appears live.
@@ -312,6 +348,12 @@ pub fn local_prefix() -> Result<String, TmuxError> {
     run_local(&prefix_query_args(), true)
 }
 
+/// The session a local tmux client is attached to (newest-active one), or `None`
+/// when nothing is attached. Used to discover a `.bashrc` auto-attach locally.
+pub fn local_attached_session() -> Option<String> {
+    run_local(&list_clients_args(), true).ok().and_then(|o| newest_client_session(&o))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +483,18 @@ mod tests {
             sync_panes_args("s", false),
             ["set-window-option", "-t", "s", "synchronize-panes", "off"]
         );
+    }
+
+    #[test]
+    fn newest_client_session_picks_most_recent() {
+        assert_eq!(newest_client_session(""), None);
+        assert_eq!(newest_client_session("\n  \n"), None);
+        assert_eq!(newest_client_session("1700000000 main"), Some("main".into()));
+        // Two clients: the newer activity wins.
+        let out = "1700000000 old\n1700000500 current\n";
+        assert_eq!(newest_client_session(out), Some("current".into()));
+        // Session names may contain spaces.
+        assert_eq!(newest_client_session("1700000000 my project"), Some("my project".into()));
     }
 
     #[test]
