@@ -77,6 +77,10 @@ struct Tab {
     /// on, so the broadcast button reflects it. Toggled when the user clicks it;
     /// may drift from tmux if changed elsewhere.
     tmux_sync: bool,
+    /// Cached tmux prefix control byte for this tab's host (e.g. 0x02 for `C-b`),
+    /// so the tmux shortcut buttons can send the right chord without re-querying.
+    /// The prefix is a server-global, stable option, so caching per tab is safe.
+    tmux_prefix: Option<u8>,
 }
 
 /// How a terminal tab's session can be restarted after it ends.
@@ -215,6 +219,22 @@ impl Default for NetworkState {
 enum SplitButton {
     Split(SplitDir),
 }
+
+/// The tmux prefix-chord buttons shown (left of split/broadcast) while attached
+/// to a tmux session, in left-to-right order: (button label, the key sent after
+/// the prefix, tooltip). Each sends the prefix + key to your own client.
+const TMUX_CHORDS: &[(&str, u8, &str)] = &[
+    ("?", b'?', "Show all tmux keybinds (prefix ?)"),
+    ("o", b'o', "Cycle between panes (prefix o)"),
+    ("w", b'w', "List windows (prefix w)"),
+    ("c", b'c', "Create window (prefix c)"),
+    ("n", b'n', "Next window (prefix n)"),
+    ("p", b'p', "Previous window (prefix p)"),
+    ("$", b'$', "Rename session (prefix $)"),
+    (",", b',', "Rename window (prefix ,)"),
+    ("[", b'[', "Scroll / copy mode (prefix [)"),
+    ("&", b'&', "Close current window (prefix &)"),
+];
 
 /// Which saved-history list an entry belongs to (for deletion).
 #[derive(Clone, Copy)]
@@ -1200,6 +1220,10 @@ struct CredentialPrompt {
 /// and the session to attach once the detach lands (`Some` for a switch).
 type TmuxDetachJob = (u64, network::Job<Result<ExecOutput, String>>, Option<String>);
 
+/// In-flight prefix query for a pending prefix chord: the target tab id, the key
+/// to send after the prefix, and the query job.
+type TmuxChordJob = (u64, u8, network::Job<Result<ExecOutput, String>>);
+
 /// A `tmux attach` deferred until a switch's detach has been *confirmed* — so
 /// the command can never land in a session you were only observing.
 struct TmuxAttachPending {
@@ -1382,6 +1406,10 @@ pub struct App {
     /// Session name to attach to once the in-flight remote create completes, set
     /// when "New session" was created with its switch-to-it box ticked.
     tmux_attach_after_create: Option<String>,
+    /// A tmux prefix chord (tab id + the key byte after the prefix) waiting on a
+    /// remote prefix query, so the right prefix is used even on the first click
+    /// before it's cached. Sent and cached when the query returns.
+    tmux_chord_job: Option<TmuxChordJob>,
     /// When the remote list was last refreshed, driving the auto-poll.
     tmux_remote_last: Option<std::time::Instant>,
     /// Filter text for the Settings ▸ Keybindings list.
@@ -1811,6 +1839,7 @@ impl App {
             tmux_detach_job: None,
             tmux_attach_pending: None,
             tmux_attach_after_create: None,
+            tmux_chord_job: None,
             tmux_remote_last: None,
             filter_keybinds: String::new(),
             paste_pw_master: None,
@@ -2080,6 +2109,7 @@ impl App {
             font_size: self.settings.terminal_font_size,
             tmux_attached: None,
             tmux_sync: false,
+            tmux_prefix: None,
         };
         let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
         let index = if adjacent && !self.tabs.is_empty() {
@@ -3427,6 +3457,52 @@ impl App {
         {
             tab.tmux_sync = on;
         }
+    }
+
+    /// Sends a tmux prefix chord — the prefix key followed by `key` — to the
+    /// active tmux session's client (e.g. `key = b'c'` for prefix + c, a new
+    /// window). This is the sole category of input allowed while attached, and it
+    /// goes only to our own client. The prefix is cached per tab; the first use
+    /// on a remote host queries it so a remapped prefix (e.g. `C-a`) still works.
+    fn send_tmux_chord(&mut self, key: u8) {
+        let Some((tab_id, _, remote)) = self.active_tmux_session() else { return };
+        if let Some(prefix) = self.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.tmux_prefix) {
+            self.paste_into_tab(tab_id, &[prefix, key]);
+            return;
+        }
+        if remote {
+            // Query the prefix once, then send (and cache) when it returns.
+            if self.tmux_chord_job.is_some() {
+                return; // a query is already in flight
+            }
+            let Some((_, _, exec)) = self.active_ssh_exec() else { return };
+            let cmd = wazowski_core::tmux::remote_prefix_query_command();
+            self.tmux_chord_job = Some((tab_id, key, network::spawn_job(move || exec.run(&cmd))));
+        } else {
+            // Local: the query is a fast local command — run it inline.
+            let prefix = wazowski_core::tmux::local_prefix()
+                .map(|s| wazowski_core::tmux::prefix_control_byte(&s))
+                .unwrap_or(0x02);
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.tmux_prefix = Some(prefix);
+            }
+            self.paste_into_tab(tab_id, &[prefix, key]);
+        }
+    }
+
+    /// Completes a pending prefix chord once its remote prefix query returns:
+    /// caches the prefix on the tab and sends the prefix + key chord.
+    fn poll_tmux_chord(&mut self) {
+        let Some((tab_id, key, job)) = self.tmux_chord_job.as_ref() else { return };
+        let Some(result) = job.poll() else { return };
+        let (tab_id, key) = (*tab_id, *key);
+        self.tmux_chord_job = None;
+        let out = result.map(|o| o.stdout).unwrap_or_default();
+        let prefix = wazowski_core::tmux::prefix_control_byte(&out);
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.tmux_prefix = Some(prefix);
+        }
+        self.paste_into_tab(tab_id, &[prefix, key]);
     }
 
     /// Saves the active tab: a terminal's scrollback output, or an RDP/VNC tab's
@@ -6668,6 +6744,7 @@ impl App {
         let in_tmux = self.active_tmux_session().is_some();
         let tmux_sync = in_tmux && self.tabs.get(self.active).is_some_and(|t| t.tmux_sync);
         let mut toggle_sync = false;
+        let mut chord: Option<u8> = None;
         // Remote-desktop (RDP/VNC) toolbar ops for the active tab, if any.
         let active_remote: Option<RemoteKind> = match self.tabs.get(self.active).map(|t| &t.content) {
             Some(TabContent::Remote(r)) => Some(r.kind()),
@@ -6813,6 +6890,16 @@ impl App {
                     if ui.button("⇥").on_hover_text(right_tip).clicked() {
                         pane_action = Some(SplitButton::Split(SplitDir::Horizontal));
                     }
+                    // tmux prefix-chord shortcuts sit to the left of the split
+                    // group. Sides renders right-to-left, so add them in reverse
+                    // of their intended left-to-right order.
+                    if in_tmux {
+                        for &(label, key, tip) in TMUX_CHORDS.iter().rev() {
+                            if ui.button(label).on_hover_text(tip).clicked() {
+                                chord = Some(key);
+                            }
+                        }
+                    }
                 }
                 // Remote-desktop ops. Sides is right-to-left, so add rightmost
                 // first; visible order ends up Screenshot | Paste text | (RDP:
@@ -6854,6 +6941,9 @@ impl App {
         self.broadcast = broadcast;
         if toggle_sync {
             self.tmux_set_sync(!tmux_sync);
+        }
+        if let Some(key) = chord {
+            self.send_tmux_chord(key);
         }
         if let Some(i) = clicked_tab {
             self.active = i;
@@ -12664,7 +12754,13 @@ impl eframe::App for App {
         if self.tmux_attach_pending.is_some() {
             self.poll_tmux_attach_pending();
         }
-        if self.tmux_detach_job.is_some() || self.tmux_attach_pending.is_some() {
+        if self.tmux_chord_job.is_some() {
+            self.poll_tmux_chord();
+        }
+        if self.tmux_detach_job.is_some()
+            || self.tmux_attach_pending.is_some()
+            || self.tmux_chord_job.is_some()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 

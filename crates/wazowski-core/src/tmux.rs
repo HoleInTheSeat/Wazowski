@@ -151,6 +151,12 @@ pub fn remote_prefix_query_command() -> String {
     "tmux show-options -gv prefix".to_owned()
 }
 
+/// Builds the argv that prints the tmux prefix key (e.g. `C-b`) — the local
+/// equivalent of [`remote_prefix_query_command`].
+pub fn prefix_query_args() -> Vec<String> {
+    vec!["show-options".into(), "-gv".into(), "prefix".into()]
+}
+
 /// Parses a tmux prefix key as printed by `show-options` (e.g. `C-b`, `C-a`)
 /// into the control byte a terminal sends for it: `C-b` → 0x02, `C-a` → 0x01.
 /// Falls back to the default prefix `C-b` (0x02) for anything unrecognised.
@@ -298,6 +304,12 @@ pub fn local_split(name: &str, horizontal: bool) -> Result<(), TmuxError> {
 /// Toggles `synchronize-panes` on a local session's active window.
 pub fn local_sync_panes(name: &str, on: bool) -> Result<(), TmuxError> {
     run_local(&sync_panes_args(name, on), false).map(|_| ())
+}
+
+/// Reads the local tmux server's prefix key (e.g. `C-b`); empty when there's no
+/// server. Feed the result to [`prefix_control_byte`].
+pub fn local_prefix() -> Result<String, TmuxError> {
+    run_local(&prefix_query_args(), true)
 }
 
 #[cfg(test)]

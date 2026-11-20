@@ -73,6 +73,27 @@ nothing is typed into the panes you're watching, and every attached client sees
 the change live. As soon as you detach (back to the shell), the same buttons go
 back to splitting and broadcasting Wazowski's own panes.
 
+To the left of the split/broadcast buttons, a row of **tmux shortcut buttons**
+appears while you're attached. Each sends a tmux prefix chord to your own client
+(and only yours), so they work with a remapped prefix such as `Ctrl+a` too — the
+prefix is read from the host. Left to right:
+
+| Button | Sends | Does |
+| ------ | ----- | ---- |
+| `?` | prefix `?` | Show all tmux keybinds |
+| `o` | prefix `o` | Cycle between panes |
+| `w` | prefix `w` | List windows |
+| `c` | prefix `c` | Create window |
+| `n` | prefix `n` | Next window |
+| `p` | prefix `p` | Previous window |
+| `$` | prefix `$` | Rename session |
+| `,` | prefix `,` | Rename window |
+| `[` | prefix `[` | Scroll / copy mode |
+| `&` | prefix `&` | Close current window |
+
+The ones that open a tmux prompt or mode (rename, keybind list, copy mode) do so
+right in the session, exactly as if you'd typed the chord yourself.
+
 ## Creating, renaming, terminating
 
 Right-click a session for the full menu, or use **＋ New session…** at the
