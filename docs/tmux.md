@@ -64,7 +64,10 @@ Right-click a session for the full menu, or use **＋ New session…** at the
 bottom of either folder:
 
 - **New session…** — prompts for a name and creates a detached session
-  (`tmux new-session -d`). It then appears in the list, ready to attach.
+  (`tmux new-session -d`). By default it then **switches you to the new session**
+  (attaching, detaching any current one first just like clicking it would);
+  untick **Switch to it after creating** to leave it detached in the list
+  instead.
 - **Rename…** — prompts for a new name.
 - **Terminate** — kills the session after a confirmation. Everything running in
   it is stopped and any attached clients are detached. **This can't be undone** —

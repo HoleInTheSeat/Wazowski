@@ -729,8 +729,9 @@ enum Dialog {
     PastePassword(Box<PastePasswordState>),
     /// Rename a tmux session (`old` → the edited `name`).
     TmuxRename { scope: TmuxScope, old: String, name: String, error: Option<String> },
-    /// Create a new, detached tmux session with the entered name.
-    TmuxNew { scope: TmuxScope, name: String, error: Option<String> },
+    /// Create a new, detached tmux session with the entered name. `switch`
+    /// attaches to it right after creating (the default).
+    TmuxNew { scope: TmuxScope, name: String, switch: bool, error: Option<String> },
     /// Confirm terminating (killing) a tmux session.
     ConfirmTmuxKill { scope: TmuxScope, name: String },
 }
@@ -1374,6 +1375,9 @@ pub struct App {
     /// A `tmux attach` deferred until a switch's detach is confirmed (the tab
     /// has returned to its shell), so it can't land in an observed session.
     tmux_attach_pending: Option<TmuxAttachPending>,
+    /// Session name to attach to once the in-flight remote create completes, set
+    /// when "New session" was created with its switch-to-it box ticked.
+    tmux_attach_after_create: Option<String>,
     /// When the remote list was last refreshed, driving the auto-poll.
     tmux_remote_last: Option<std::time::Instant>,
     /// Filter text for the Settings ▸ Keybindings list.
@@ -1802,6 +1806,7 @@ impl App {
             tmux_remote_action: None,
             tmux_detach_job: None,
             tmux_attach_pending: None,
+            tmux_attach_after_create: None,
             tmux_remote_last: None,
             filter_keybinds: String::new(),
             paste_pw_master: None,
@@ -3127,8 +3132,19 @@ impl App {
             && let Some(result) = job.poll()
         {
             self.tmux_remote_action = None;
-            if let Err(e) = result {
-                self.error = Some(format!("tmux: {e}"));
+            match result {
+                Err(e) => {
+                    self.error = Some(format!("tmux: {e}"));
+                    // The create failed — don't try to attach to it.
+                    self.tmux_attach_after_create = None;
+                }
+                Ok(()) => {
+                    // "New session" with switch-to-it ticked: now that it exists,
+                    // attach to it (which detaches any current session first).
+                    if let Some(name) = self.tmux_attach_after_create.take() {
+                        self.attach_tmux_remote(&name);
+                    }
+                }
             }
             // Re-list now so the change shows without waiting for the next tick.
             self.tmux_remote_last = None;
@@ -3159,61 +3175,62 @@ impl App {
     /// Attaches to a remote tmux session over the active SSH tab's shell.
     ///
     /// - Clicking the session the shell is already in does nothing.
-    /// - When the shell is already attached to a *different* session, this is a
-    ///   switch: we detach our client cleanly first (a prefix + `d` keystroke,
-    ///   which only ever drops our own client — see [`start_tmux_detach`]) and
-    ///   attach to the new session once we're back at the shell. Detaching by
-    ///   keystroke works even when a pane is running a full-screen program, and
-    ///   leaves anyone else on the old session undisturbed — unlike typing a
-    ///   `switch-client` command, which only lands at a shell prompt.
-    /// - Otherwise (not attached) it types a plain `tmux attach` at the prompt.
+    /// - If the shell is in a full-screen view (an attached tmux client — its
+    ///   alternate screen — or an editor), we never type a command into it: we
+    ///   detach our client first (a prefix + `d` keystroke, the only input ever
+    ///   sent while attached, which drops only our own client) and attach to the
+    ///   new session once the shell is *confirmed* back at a prompt (see
+    ///   [`poll_tmux_attach_pending`]). The live screen state is used, not just
+    ///   our own tracking, so this is right even for a session we didn't open.
+    /// - Otherwise, at a shell prompt, it types a plain `tmux attach`.
     fn attach_tmux_remote(&mut self, name: &str) {
         let Some((tab_id, _, exec)) = self.active_ssh_exec() else { return };
         // A detach/switch is already in flight — let it finish first.
         if self.tmux_detach_job.is_some() || self.tmux_attach_pending.is_some() {
             return;
         }
-        let attached = self
+        // Already in this session — leave the shell alone.
+        let current = self
             .tabs
             .get(self.active)
             .and_then(|t| t.tmux_attached.as_deref());
-        // Already in this session — leave the shell alone.
-        if attached == Some(name) {
+        if current == Some(name) {
             return;
         }
-        if attached.is_some() {
-            // Attached elsewhere: detach, then attach to the new session.
+        if self.tab_in_alt_screen(tab_id) == Some(true) {
+            // In a full-screen view: detach first, then attach once confirmed
+            // back. Never type a command into the alternate screen.
             self.start_tmux_detach(tab_id, exec, Some(name.to_owned()));
             return;
         }
-        // Not attached — a plain attach typed at the shell prompt.
-        let line = format!("{}\n", wazowski_core::tmux::remote_attach_command(name));
-        if self.paste_into_tab(tab_id, line.as_bytes())
-            && let Some(tab) = self.tabs.get_mut(self.active)
+        // At a shell prompt — safe to type a plain attach.
+        if self.paste_shell_command(tab_id, &wazowski_core::tmux::remote_attach_command(name))
+            && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
         {
             tab.tmux_attached = Some(name.to_owned());
         }
     }
 
     /// Detaches the active SSH tab's shell from tmux (back to the plain login
-    /// shell), so clicking the host returns you to the real SSH session. If the
-    /// shell isn't attached to anything, there's nothing to detach — we just
-    /// bring the tab to the front rather than sending a stray keystroke. See
-    /// [`start_tmux_detach`] for how the detach itself is done.
+    /// shell), so clicking the host returns you to the real SSH session. Only
+    /// acts when the tab is actually in tmux's full-screen (alternate-screen)
+    /// view; otherwise there's nothing to detach, so it just surfaces the shell
+    /// tab rather than sending a stray keystroke. The detach itself is a
+    /// prefix + `d` chord — see [`start_tmux_detach`].
     fn detach_tmux_remote(&mut self) {
         let Some((tab_id, _, exec)) = self.active_ssh_exec() else { return };
         // A detach/switch is already in flight — let it finish first.
         if self.tmux_detach_job.is_some() || self.tmux_attach_pending.is_some() {
             return;
         }
-        let attached = self
-            .tabs
-            .get(self.active)
-            .is_some_and(|t| t.tmux_attached.is_some());
-        if !attached {
-            // Nothing to detach from — just surface the shell tab.
+        if self.tab_in_alt_screen(tab_id) != Some(true) {
+            // Not in a full-screen view — nothing to detach. Surface the tab and
+            // keep our tracking honest.
             if let Some(i) = self.tabs.iter().position(|t| t.id == tab_id) {
                 self.active = i;
+            }
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.tmux_attached = None;
             }
             return;
         }
@@ -3284,8 +3301,9 @@ impl App {
         };
         if confirmed {
             let name = self.tmux_attach_pending.take().expect("pending").name;
-            let line = format!("{}\n", wazowski_core::tmux::remote_attach_command(&name));
-            if self.paste_into_tab(tab_id, line.as_bytes())
+            // paste_shell_command re-checks we're at a shell prompt — upholding
+            // the invariant that a command is never typed into the alt screen.
+            if self.paste_shell_command(tab_id, &wazowski_core::tmux::remote_attach_command(&name))
                 && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
             {
                 tab.tmux_attached = Some(name);
@@ -3320,6 +3338,21 @@ impl App {
             return None;
         };
         Some(panes.get(panes.focused_id())?.screen_text())
+    }
+
+    /// Types a command line (a trailing newline is added) into the focused pane
+    /// of tab `id`, but **only while that pane is at a shell prompt** — never
+    /// while it's in the alternate screen (an attached tmux client, or any
+    /// full-screen program). This is the safety invariant for remote tmux: the
+    /// only input ever injected while attached is a prefix-key chord; every typed
+    /// command waits until we're confirmed back at the shell. Returns true only
+    /// if it was actually sent.
+    fn paste_shell_command(&mut self, id: u64, cmd: &str) -> bool {
+        if self.tab_in_alt_screen(id) != Some(false) {
+            return false; // in a full-screen view (or not a terminal) — refuse.
+        }
+        let line = format!("{cmd}\n");
+        self.paste_into_tab(id, line.as_bytes())
     }
 
     /// Saves the active tab: a terminal's scrollback output, or an RDP/VNC tab's
@@ -4865,7 +4898,8 @@ impl App {
                 self.dialog = Dialog::ConfirmTmuxKill { scope, name };
             }
             Some(TmuxAction::New(scope)) => {
-                self.dialog = Dialog::TmuxNew { scope, name: String::new(), error: None };
+                self.dialog =
+                    Dialog::TmuxNew { scope, name: String::new(), switch: true, error: None };
             }
             Some(TmuxAction::Refresh) => {
                 self.refresh_tmux_local();
@@ -8652,8 +8686,9 @@ impl App {
     }
 
     fn show_tmux_new(&mut self, ctx: &egui::Context) {
-        let Dialog::TmuxNew { scope, name, error } = &mut self.dialog else { return };
-        let (scope, mut name, mut error) = (*scope, name.clone(), error.clone());
+        let Dialog::TmuxNew { scope, name, switch, error } = &mut self.dialog else { return };
+        let (scope, mut name, mut switch, mut error) =
+            (*scope, name.clone(), *switch, error.clone());
         let mut submit = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::unique("tmux-new")).show(ctx, |ui| {
@@ -8663,6 +8698,8 @@ impl App {
             ui.label("Session name:");
             let resp = ui.text_edit_singleline(&mut name);
             autofocus(ui, &resp);
+            ui.add_space(6.0);
+            ui.checkbox(&mut switch, "Switch to it after creating");
             if let Some(e) = &error {
                 ui.add_space(4.0);
                 ui.colored_label(Color32::from_rgb(220, 120, 120), e);
@@ -8690,6 +8727,10 @@ impl App {
                         } else {
                             self.refresh_tmux_local();
                             self.dialog = Dialog::None;
+                            // Open a tab attached to the new session.
+                            if switch {
+                                self.open_tmux_attach(&new, ctx);
+                            }
                             return;
                         }
                     }
@@ -8697,6 +8738,9 @@ impl App {
                         let cmd = wazowski_core::tmux::remote_new_command(&new);
                         if self.start_remote_tmux_cmd(cmd) {
                             self.dialog = Dialog::None;
+                            // Attach once the (async) create completes — see
+                            // poll_tmux_remote.
+                            self.tmux_attach_after_create = switch.then(|| new.clone());
                             return;
                         }
                         error = Some("No active SSH session.".into());
@@ -8708,8 +8752,9 @@ impl App {
             self.dialog = Dialog::None;
             return;
         }
-        if let Dialog::TmuxNew { name: n, error: err, .. } = &mut self.dialog {
+        if let Dialog::TmuxNew { name: n, switch: s, error: err, .. } = &mut self.dialog {
             *n = name;
+            *s = switch;
             *err = error;
         }
     }
