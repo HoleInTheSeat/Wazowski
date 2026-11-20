@@ -73,6 +73,10 @@ struct Tab {
     /// told to attach). Lets a click re-focus an existing tab, avoid re-attaching
     /// the session you're already in, and switch sessions without nesting.
     tmux_attached: Option<String>,
+    /// Our best guess at whether this tmux tab's window has `synchronize-panes`
+    /// on, so the broadcast button reflects it. Toggled when the user clicks it;
+    /// may drift from tmux if changed elsewhere.
+    tmux_sync: bool,
 }
 
 /// How a terminal tab's session can be restarted after it ends.
@@ -2075,6 +2079,7 @@ impl App {
             connected_at,
             font_size: self.settings.terminal_font_size,
             tmux_attached: None,
+            tmux_sync: false,
         };
         let adjacent = force_adjacent || self.settings.new_tab_placement == NewTabPlacement::Always;
         let index = if adjacent && !self.tabs.is_empty() {
@@ -2910,17 +2915,32 @@ impl App {
                 self.active = (self.active + n - 1) % n;
             }
         }
+        // In tmux, split/broadcast keybinds drive tmux itself, matching the
+        // toolbar buttons, so keys and buttons never disagree.
         if triggered(Action::SplitRight, ctx, &self.keymap) {
-            self.split_active_pane(SplitDir::Horizontal, ctx);
+            if self.active_tmux_session().is_some() {
+                self.tmux_split(SplitDir::Horizontal);
+            } else {
+                self.split_active_pane(SplitDir::Horizontal, ctx);
+            }
         }
         if triggered(Action::SplitDown, ctx, &self.keymap) {
-            self.split_active_pane(SplitDir::Vertical, ctx);
+            if self.active_tmux_session().is_some() {
+                self.tmux_split(SplitDir::Vertical);
+            } else {
+                self.split_active_pane(SplitDir::Vertical, ctx);
+            }
         }
         if triggered(Action::ClosePane, ctx, &self.keymap) {
             self.close_active_pane();
         }
         if triggered(Action::ToggleBroadcast, ctx, &self.keymap) {
-            self.broadcast = !self.broadcast;
+            if let Some((tab_id, _, _)) = self.active_tmux_session() {
+                let on = !self.tabs.iter().find(|t| t.id == tab_id).is_some_and(|t| t.tmux_sync);
+                self.tmux_set_sync(on);
+            } else {
+                self.broadcast = !self.broadcast;
+            }
         }
         if triggered(Action::Find, ctx, &self.keymap) {
             match &self.find {
@@ -3353,6 +3373,60 @@ impl App {
         }
         let line = format!("{cmd}\n");
         self.paste_into_tab(id, line.as_bytes())
+    }
+
+    /// If the active tab is genuinely inside a tmux session — attached (our
+    /// tracking) *and* still in the alternate screen (tmux owns it while
+    /// attached) — returns its (tab id, session name, is-remote). This combines
+    /// the live screen state with our tracking so it's never true for a plain
+    /// editor with no tmux. Remote tabs drive tmux over the SSH exec side
+    /// channel; local tabs over a local command.
+    fn active_tmux_session(&self) -> Option<(u64, String, bool)> {
+        let tab = self.tabs.get(self.active)?;
+        let name = tab.tmux_attached.clone()?;
+        if self.tab_in_alt_screen(tab.id) != Some(true) {
+            return None;
+        }
+        Some((tab.id, name, tab.exec.is_some()))
+    }
+
+    /// Splits the current window of the active tmux session, via a tmux command
+    /// on the side channel (SSH exec for remote, a local command for local) — no
+    /// keys are typed into the session. Drives the split buttons while attached.
+    fn tmux_split(&mut self, dir: SplitDir) {
+        let Some((_, name, remote)) = self.active_tmux_session() else { return };
+        let horizontal = matches!(dir, SplitDir::Horizontal);
+        if remote {
+            let cmd = wazowski_core::tmux::remote_split_command(&name, horizontal);
+            self.start_remote_tmux_cmd(cmd);
+        } else if let Err(e) = wazowski_core::tmux::local_split(&name, horizontal) {
+            self.error = Some(format!("tmux: {e}"));
+        }
+    }
+
+    /// Turns `synchronize-panes` on or off for the active tmux session's window
+    /// (via a side-channel command — not typed into the session). This is the one
+    /// tmux action that mirrors typed input across panes; the broadcast button
+    /// drives it while you're attached to tmux.
+    fn tmux_set_sync(&mut self, on: bool) {
+        let Some((tab_id, name, remote)) = self.active_tmux_session() else { return };
+        let ok = if remote {
+            let cmd = wazowski_core::tmux::remote_sync_panes_command(&name, on);
+            self.start_remote_tmux_cmd(cmd)
+        } else {
+            match wazowski_core::tmux::local_sync_panes(&name, on) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.error = Some(format!("tmux: {e}"));
+                    false
+                }
+            }
+        };
+        if ok
+            && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
+        {
+            tab.tmux_sync = on;
+        }
     }
 
     /// Saves the active tab: a terminal's scrollback output, or an RDP/VNC tab's
@@ -6589,6 +6663,11 @@ impl App {
             _ => (false, false),
         };
         let mut broadcast = self.broadcast;
+        // When the active tab is attached to tmux, the split/broadcast buttons
+        // drive tmux itself instead of egui panes (see tmux_split / tmux_set_sync).
+        let in_tmux = self.active_tmux_session().is_some();
+        let tmux_sync = in_tmux && self.tabs.get(self.active).is_some_and(|t| t.tmux_sync);
+        let mut toggle_sync = false;
         // Remote-desktop (RDP/VNC) toolbar ops for the active tab, if any.
         let active_remote: Option<RemoteKind> = match self.tabs.get(self.active).map(|t| &t.content) {
             Some(TabContent::Remote(r)) => Some(r.kind()),
@@ -6696,26 +6775,42 @@ impl App {
                 // rightmost. Add Broadcast first so the visible order reads
                 // Split right | Split down | Broadcast, with Broadcast on the right.
                 if show_split {
-                    // Broadcast only makes sense with more than one pane in this
-                    // tab; otherwise it's greyed out (and clicks are ignored), but
-                    // its state is still shown and a tooltip explains why.
-                    let resp = ui.add_enabled(
-                        has_multiple_panes,
-                        egui::Button::new("⇉").selected(broadcast && has_multiple_panes),
-                    );
-                    let resp = resp
-                        .on_hover_text("Broadcast: send input to eligible panes in this tab")
-                        .on_disabled_hover_text(
-                            "Broadcast sends input to eligible panes in this tab. \
-                             Split this tab into multiple panes to enable it.",
-                        );
+                    // In tmux, Broadcast toggles the session's synchronize-panes
+                    // (the one tmux action that mirrors typed input across panes),
+                    // and is always available. Otherwise it broadcasts to egui
+                    // panes and only makes sense with more than one pane; when
+                    // there's one it's greyed out but its state and a tooltip show.
+                    let bc_enabled = in_tmux || has_multiple_panes;
+                    let bc_selected = if in_tmux { tmux_sync } else { broadcast && has_multiple_panes };
+                    let resp =
+                        ui.add_enabled(bc_enabled, egui::Button::new("⇉").selected(bc_selected));
+                    let resp = if in_tmux {
+                        resp.on_hover_text(
+                            "Broadcast: toggle tmux synchronize-panes (type into every pane at once)",
+                        )
+                    } else {
+                        resp.on_hover_text("Broadcast: send input to eligible panes in this tab")
+                            .on_disabled_hover_text(
+                                "Broadcast sends input to eligible panes in this tab. \
+                                 Split this tab into multiple panes to enable it.",
+                            )
+                    };
                     if resp.clicked() {
-                        broadcast = !broadcast;
+                        if in_tmux {
+                            toggle_sync = true;
+                        } else {
+                            broadcast = !broadcast;
+                        }
                     }
-                    if ui.button("⇩").on_hover_text("Split pane down").clicked() {
+                    let (down_tip, right_tip) = if in_tmux {
+                        ("Split the tmux pane top/bottom", "Split the tmux pane left/right")
+                    } else {
+                        ("Split pane down", "Split pane right")
+                    };
+                    if ui.button("⇩").on_hover_text(down_tip).clicked() {
                         pane_action = Some(SplitButton::Split(SplitDir::Vertical));
                     }
-                    if ui.button("⇥").on_hover_text("Split pane right").clicked() {
+                    if ui.button("⇥").on_hover_text(right_tip).clicked() {
                         pane_action = Some(SplitButton::Split(SplitDir::Horizontal));
                     }
                 }
@@ -6757,6 +6852,9 @@ impl App {
             self.apply_remote_op(op, &ctx);
         }
         self.broadcast = broadcast;
+        if toggle_sync {
+            self.tmux_set_sync(!tmux_sync);
+        }
         if let Some(i) = clicked_tab {
             self.active = i;
             // Leave a full-area rail view so the clicked tab is shown.
@@ -6767,6 +6865,8 @@ impl App {
             self.open_local_shell(ui.ctx());
         }
         match pane_action {
+            // In tmux, split tmux itself; otherwise split the egui panes.
+            Some(SplitButton::Split(dir)) if in_tmux => self.tmux_split(dir),
             Some(SplitButton::Split(dir)) => self.split_active_pane(dir, ui.ctx()),
             None => {}
         }

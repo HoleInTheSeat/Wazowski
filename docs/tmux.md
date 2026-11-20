@@ -58,6 +58,21 @@ filter box to narrow a long list by name.
 
 Either way, clicking the session you're **already in** does nothing.
 
+## Split and broadcast drive tmux while you're attached
+
+While a tab is attached to a tmux session, the tab toolbar's **split** buttons
+(and their keybinds) split the **tmux** window instead of Wazowski's own panes:
+**⇥** splits left/right, **⇩** splits top/bottom. The **Broadcast** (⇉) button
+toggles tmux's **`synchronize-panes`**, which mirrors what you type to every pane
+in the window — the tmux equivalent of broadcast. The button lights up while
+synchronize-panes is on.
+
+These run as tmux commands over the side channel (the SSH connection for a remote
+session, a local command for a local one), targeting the session by name — so
+nothing is typed into the panes you're watching, and every attached client sees
+the change live. As soon as you detach (back to the shell), the same buttons go
+back to splitting and broadcasting Wazowski's own panes.
+
 ## Creating, renaming, terminating
 
 Right-click a session for the full menu, or use **＋ New session…** at the

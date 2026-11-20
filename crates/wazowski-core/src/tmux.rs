@@ -76,6 +76,28 @@ pub fn attach_args(name: &str) -> Vec<String> {
     vec!["attach-session".into(), "-t".into(), name.into()]
 }
 
+/// Builds the argv to split the active window of a session. `horizontal` splits
+/// left/right (tmux `-h`, panes side by side), otherwise top/bottom (`-v`).
+/// Targeting the session by name hits its active window and pane — where an
+/// attached client is looking — so the split lands where the user is.
+pub fn split_args(name: &str, horizontal: bool) -> Vec<String> {
+    let flag = if horizontal { "-h" } else { "-v" };
+    vec!["split-window".into(), flag.into(), "-t".into(), name.into()]
+}
+
+/// Builds the argv to turn a session's pane synchronization on or off (tmux's
+/// `synchronize-panes`, which mirrors typed input to every pane in the window).
+pub fn sync_panes_args(name: &str, on: bool) -> Vec<String> {
+    let val = if on { "on" } else { "off" };
+    vec![
+        "set-window-option".into(),
+        "-t".into(),
+        name.into(),
+        "synchronize-panes".into(),
+        val.into(),
+    ]
+}
+
 /// Wraps a string in single quotes for safe use as one argument in a remote
 /// shell command (SSH exec runs the command through the login shell). Embedded
 /// single quotes are escaped the POSIX way: `'\''`.
@@ -150,6 +172,21 @@ pub fn prefix_control_byte(s: &str) -> u8 {
 pub fn remote_switch_or_attach_command(name: &str) -> String {
     let t = shell_quote(name);
     format!("tmux switch-client -t {t} 2>/dev/null || tmux attach -t {t}")
+}
+
+/// The remote command to split the active window of a session, run on the SSH
+/// exec side channel (not typed into the session), so it never injects keys into
+/// a pane. tmux updates every attached client, so the split appears live.
+pub fn remote_split_command(name: &str, horizontal: bool) -> String {
+    let flag = if horizontal { "-h" } else { "-v" };
+    format!("tmux split-window {flag} -t {}", shell_quote(name))
+}
+
+/// The remote command to toggle a session's `synchronize-panes` on or off, run
+/// on the SSH exec side channel (not typed into the session).
+pub fn remote_sync_panes_command(name: &str, on: bool) -> String {
+    let val = if on { "on" } else { "off" };
+    format!("tmux set-window-option -t {} synchronize-panes {val}", shell_quote(name))
 }
 
 /// Interprets the result of a remote `list-sessions` (its stdout, stderr, and
@@ -251,6 +288,16 @@ pub fn local_rename(old: &str, new: &str) -> Result<(), TmuxError> {
 /// Creates a new detached local session.
 pub fn local_new_detached(name: &str) -> Result<(), TmuxError> {
     run_local(&new_detached_args(name), false).map(|_| ())
+}
+
+/// Splits the active window of a local session (see [`split_args`]).
+pub fn local_split(name: &str, horizontal: bool) -> Result<(), TmuxError> {
+    run_local(&split_args(name, horizontal), false).map(|_| ())
+}
+
+/// Toggles `synchronize-panes` on a local session's active window.
+pub fn local_sync_panes(name: &str, on: bool) -> Result<(), TmuxError> {
+    run_local(&sync_panes_args(name, on), false).map(|_| ())
 }
 
 #[cfg(test)]
@@ -358,6 +405,30 @@ mod tests {
             "tmux switch-client -t 'x' 2>/dev/null || tmux attach -t 'x'"
         );
         assert!(remote_list_command().starts_with("tmux list-sessions -F '"));
+        assert_eq!(remote_split_command("x", true), "tmux split-window -h -t 'x'");
+        assert_eq!(remote_split_command("x", false), "tmux split-window -v -t 'x'");
+        assert_eq!(
+            remote_sync_panes_command("x", true),
+            "tmux set-window-option -t 'x' synchronize-panes on"
+        );
+        assert_eq!(
+            remote_sync_panes_command("x", false),
+            "tmux set-window-option -t 'x' synchronize-panes off"
+        );
+    }
+
+    #[test]
+    fn split_and_sync_args_build() {
+        assert_eq!(split_args("s", true), ["split-window", "-h", "-t", "s"]);
+        assert_eq!(split_args("s", false), ["split-window", "-v", "-t", "s"]);
+        assert_eq!(
+            sync_panes_args("s", true),
+            ["set-window-option", "-t", "s", "synchronize-panes", "on"]
+        );
+        assert_eq!(
+            sync_panes_args("s", false),
+            ["set-window-option", "-t", "s", "synchronize-panes", "off"]
+        );
     }
 
     #[test]
