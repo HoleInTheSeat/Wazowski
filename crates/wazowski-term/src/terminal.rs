@@ -282,6 +282,15 @@ impl Terminal {
         self.text_range(0)
     }
 
+    /// Whether the terminal is currently showing the alternate screen buffer —
+    /// what a full-screen program switches to, including an attached tmux client
+    /// (tmux owns the alternate screen for its whole UI while attached). Leaving
+    /// it is a locale- and version-independent sign the shell is back at its
+    /// prompt, so it's a reliable way to confirm a tmux detach actually landed.
+    pub fn in_alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// The scrollback history plus the visible screen, as plain text.
     pub fn full_text(&self) -> String {
         let history = self.term.grid().history_size() as i32;

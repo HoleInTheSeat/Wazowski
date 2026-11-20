@@ -50,7 +50,11 @@ filter box to narrow a long list by name.
   prefix + `d` keystroke as above, so only your client drops and no one else is
   disturbed) and then attaches to the new one — you never see tmux's "sessions
   should be nested" warning, and because the detach is a keystroke it works even
-  when a pane is running a full-screen program.
+  when a pane is running a full-screen program. The attach command is only typed
+  **once the shell is confirmed back from tmux** (Wazowski watches for the tab to
+  leave tmux's full-screen display), so it can never be typed into a session you
+  were only observing. If that can't be confirmed within a few seconds, nothing
+  is typed and you're told to run `tmux attach` yourself.
 
 Either way, clicking the session you're **already in** does nothing.
 

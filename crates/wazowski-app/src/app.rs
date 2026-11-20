@@ -1195,6 +1195,21 @@ struct CredentialPrompt {
 /// and the session to attach once the detach lands (`Some` for a switch).
 type TmuxDetachJob = (u64, network::Job<Result<ExecOutput, String>>, Option<String>);
 
+/// A `tmux attach` deferred until a switch's detach has been *confirmed* — so
+/// the command can never land in a session you were only observing.
+struct TmuxAttachPending {
+    /// The SSH tab to attach in.
+    tab_id: u64,
+    /// The session to attach to.
+    name: String,
+    /// Whether the tab was in tmux's alternate screen when the detach was sent
+    /// (the normal case). We then attach once the alternate screen clears;
+    /// otherwise we fall back to watching for tmux's `[detached` message.
+    alt_at_start: bool,
+    /// Give-up time: if the detach can't be confirmed by now, we type nothing.
+    deadline: std::time::Instant,
+}
+
 pub struct App {
     tabs: Vec<Tab>,
     active: usize,
@@ -1356,10 +1371,9 @@ pub struct App {
     /// to attach once the detach lands — set when the detach is really a
     /// *switch* between sessions, `None` for a plain detach.
     tmux_detach_job: Option<TmuxDetachJob>,
-    /// A `tmux attach` deferred until just after a switch's detach, so it lands
-    /// at the shell prompt rather than racing tmux's terminal hand-off. Holds
-    /// the target tab id, the session name, and when to send it.
-    tmux_attach_pending: Option<(u64, String, std::time::Instant)>,
+    /// A `tmux attach` deferred until a switch's detach is confirmed (the tab
+    /// has returned to its shell), so it can't land in an observed session.
+    tmux_attach_pending: Option<TmuxAttachPending>,
     /// When the remote list was last refreshed, driving the auto-poll.
     tmux_remote_last: Option<std::time::Instant>,
     /// Filter text for the Settings ▸ Keybindings list.
@@ -3237,27 +3251,75 @@ impl App {
             tab.tmux_attached = None;
         }
         if let Some(name) = next {
-            // A short gap lets the shell settle back to a prompt after the
-            // detach, so the attach command doesn't race the hand-off.
-            let due = std::time::Instant::now() + std::time::Duration::from_millis(250);
-            self.tmux_attach_pending = Some((tab_id, name, due));
+            // Don't type the attach yet: wait until we can confirm the shell is
+            // actually back (see poll_tmux_attach_pending), so the command can't
+            // land in a session you were only observing. Record whether we're in
+            // tmux's alternate screen now, which is how we'll know it detached.
+            let alt_at_start = self.tab_in_alt_screen(tab_id).unwrap_or(false);
+            self.tmux_attach_pending = Some(TmuxAttachPending {
+                tab_id,
+                name,
+                alt_at_start,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(3),
+            });
         }
     }
 
-    /// Sends the deferred `tmux attach` that follows a switch's detach, once the
-    /// short settle delay has elapsed.
+    /// Finishes a switch once its detach is *confirmed*: types `tmux attach` only
+    /// after the tab has left tmux's alternate screen (so it's back at the real
+    /// shell), never into a session you might only be observing. If it can't be
+    /// confirmed before the deadline, it types nothing and says so.
     fn poll_tmux_attach_pending(&mut self) {
-        let Some((_, _, due)) = self.tmux_attach_pending.as_ref() else { return };
-        if std::time::Instant::now() < *due {
-            return;
+        let Some(p) = self.tmux_attach_pending.as_ref() else { return };
+        let tab_id = p.tab_id;
+        let alt_at_start = p.alt_at_start;
+        let deadline = p.deadline;
+        // Confirm we're back at the shell. Normal case: the tab has left tmux's
+        // alternate screen. If tmux wasn't using it, fall back to its message.
+        let confirmed = if alt_at_start {
+            self.tab_in_alt_screen(tab_id) == Some(false)
+        } else {
+            self.tab_screen_text(tab_id)
+                .is_some_and(|s| s.contains("[detached"))
+        };
+        if confirmed {
+            let name = self.tmux_attach_pending.take().expect("pending").name;
+            let line = format!("{}\n", wazowski_core::tmux::remote_attach_command(&name));
+            if self.paste_into_tab(tab_id, line.as_bytes())
+                && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
+            {
+                tab.tmux_attached = Some(name);
+            }
+        } else if std::time::Instant::now() >= deadline {
+            // Fail safe: couldn't confirm the detach, so don't type into a
+            // possibly-observed session — tell the user to attach by hand.
+            let name = self.tmux_attach_pending.take().expect("pending").name;
+            self.error = Some(format!(
+                "Detached from tmux, but couldn't confirm the shell was back \
+                 before attaching, so nothing was typed. Run `tmux attach -t \
+                 {name}` in the SSH tab to open that session."
+            ));
         }
-        let (tab_id, name, _) = self.tmux_attach_pending.take().expect("just checked");
-        let line = format!("{}\n", wazowski_core::tmux::remote_attach_command(&name));
-        if self.paste_into_tab(tab_id, line.as_bytes())
-            && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
-        {
-            tab.tmux_attached = Some(name);
-        }
+    }
+
+    /// Whether the focused pane of the tab with `id` is showing the alternate
+    /// screen (e.g. an attached tmux client). `None` if it isn't a terminal tab.
+    fn tab_in_alt_screen(&self, id: u64) -> Option<bool> {
+        let tab = self.tabs.iter().find(|t| t.id == id)?;
+        let TabContent::Terminal(panes) = &tab.content else {
+            return None;
+        };
+        Some(panes.get(panes.focused_id())?.in_alt_screen())
+    }
+
+    /// The visible text of the focused pane of the tab with `id`, if it's a
+    /// terminal tab.
+    fn tab_screen_text(&self, id: u64) -> Option<String> {
+        let tab = self.tabs.iter().find(|t| t.id == id)?;
+        let TabContent::Terminal(panes) = &tab.content else {
+            return None;
+        };
+        Some(panes.get(panes.focused_id())?.screen_text())
     }
 
     /// Saves the active tab: a terminal's scrollback output, or an RDP/VNC tab's
