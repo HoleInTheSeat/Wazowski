@@ -226,20 +226,31 @@ fn handle_mouse(ui: &Ui, t: &mut Terminal, response: &Response, grid: &Grid) {
 
     if let Some(pos) = response.interact_pointer_pos() {
         let (point, side) = grid.point_at(pos, offset);
-        let select = |t: &mut Terminal, ty| {
+        let select = |t: &mut Terminal, ty, side| {
             let mut selection = Selection::new(ty, point, side);
             selection.update(point, side);
             t.term.selection = Some(selection);
         };
 
         if response.triple_clicked() {
-            select(t, SelectionType::Lines);
+            select(t, SelectionType::Lines, side);
             copy_selection(ui, t);
         } else if response.double_clicked() {
-            select(t, SelectionType::Semantic);
+            select(t, SelectionType::Semantic, side);
             copy_selection(ui, t);
         } else if response.drag_started_by(PointerButton::Primary) {
-            select(t, SelectionType::Simple);
+            // Anchor on where the button went *down*, not the current pointer: a
+            // drag is only recognized after the pointer passes a small threshold,
+            // so on a fast drag it has already moved several cells by this frame —
+            // using the current position would start the selection late. Anchor on
+            // the left edge of that cell (Side::Left) so the clicked character is
+            // included rather than the next one (a Side::Right start shifts the
+            // selection forward a column in alacritty), then extend to the pointer.
+            let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+            let (anchor, _) = grid.point_at(press, offset);
+            let mut selection = Selection::new(SelectionType::Simple, anchor, Side::Left);
+            selection.update(point, side);
+            t.term.selection = Some(selection);
         } else if response.dragged_by(PointerButton::Primary) {
             if let Some(selection) = &mut t.term.selection {
                 selection.update(point, side);
