@@ -26,7 +26,9 @@ host (over the SSH connection).
   drop back to the plain SSH shell in that tab. Detaching sends the tmux
   **prefix + `d`** keystroke (the prefix is read from the host, so a remapped
   prefix such as `Ctrl+a` still works), which detaches **only your client** —
-  anyone else attached to the same session stays connected.
+  anyone else attached to the same session stays connected. If the shell isn't
+  in a tmux session to begin with, clicking the name just brings that tab to the
+  front (there's nothing to detach, so no keystroke is sent).
 
 Each session row shows its name, its window count, and a dot (`●`) when a client
 is already attached. The list refreshes automatically every couple of seconds
@@ -44,8 +46,11 @@ filter box to narrow a long list by name.
 - **Remote** types `tmux attach` into the active SSH tab's shell — the normal
   way to attach over an existing connection. Make sure that shell is at a prompt
   first. If the shell is already showing a *different* tmux session, clicking
-  another one **switches** to it rather than attaching again, so you never see
-  tmux's "sessions should be nested" warning.
+  another one first **detaches** your client from the current session (the same
+  prefix + `d` keystroke as above, so only your client drops and no one else is
+  disturbed) and then attaches to the new one — you never see tmux's "sessions
+  should be nested" warning, and because the detach is a keystroke it works even
+  when a pane is running a full-screen program.
 
 Either way, clicking the session you're **already in** does nothing.
 

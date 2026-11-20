@@ -1191,6 +1191,10 @@ struct CredentialPrompt {
     then_connect: Session,
 }
 
+/// In-flight remote-tmux prefix query for a detach: the target tab id, the job,
+/// and the session to attach once the detach lands (`Some` for a switch).
+type TmuxDetachJob = (u64, network::Job<Result<ExecOutput, String>>, Option<String>);
+
 pub struct App {
     tabs: Vec<Tab>,
     active: usize,
@@ -1348,8 +1352,14 @@ pub struct App {
     tmux_remote_action: Option<network::Job<Result<(), String>>>,
     /// In-flight query of the remote tmux prefix key for a pending detach, with
     /// the target tab id. On completion the prefix + `d` keystroke is sent so
-    /// only this client detaches.
-    tmux_detach_job: Option<(u64, network::Job<Result<ExecOutput, String>>)>,
+    /// only this client detaches. The trailing `Option<String>` is the session
+    /// to attach once the detach lands — set when the detach is really a
+    /// *switch* between sessions, `None` for a plain detach.
+    tmux_detach_job: Option<TmuxDetachJob>,
+    /// A `tmux attach` deferred until just after a switch's detach, so it lands
+    /// at the shell prompt rather than racing tmux's terminal hand-off. Holds
+    /// the target tab id, the session name, and when to send it.
+    tmux_attach_pending: Option<(u64, String, std::time::Instant)>,
     /// When the remote list was last refreshed, driving the auto-poll.
     tmux_remote_last: Option<std::time::Instant>,
     /// Filter text for the Settings ▸ Keybindings list.
@@ -1777,6 +1787,7 @@ impl App {
             tmux_remote_job: None,
             tmux_remote_action: None,
             tmux_detach_job: None,
+            tmux_attach_pending: None,
             tmux_remote_last: None,
             filter_keybinds: String::new(),
             paste_pw_master: None,
@@ -3131,27 +3142,38 @@ impl App {
         true
     }
 
-    /// Attaches to a remote tmux session by typing into the active SSH tab's
-    /// shell (the normal way to attach over an existing connection). If the shell
-    /// is already showing another tmux session, it switches to this one instead
-    /// of attaching again — no "sessions should be nested" warning. Clicking the
-    /// session the shell is already in does nothing.
+    /// Attaches to a remote tmux session over the active SSH tab's shell.
+    ///
+    /// - Clicking the session the shell is already in does nothing.
+    /// - When the shell is already attached to a *different* session, this is a
+    ///   switch: we detach our client cleanly first (a prefix + `d` keystroke,
+    ///   which only ever drops our own client — see [`start_tmux_detach`]) and
+    ///   attach to the new session once we're back at the shell. Detaching by
+    ///   keystroke works even when a pane is running a full-screen program, and
+    ///   leaves anyone else on the old session undisturbed — unlike typing a
+    ///   `switch-client` command, which only lands at a shell prompt.
+    /// - Otherwise (not attached) it types a plain `tmux attach` at the prompt.
     fn attach_tmux_remote(&mut self, name: &str) {
-        let Some((tab_id, _, _)) = self.active_ssh_exec() else { return };
-        let current = self
+        let Some((tab_id, _, exec)) = self.active_ssh_exec() else { return };
+        // A detach/switch is already in flight — let it finish first.
+        if self.tmux_detach_job.is_some() || self.tmux_attach_pending.is_some() {
+            return;
+        }
+        let attached = self
             .tabs
             .get(self.active)
             .and_then(|t| t.tmux_attached.as_deref());
-        let cmd = match current {
-            // Already in this session — leave the shell alone.
-            Some(cur) if cur == name => return,
-            // In a different session (or possibly none): switch if we can,
-            // otherwise attach. The command self-corrects either way.
-            Some(_) => wazowski_core::tmux::remote_switch_or_attach_command(name),
-            // Not known to be attached — a plain attach.
-            None => wazowski_core::tmux::remote_attach_command(name),
-        };
-        let line = format!("{cmd}\n");
+        // Already in this session — leave the shell alone.
+        if attached == Some(name) {
+            return;
+        }
+        if attached.is_some() {
+            // Attached elsewhere: detach, then attach to the new session.
+            self.start_tmux_detach(tab_id, exec, Some(name.to_owned()));
+            return;
+        }
+        // Not attached — a plain attach typed at the shell prompt.
+        let line = format!("{}\n", wazowski_core::tmux::remote_attach_command(name));
         if self.paste_into_tab(tab_id, line.as_bytes())
             && let Some(tab) = self.tabs.get_mut(self.active)
         {
@@ -3160,38 +3182,81 @@ impl App {
     }
 
     /// Detaches the active SSH tab's shell from tmux (back to the plain login
-    /// shell) and focuses that tab, so clicking the host returns you to the real
-    /// SSH session. Detaches **only this client**: rather than running
-    /// `detach-client` (which, as a command, can drop every attached client), it
-    /// first asks the host for its tmux prefix key, then sends the prefix + `d`
-    /// keystroke — the same thing you'd type by hand — so clients other people
-    /// have on the session stay put.
+    /// shell), so clicking the host returns you to the real SSH session. If the
+    /// shell isn't attached to anything, there's nothing to detach — we just
+    /// bring the tab to the front rather than sending a stray keystroke. See
+    /// [`start_tmux_detach`] for how the detach itself is done.
     fn detach_tmux_remote(&mut self) {
         let Some((tab_id, _, exec)) = self.active_ssh_exec() else { return };
-        // Bring the SSH tab to the front so the shell you're dropped into shows.
+        // A detach/switch is already in flight — let it finish first.
+        if self.tmux_detach_job.is_some() || self.tmux_attach_pending.is_some() {
+            return;
+        }
+        let attached = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|t| t.tmux_attached.is_some());
+        if !attached {
+            // Nothing to detach from — just surface the shell tab.
+            if let Some(i) = self.tabs.iter().position(|t| t.id == tab_id) {
+                self.active = i;
+            }
+            return;
+        }
+        self.start_tmux_detach(tab_id, exec, None);
+    }
+
+    /// Kicks off the async tmux-prefix query a detach needs, and brings the SSH
+    /// tab to the front so the shell you drop into is visible. Detaches **only
+    /// this client**: rather than running `detach-client` (which, as a command,
+    /// can drop every attached client), the prefix is read from the host and
+    /// then [`poll_tmux_detach`] sends the prefix + `d` keystroke — the same
+    /// thing you'd type by hand. When `next` is set the detach is a switch, and
+    /// that session is attached once the detach lands.
+    fn start_tmux_detach(&mut self, tab_id: u64, exec: Exec, next: Option<String>) {
         if let Some(i) = self.tabs.iter().position(|t| t.id == tab_id) {
             self.active = i;
         }
         let cmd = wazowski_core::tmux::remote_prefix_query_command();
-        self.tmux_detach_job = Some((tab_id, network::spawn_job(move || exec.run(&cmd))));
+        self.tmux_detach_job = Some((tab_id, network::spawn_job(move || exec.run(&cmd)), next));
     }
 
     /// Finishes a pending detach once its prefix query returns: sends the
     /// `prefix` then `d` keystroke to the target tab, falling back to the default
-    /// prefix if the query failed.
+    /// prefix if the query failed. If the detach was a switch, schedules the
+    /// follow-up `tmux attach` for just after the terminal hand-off settles.
     fn poll_tmux_detach(&mut self) {
-        let Some((tab_id, job)) = &self.tmux_detach_job else { return };
+        let Some((tab_id, job, _)) = self.tmux_detach_job.as_ref() else { return };
         let Some(result) = job.poll() else { return };
         let tab_id = *tab_id;
-        self.tmux_detach_job = None;
-        let out = match result {
-            Ok(o) => o.stdout,
-            Err(_) => String::new(), // unreachable prefix → default C-b
-        };
+        let next = self.tmux_detach_job.take().and_then(|(_, _, n)| n);
+        let out = result.map(|o| o.stdout).unwrap_or_default(); // unreachable → default C-b
         let prefix = wazowski_core::tmux::prefix_control_byte(&out);
         self.paste_into_tab(tab_id, &[prefix, b'd']);
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.tmux_attached = None;
+        }
+        if let Some(name) = next {
+            // A short gap lets the shell settle back to a prompt after the
+            // detach, so the attach command doesn't race the hand-off.
+            let due = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            self.tmux_attach_pending = Some((tab_id, name, due));
+        }
+    }
+
+    /// Sends the deferred `tmux attach` that follows a switch's detach, once the
+    /// short settle delay has elapsed.
+    fn poll_tmux_attach_pending(&mut self) {
+        let Some((_, _, due)) = self.tmux_attach_pending.as_ref() else { return };
+        if std::time::Instant::now() < *due {
+            return;
+        }
+        let (tab_id, name, _) = self.tmux_attach_pending.take().expect("just checked");
+        let line = format!("{}\n", wazowski_core::tmux::remote_attach_command(&name));
+        if self.paste_into_tab(tab_id, line.as_bytes())
+            && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
+        {
+            tab.tmux_attached = Some(name);
         }
     }
 
@@ -12382,11 +12447,17 @@ impl eframe::App for App {
         // written out on close.
         self.track_window_geometry(&ctx);
 
-        // Finish a pending tmux detach as soon as its prefix query returns, and
-        // keep repainting at a short interval until it does (the job is polled,
-        // not pushed).
+        // Finish a pending tmux detach as soon as its prefix query returns, then
+        // send any switch's deferred attach once its settle delay elapses, and
+        // keep repainting at a short interval until both are done (they're
+        // polled, not pushed).
         if self.tmux_detach_job.is_some() {
             self.poll_tmux_detach();
+        }
+        if self.tmux_attach_pending.is_some() {
+            self.poll_tmux_attach_pending();
+        }
+        if self.tmux_detach_job.is_some() || self.tmux_attach_pending.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
